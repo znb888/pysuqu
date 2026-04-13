@@ -8,7 +8,7 @@
     <a href="#zh-cn">简体中文</a>
   </p>
   <p>
-    <img alt="version" src="https://img.shields.io/badge/version-2.0.0-0f766e" />
+    <img alt="version" src="https://img.shields.io/badge/version-2.0.1-0f766e" />
     <img alt="python" src="https://img.shields.io/badge/python-%3E%3D3.8-2563eb" />
     <img alt="license" src="https://img.shields.io/badge/license-AGPLv3%2B-f59e0b" />
     <img alt="focus" src="https://img.shields.io/badge/focus-superconducting%20qubits-14b8a6" />
@@ -33,7 +33,7 @@ notebooks only.
 - Superconducting qubit modeling utilities under `pysuqu.qubit`
 - Decoherence and noise-analysis workflows under `pysuqu.decoherence`
 - Public demo notebooks covering qubits, decoherence, waveforms, and coupler workflows
-- Public tests and packaging metadata prepared for the first public `2.0.0` release
+- Public tests, benchmark harnesses, and packaging metadata prepared for the public `2.0.1` release
 
 ### Installation
 
@@ -104,6 +104,7 @@ pysuqu/
   tests/          public test suite
   docs/           public documentation
   demo/           public tutorial notebooks and synthetic demo data
+  benchmarks/     local performance benchmark harnesses
   requirements.txt
   setup.py
   pyproject.toml
@@ -136,7 +137,7 @@ repository, fork it, and contribute improvements.
 - `pysuqu.qubit` 中的超导量子比特建模能力
 - `pysuqu.decoherence` 中的退相干与噪声分析工作流
 - 覆盖单比特、退相干、波形门操作、多比特 coupler 工作流的公开 demo
-- 为首次公开 `2.0.0` 版本整理好的测试与发布元数据
+- 为公开 `2.0.1` 版本整理好的测试、benchmark harness 与发布元数据
 
 ### 安装
 
@@ -218,5 +219,4 @@ pysuqu/
 本仓库采用 [GNU Affero General Public License v3.0 或更高版本](LICENSE)。
 
 如果 `pysuqu` 对你的工作有帮助，也非常欢迎你关注仓库、fork 项目并提交贡献。
-
 

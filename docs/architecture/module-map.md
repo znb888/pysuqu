@@ -1,6 +1,6 @@
 ﻿# Module Map
 
-Updated for the public `pysuqu 2.0.0` repository.
+Updated for the public `pysuqu 2.0.1` repository.
 
 ## Package Layout
 
@@ -58,12 +58,14 @@ from pysuqu.qubit import (
 
 ```python
 from pysuqu.decoherence import (
+    BiasCurrentVoltageResult,
     Decoherence,
     ElectronicNoise,
     NoiseFitResult,
     NoisePipelineStage,
     T1Result,
     TphiResult,
+    XYCurrentVoltageResult,
     ZNoiseDecoherence,
     XYNoiseDecoherence,
     RNoiseDecoherence,

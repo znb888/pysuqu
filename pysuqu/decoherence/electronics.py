@@ -141,7 +141,12 @@ class ElectronicNoise():
             
             psd_single_in = Sii_D2S(psd_double_in, self.noise_freq)
             psd_smooth_in = smooth_data(psd_double_in)
-            psd_double_out = np.array([S_transmission(p,f,self.T_setup,self.attenuation_setup) for p, f in zip(psd_double_in, self.noise_freq)])
+            psd_double_out = S_transmission(
+                psd_double_in,
+                self.noise_freq,
+                self.T_setup,
+                self.attenuation_setup,
+            )
             psd_single_out = Sii_D2S(psd_double_out, self.noise_freq)
             psd_smooth_out = smooth_data(psd_double_out)
             

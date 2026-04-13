@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 
@@ -9,6 +9,7 @@ from tests.support import install_test_stubs
 install_test_stubs()
 
 from pysuqu.decoherence.dequbit import ZNoiseDecoherence
+from pysuqu.decoherence.results import BiasCurrentVoltageResult
 from pysuqu.qubit.base import Phi0
 
 
@@ -42,6 +43,7 @@ class ZNoiseDecoherenceBiasAnalyzerBoundaryTests(unittest.TestCase):
 
         actual = z_noise.cal_bias_current_voltage(phi_fraction=phi_fraction, is_print=False)
 
+        self.assertEqual(set(actual), set(BiasCurrentVoltageResult.__annotations__))
         self.assertAlmostEqual(actual['phi_bias'], phi_bias)
         self.assertAlmostEqual(actual['chip_current_uA'], chip_current_uA)
         self.assertAlmostEqual(actual['chip_voltage_mV'], chip_voltage_mV)
@@ -87,6 +89,7 @@ class ZNoiseDecoherenceBiasAnalyzerBoundaryTests(unittest.TestCase):
 
         self.assertEqual(len(builder_calls), 1)
         self.assertEqual(builder_calls[0]['couple_term'], z_noise.couple_term)
+        self.assertEqual(set(actual), set(BiasCurrentVoltageResult.__annotations__))
         self.assertEqual(actual, expected)
         self.assertEqual(len(analyzer_calls), 1)
         self.assertEqual(analyzer_calls[0]['phi_fraction'], 0.125)
@@ -95,4 +98,3 @@ class ZNoiseDecoherenceBiasAnalyzerBoundaryTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

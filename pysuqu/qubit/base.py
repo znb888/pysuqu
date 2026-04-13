@@ -146,6 +146,15 @@ class QubitBase(HamiltonianEvo):
 
         return [destroyors, ns_norm, phis_norm, charge_op]
 
+    @staticmethod
+    def _build_even_operator_powers(operator: Qobj) -> tuple[Qobj, Qobj, Qobj, Qobj]:
+        """Build reusable even-power terms for a phase-like operator."""
+        operator_squared = operator * operator
+        operator_fourth = operator_squared * operator_squared
+        operator_sixth = operator_fourth * operator_squared
+        operator_eighth = operator_fourth * operator_fourth
+        return operator_squared, operator_fourth, operator_sixth, operator_eighth
+
     def _generate_hamiltonian(
         self,
         Ec: np.ndarray,
@@ -162,43 +171,49 @@ class QubitBase(HamiltonianEvo):
                 (2 * Ec[ii, ii] / (Ej[ii, ii] + El[ii, ii])) ** (1 / 4) * phis_norm[ii]
                 for ii in range(self._numQubits)
             ]
+            phi_power_terms = [self._build_even_operator_powers(phi_operator) for phi_operator in phis_op]
+            pair_power_terms = {
+                (ii, jj): self._build_even_operator_powers(phis_op[ii] - phis_op[jj])
+                for ii in range(self._numQubits)
+                for jj in range(ii + 1, self._numQubits)
+            }
+            factorial_6 = math.factorial(6)
+            factorial_8 = math.factorial(8)
+            hamil_c_terms = []
+            hamil_high_pair_terms = []
+
+            for ii in range(self._numQubits):
+                for jj in range(self._numQubits):
+                    if ii == jj:
+                        continue
+
+                    pair_key = (ii, jj) if ii < jj else (jj, ii)
+                    delta_squared, delta_fourth, delta_sixth, delta_eighth = pair_power_terms[pair_key]
+                    hamil_c_terms.append(
+                        4 * Ec[ii, jj] * ns_op[ii] * ns_op[jj]
+                        + El[ii, jj] * phis_op[ii] * phis_op[jj] / 2
+                        - Ej[ii, jj] * (-delta_squared / 2 + delta_fourth / 24)
+                    )
+                    hamil_high_pair_terms.append(
+                        Ej[ii, jj] * (delta_sixth / factorial_6 - delta_eighth / factorial_8)
+                    )
 
             hamil_0 = sum(
                 [
                     np.sqrt(8 * Ec[ii, ii] * (El[ii, ii] + Ej[ii, ii])) * destroyors[ii].dag() * destroyors[ii]
-                    - (Ej[ii, ii] * phis_op[ii] ** 4) / 24
+                    - (Ej[ii, ii] * phi_power_terms[ii][1]) / 24
                     for ii in range(self._numQubits)
                 ]
             )
-            hamil_c = sum(
-                [
-                    4 * Ec[ii, jj] * ns_op[ii] * ns_op[jj]
-                    + El[ii, jj] * phis_op[ii] * phis_op[jj] / 2
-                    - Ej[ii, jj]
-                    * (-(phis_op[ii] - phis_op[jj]) ** 2 / 2 + (phis_op[ii] - phis_op[jj]) ** 4 / 24)
-                    for ii in range(self._numQubits)
-                    for jj in range(self._numQubits)
-                    if ii != jj
-                ]
-            )
+            hamil_c = sum(hamil_c_terms)
             hamil_high = sum(
                 [
-                    Ej[ii, ii] * (phis_op[ii] ** 6 / math.factorial(6) - phis_op[ii] ** 8 / math.factorial(8))
+                    Ej[ii, ii] * phi_power_terms[ii][2] / factorial_6
+                    - Ej[ii, ii] * phi_power_terms[ii][3] / factorial_8
                     for ii in range(self._numQubits)
                 ]
             )
-            hamil_high += sum(
-                [
-                    Ej[ii, jj]
-                    * (
-                        (phis_op[ii] - phis_op[jj]) ** 6 / math.factorial(6)
-                        - (phis_op[ii] - phis_op[jj]) ** 8 / math.factorial(8)
-                    )
-                    for ii in range(self._numQubits)
-                    for jj in range(self._numQubits)
-                    if ii != jj
-                ]
-            )
+            hamil_high += sum(hamil_high_pair_terms)
 
             self.eigenHamiltonian = hamil_0
             self.couplingHamiltonian = hamil_c

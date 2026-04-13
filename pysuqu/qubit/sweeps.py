@@ -3,11 +3,11 @@ from copy import copy
 import numpy as np
 
 from ..funclib import cal_product_state_list
+from .base import ParameterizedQubit, pi
 from .plotting import (
     plot_multi_qubit_coupling_strength_vs_flux,
     plot_multi_qubit_energy_vs_flux,
 )
-from .base import pi
 from .types import CouplingResult, SweepResult
 
 
@@ -19,6 +19,98 @@ def _validate_single_qubit_sweep_upper_level(qubit, upper_level):
 
     if upper_level > nlevel_val:
         raise ValueError('Energy list out of range! Should lower than truncate energy level! ')
+
+
+def _supports_fast_single_qubit_sweep(qubit) -> bool:
+    """Return whether the sweep can reuse the internal single-qubit energy-only path."""
+    return isinstance(qubit, ParameterizedQubit) and getattr(qubit, '_numQubits', 0) == 1
+
+
+def _extract_relative_energylevels(hamiltonian) -> np.ndarray:
+    """Return relative eigenenergies while avoiding eigenstate construction when possible."""
+    eigenenergies = getattr(hamiltonian, 'eigenenergies', None)
+    if callable(eigenenergies):
+        energylevels = np.asarray(eigenenergies(), dtype=float)
+    elif hasattr(hamiltonian, 'full'):
+        energylevels = np.linalg.eigvalsh(np.asarray(hamiltonian.full(), dtype=complex)).real
+    else:
+        energylevels = np.asarray(hamiltonian.eigenstates()[0], dtype=float)
+
+    return energylevels - energylevels[0]
+
+
+def _build_single_qubit_sweep_result_generic(
+    qubit,
+    flux_origin,
+    flux_offsets: list[np.ndarray],
+    upper_level: float,
+) -> SweepResult:
+    """Build the single-qubit sweep result through the generic change-by-change path."""
+    energy_series = {f'level_{ii}': [] for ii in range(1, upper_level + 1)}
+
+    try:
+        for offset in flux_offsets:
+            qubit.change_para(flux=flux_origin + offset)
+            for ii in range(1, upper_level + 1):
+                energy_series[f'level_{ii}'].append(qubit.get_energylevel(ii) / 2 / pi)
+
+        return SweepResult(
+            sweep_parameter='flux_offset',
+            sweep_values=flux_offsets,
+            series=energy_series,
+            metadata={
+                'flux_origin': np.array(flux_origin, copy=True),
+                'upper_level': upper_level,
+            },
+        )
+    finally:
+        qubit.change_para(flux=flux_origin)
+
+
+def _build_single_qubit_sweep_result_fast(
+    qubit,
+    flux_origin,
+    flux_offsets: list[np.ndarray],
+    upper_level: float,
+) -> SweepResult:
+    """Build the sweep result through an energy-only single-qubit update path."""
+    energy_series = {f'level_{ii}': [] for ii in range(1, upper_level + 1)}
+    level_keys = tuple(energy_series)
+
+    try:
+        for offset in flux_offsets:
+            qubit._flux = qubit._normalize_flux_input(flux_origin + offset)
+            qubit._update_transformed_vars()
+
+            junc_ratio_to_use = (
+                qubit._junc_ratio_transformed
+                if hasattr(qubit, '_junc_ratio_transformed')
+                else qubit._junc_ratio
+            )
+            ejmax_to_use = (
+                qubit._ParameterizedQubit__Ej0
+                if hasattr(qubit, '_ParameterizedQubit__Ej0')
+                else qubit.Ejmax
+            )
+            Ej = qubit._Ejphi(ejmax_to_use, qubit._flux_transformed, junc_ratio_to_use)
+            relative_energylevels = _extract_relative_energylevels(
+                qubit._generate_hamiltonian(qubit.Ec, qubit.El, Ej)
+            )
+
+            for level_index, level_key in enumerate(level_keys, start=1):
+                energy_series[level_key].append(relative_energylevels[level_index] / 2 / pi)
+
+        return SweepResult(
+            sweep_parameter='flux_offset',
+            sweep_values=flux_offsets,
+            series=energy_series,
+            metadata={
+                'flux_origin': np.array(flux_origin, copy=True),
+                'upper_level': upper_level,
+            },
+        )
+    finally:
+        qubit.change_para(flux=flux_origin)
 
 
 def sweep_single_qubit_energy_vs_flux_base(
@@ -47,25 +139,20 @@ def sweep_single_qubit_energy_vs_flux_base_result(
     _validate_single_qubit_sweep_upper_level(qubit, upper_level)
 
     flux_origin = copy(qubit._flux)
-    energy_series = {f'level_{ii}': [] for ii in range(1, upper_level + 1)}
-
-    try:
-        for offset in flux_offsets:
-            qubit.change_para(flux=flux_origin + offset)
-            for ii in range(1, upper_level + 1):
-                energy_series[f'level_{ii}'].append(qubit.get_energylevel(ii) / 2 / pi)
-
-        return SweepResult(
-            sweep_parameter='flux_offset',
-            sweep_values=flux_offsets,
-            series=energy_series,
-            metadata={
-                'flux_origin': np.array(flux_origin, copy=True),
-                'upper_level': upper_level,
-            },
+    if _supports_fast_single_qubit_sweep(qubit):
+        return _build_single_qubit_sweep_result_fast(
+            qubit,
+            flux_origin,
+            flux_offsets,
+            upper_level,
         )
-    finally:
-        qubit.change_para(flux=flux_origin)
+
+    return _build_single_qubit_sweep_result_generic(
+        qubit,
+        flux_origin,
+        flux_offsets,
+        upper_level,
+    )
 
 
 def sweep_multi_qubit_energy_vs_flux_result(

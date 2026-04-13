@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import TypedDict
 
 import numpy as np
 
@@ -60,6 +61,31 @@ class T1Result:
 
     def __post_init__(self) -> None:
         _normalize_scalar_result(self)
+
+
+class BiasCurrentVoltageResult(TypedDict):
+    """Stable public mapping contract for Z-bias current/voltage summaries."""
+
+    phi_bias: float
+    chip_current_uA: float
+    chip_voltage_mV: float
+    total_attenuation_dB: float
+    room_current_mA: float
+    room_voltage_mV: float
+    room_power_dBm: float
+
+
+class XYCurrentVoltageResult(TypedDict):
+    """Stable public mapping contract for XY current/voltage summaries."""
+
+    phi_bias: float
+    chip_current_uA: float
+    chip_voltage_uV: float
+    chip_power_dBm: float
+    total_attenuation_dB: float
+    room_current_mA: float
+    room_voltage_mV: float
+    room_power_dBm: float
 
 
 @dataclass(frozen=True)
@@ -141,8 +167,10 @@ class NoisePipelineStage:
 
 
 __all__ = [
+    'BiasCurrentVoltageResult',
     'NoiseFitResult',
     'NoisePipelineStage',
     'T1Result',
     'TphiResult',
+    'XYCurrentVoltageResult',
 ]

@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 
@@ -8,7 +8,7 @@ from tests.support import install_test_stubs
 
 install_test_stubs()
 
-from pysuqu.decoherence.electronics import ElectronicNoise
+from pysuqu.decoherence.electronics import ElectronicNoise, S_transmission
 from pysuqu.decoherence.results import NoiseFitResult
 
 
@@ -47,6 +47,19 @@ class ElectronicNoisePipelineTests(unittest.TestCase):
             noise.noise_fitres_out['corner_freq'],
         )
 
+    def test_refresh_model_matches_scalar_transmission_for_spectral_noise(self):
+        noise = self._construct(is_spectral=True)
+
+        expected_psd_double_out = np.array(
+            [
+                S_transmission(point_psd, point_freq, noise.T_setup, noise.attenuation_setup)
+                for point_psd, point_freq in zip(noise.psd_double_in, noise.noise_freq)
+            ]
+        )
+
+        np.testing.assert_allclose(noise.output_stage.psd_double, expected_psd_double_out)
+        np.testing.assert_allclose(noise.psd_double_out, expected_psd_double_out)
+
     def test_refresh_model_keeps_constant_pipeline_outputs_explicit_without_fit_results(self):
         freq, _ = self._sample_noise_inputs()
         with redirect_stdout(StringIO()):
@@ -74,4 +87,3 @@ class ElectronicNoisePipelineTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

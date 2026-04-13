@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
@@ -12,6 +12,7 @@ install_test_stubs()
 from pysuqu.decoherence.analysis import XYRelaxationAnalyzer
 from pysuqu.decoherence.dequbit import XYNoiseDecoherence
 from pysuqu.decoherence.electronics import T2Sii_Double
+from pysuqu.decoherence.results import XYCurrentVoltageResult
 from pysuqu.qubit.base import Phi0
 
 
@@ -230,7 +231,90 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
             ],
         )
 
+    def test_xy_current_voltage_keeps_existing_numeric_formula(self):
+        phi_fraction = 0.015 / (4 * np.pi)
+        attenuation_setup = np.array([2.0, 6.5, 10.0, 13.0, 1.0, 0.0])
+        xy_noise = self._construct(attenuation_setup=attenuation_setup)
+
+        phi_bias = phi_fraction * Phi0
+        chip_current_A = phi_bias / xy_noise.couple_term / 2
+        chip_current_uA = chip_current_A * 1e6
+        chip_voltage_uV = chip_current_uA * 50
+        chip_power_W = chip_current_A**2 * 50
+        chip_power_dBm = 10 * np.log10(chip_power_W / 1e-3)
+        total_attenuation_dB = np.sum(attenuation_setup)
+        chip_current_mA = chip_current_A * 1e3
+        room_current_mA = chip_current_mA * 10 ** (total_attenuation_dB / 20)
+        room_voltage_mV = room_current_mA * 50
+        room_power_W = room_current_mA**2 * 50 / 2 / 1e3
+        room_power_dBm = 10 * np.log10(room_power_W)
+
+        actual = xy_noise.cal_xy_current_voltage(phi_fraction=phi_fraction, is_print=False)
+
+        self.assertEqual(set(actual), set(XYCurrentVoltageResult.__annotations__))
+        self.assertAlmostEqual(actual['phi_bias'], phi_bias)
+        self.assertAlmostEqual(actual['chip_current_uA'], chip_current_uA)
+        self.assertAlmostEqual(actual['chip_voltage_uV'], chip_voltage_uV)
+        self.assertAlmostEqual(actual['chip_power_dBm'], chip_power_dBm)
+        self.assertAlmostEqual(actual['total_attenuation_dB'], total_attenuation_dB)
+        self.assertAlmostEqual(actual['room_current_mA'], room_current_mA)
+        self.assertAlmostEqual(actual['room_voltage_mV'], room_voltage_mV)
+        self.assertAlmostEqual(actual['room_power_dBm'], room_power_dBm)
+
+    def test_xy_current_voltage_can_delegate_through_explicit_xy_analyzer_builder(self):
+        builder_calls = []
+        analyzer_calls = []
+        expected = {
+            'phi_bias': 1.0,
+            'chip_current_uA': 2.0,
+            'chip_voltage_uV': 3.0,
+            'chip_power_dBm': 4.0,
+            'total_attenuation_dB': 5.0,
+            'room_current_mA': 6.0,
+            'room_voltage_mV': 7.0,
+            'room_power_dBm': 8.0,
+        }
+
+        class RecordingAnalyzer:
+            def calculate_t1(self, *, noise_output, qubit_freq, Ej, Ec):
+                return {
+                    'gamma_up': 1.0,
+                    'gamma_down': 2.0,
+                    't1': 0.5,
+                }
+
+            def calculate_thermal_excitation(self, *, gamma_up, gamma_down, t1_us):
+                return (0.0, 0.0)
+
+            def calculate_xy_current_voltage(self, *, phi_fraction, attenuation_setup):
+                analyzer_calls.append(
+                    {
+                        'phi_fraction': phi_fraction,
+                        'attenuation_setup': np.array(attenuation_setup, copy=True),
+                    }
+                )
+                return dict(expected)
+
+        def xy_analyzer_builder(**kwargs):
+            builder_calls.append(dict(kwargs))
+            return RecordingAnalyzer()
+
+        attenuation_setup = np.array([1.5, 2.5, 3.5, 4.5, 5.5, 6.5])
+        xy_noise = self._construct(
+            attenuation_setup=attenuation_setup,
+            xy_analyzer_builder=xy_analyzer_builder,
+        )
+
+        actual = xy_noise.cal_xy_current_voltage(phi_fraction=0.02, is_print=False)
+
+        self.assertEqual(len(builder_calls), 1)
+        self.assertEqual(builder_calls[0]['couple_term'], xy_noise.couple_term)
+        self.assertEqual(set(actual), set(XYCurrentVoltageResult.__annotations__))
+        self.assertEqual(actual, expected)
+        self.assertEqual(len(analyzer_calls), 1)
+        self.assertEqual(analyzer_calls[0]['phi_fraction'], 0.02)
+        np.testing.assert_array_equal(analyzer_calls[0]['attenuation_setup'], attenuation_setup)
+
 
 if __name__ == '__main__':
     unittest.main()
-

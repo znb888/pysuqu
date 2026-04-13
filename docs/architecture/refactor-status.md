@@ -1,6 +1,6 @@
 ﻿# Refactor Status
 
-This public repository exposes the stabilized `pysuqu 2.0.0` package layout.
+This public repository exposes the stabilized `pysuqu 2.0.1` package layout.
 
 ## Current State
 

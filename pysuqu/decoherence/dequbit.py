@@ -26,7 +26,7 @@ from .formatting import (
     format_z_tphi2_report,
 )
 from .plotting import plot_read_tphi_fit, plot_z_tphi2_fit
-from .results import T1Result, TphiResult
+from .results import BiasCurrentVoltageResult, T1Result, TphiResult, XYCurrentVoltageResult
 
 Euler_gamma = 0.577216
 
@@ -319,7 +319,11 @@ class ZNoiseDecoherence(Decoherence):
             )
         return self.tphi1
 
-    def cal_bias_current_voltage(self, phi_fraction: float = 0.25, is_print: bool = True) -> dict:
+    def cal_bias_current_voltage(
+        self,
+        phi_fraction: float = 0.25,
+        is_print: bool = True,
+    ) -> BiasCurrentVoltageResult:
         """
         Calculate bias current and voltage at chip and room temperature ends.
         
@@ -724,7 +728,11 @@ class XYNoiseDecoherence(Decoherence):
 
         return self.thermal_exitation, self.thermal_exitation_onlyxy
 
-    def cal_xy_current_voltage(self, phi_fraction: float = 0.010 / (4 * np.pi), is_print: bool = True) -> dict:
+    def cal_xy_current_voltage(
+        self,
+        phi_fraction: float = 0.010 / (4 * np.pi),
+        is_print: bool = True,
+    ) -> XYCurrentVoltageResult:
         """
         Calculate XY control line current and voltage at chip and room temperature ends.
         
