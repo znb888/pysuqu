@@ -1,0 +1,9 @@
+﻿# Core dependencies for pysuqu
+# Install with: pip install -r requirements.txt
+
+numpy>=1.20.0
+scipy>=1.7.0
+qutip>=4.7.0
+matplotlib>=3.4.0
+plotly>=5.0.0
+

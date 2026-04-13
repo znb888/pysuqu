@@ -1,0 +1,7 @@
+include LICENSE
+include README.md
+recursive-include docs *.md *.svg
+recursive-include demo *.md *.ipynb *.csv
+recursive-include tests *.py
+global-exclude __pycache__
+global-exclude *.py[cod]

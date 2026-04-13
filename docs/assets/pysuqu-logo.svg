@@ -1,0 +1,120 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1400 420" role="img" aria-labelledby="title desc">
+  <title id="title">pysuqu</title>
+  <desc id="desc">Python toolkit for superconducting qubit simulation.</desc>
+
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#171827"/>
+      <stop offset="55%" stop-color="#1a1c2f"/>
+      <stop offset="100%" stop-color="#20253a"/>
+    </linearGradient>
+    <linearGradient id="well" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#97b8ff"/>
+      <stop offset="100%" stop-color="#76d8ff"/>
+    </linearGradient>
+    <linearGradient id="wordmarkBlue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8bb0ff"/>
+      <stop offset="100%" stop-color="#71a5ff"/>
+    </linearGradient>
+    <linearGradient id="wordmarkGold" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#ffe8ae"/>
+      <stop offset="100%" stop-color="#ffd56b"/>
+    </linearGradient>
+    <linearGradient id="wordmarkPale" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#d7deff"/>
+      <stop offset="100%" stop-color="#c6ccf3"/>
+    </linearGradient>
+    <filter id="wellGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="10" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="neonGlow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="4" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <marker id="excitationArrow" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L5 2.5 L0 5 Z" fill="#38bdf8"/>
+    </marker>
+    <marker id="decayArrow" markerWidth="5" markerHeight="5" refX="4" refY="2.5" orient="auto" markerUnits="strokeWidth">
+      <path d="M0 0 L5 2.5 L0 5 Z" fill="#f97316"/>
+    </marker>
+  </defs>
+  <rect x="12" y="12" width="1376" height="396" rx="48" fill="url(#bg)"/>
+
+  <g transform="translate(34.0 33.0) scale(0.46)">
+    <rect x="0" y="0" width="768" height="768" rx="110" fill="url(#bg)"/>
+    <g opacity="0.12" stroke="#555f88" stroke-width="1.6" fill="none">
+      <path d="M516 112 H664"/>
+      <path d="M560 144 H700"/>
+      <path d="M478 178 H612"/>
+      <path d="M454 618 H676"/>
+    </g>
+    <path
+      d="M160 200
+         C 220 400, 277 520, 384 520
+         C 491 520, 548 400, 608 200"
+      fill="none"
+      stroke="url(#well)"
+      stroke-width="18"
+      stroke-linecap="round"
+      filter="url(#wellGlow)"
+    />
+    <g stroke-linecap="round">
+      <line x1="215" y1="250" x2="553" y2="250" stroke="#b9ac95" stroke-width="8"/>
+      <line x1="256" y1="350" x2="512" y2="350" stroke="#ffe8b4" stroke-width="8"/>
+      <line x1="318" y1="460" x2="450" y2="460" stroke="#f4d88c" stroke-width="7"/>
+    </g>
+    <path
+      d="M360 430
+         A 25 25 0 0 1 384 380"
+      fill="none"
+      stroke="#38bdf8"
+      stroke-width="5"
+      stroke-dasharray="8 6"
+      stroke-linecap="round"
+      marker-end="url(#excitationArrow)"
+      filter="url(#neonGlow)"
+    />
+    <path
+      d="M408 380
+         A 25 25 0 0 1 384 430"
+      fill="none"
+      stroke="#f97316"
+      stroke-width="5"
+      stroke-dasharray="8 6"
+      stroke-linecap="round"
+      marker-end="url(#decayArrow)"
+      filter="url(#neonGlow)"
+    />
+  </g>
+  <g transform="translate(455.0 0)">
+    <text
+      x="0"
+      y="210.0"
+      font-size="148"
+      font-weight="500"
+      letter-spacing="-2.6"
+      font-family="'Avenir Next', 'Trebuchet MS', 'Segoe UI', sans-serif"
+    >
+      <tspan fill="url(#wordmarkBlue)">py</tspan><tspan fill="url(#wordmarkPale)">su</tspan><tspan fill="url(#wordmarkGold)">qu</tspan>
+    </text>
+    <text
+      x="6"
+      y="290.0"
+      font-size="28"
+      letter-spacing="1.6"
+      font-family="'Avenir Next', 'Segoe UI', Arial, sans-serif"
+      fill="#99a0c4"
+    >
+      <tspan fill="url(#wordmarkBlue)">Py</tspan>thon toolkit for 
+      <tspan fill="url(#wordmarkPale)">su</tspan>perconducting 
+      <tspan fill="url(#wordmarkGold)">qu</tspan>bit simulation.
+    </text>
+  </g>
+</svg>
