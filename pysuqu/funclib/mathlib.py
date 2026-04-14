@@ -5,6 +5,9 @@ Lib for math utility functions.
  USTC
  Since 2025-04-13
 '''
+import inspect
+from functools import lru_cache
+
 import numpy as np
 from scipy.constants import hbar, pi, Boltzmann
 from scipy.optimize import curve_fit
@@ -15,6 +18,67 @@ from scipy.interpolate import CubicSpline
 from typing import Callable, Optional, Tuple
 
 kb = Boltzmann
+
+
+def _fit_cache_token(values: np.ndarray) -> tuple[str, tuple[int, ...], bytes]:
+    array = np.ascontiguousarray(np.asarray(values, dtype=float))
+    return array.dtype.str, array.shape, array.tobytes()
+
+
+def _fit_cache_array(token: tuple[str, tuple[int, ...], bytes]) -> np.ndarray:
+    dtype_str, shape, payload = token
+    return np.frombuffer(payload, dtype=np.dtype(dtype_str)).reshape(shape).copy()
+
+
+def _fit_param_count(decay_func: Callable, p0: Optional[np.ndarray]) -> int:
+    if p0 is not None:
+        return len(p0)
+
+    signature = inspect.signature(decay_func)
+    return max(len(signature.parameters) - 1, 0)
+
+
+def _normalize_fit_bounds(
+    bounds: Optional[Tuple[np.ndarray, np.ndarray]],
+    *,
+    param_count: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    if bounds is None:
+        lower_array = np.full(param_count, -np.inf, dtype=float)
+        upper_array = np.full(param_count, np.inf, dtype=float)
+    else:
+        lower_array = np.broadcast_to(np.asarray(bounds[0], dtype=float), (param_count,)).copy()
+        upper_array = np.broadcast_to(np.asarray(bounds[1], dtype=float), (param_count,)).copy()
+
+    return lower_array, upper_array
+
+
+@lru_cache(maxsize=32)
+def _fit_decay_cached(
+    decay_func: Callable,
+    t_token: tuple[str, tuple[int, ...], bytes],
+    p1_token: tuple[str, tuple[int, ...], bytes],
+    p0_token: Optional[tuple[str, tuple[int, ...], bytes]],
+    lower_token: tuple[str, tuple[int, ...], bytes],
+    upper_token: tuple[str, tuple[int, ...], bytes],
+) -> tuple[
+    tuple[str, tuple[int, ...], bytes],
+    tuple[str, tuple[int, ...], bytes],
+]:
+    t_array = _fit_cache_array(t_token)
+    p1_array = _fit_cache_array(p1_token)
+    p0_array = None if p0_token is None else _fit_cache_array(p0_token)
+    lower_array = _fit_cache_array(lower_token)
+    upper_array = _fit_cache_array(upper_token)
+
+    popt, pcov = curve_fit(
+        decay_func,
+        t_array,
+        p1_array,
+        p0=p0_array,
+        bounds=(lower_array, upper_array),
+    )
+    return _fit_cache_token(popt), _fit_cache_token(pcov)
 
 def fft_analysis(
     t_total: np.ndarray, 
@@ -321,8 +385,31 @@ def fit_decay(t: np.ndarray, p1: np.ndarray, decay_func: Callable, p0: Optional[
     """
     Fit decay function to data.
     """
-    popt, pcov = curve_fit(decay_func, t, p1, p0=p0, bounds=bounds)
-    return popt, pcov
+    t_array = np.ascontiguousarray(np.asarray(t, dtype=float))
+    p1_array = np.ascontiguousarray(np.asarray(p1, dtype=float))
+    p0_array = None if p0 is None else np.ascontiguousarray(np.asarray(p0, dtype=float))
+    param_count = _fit_param_count(decay_func, p0_array)
+    lower_array, upper_array = _normalize_fit_bounds(bounds, param_count=param_count)
+
+    try:
+        popt_token, pcov_token = _fit_decay_cached(
+            decay_func,
+            _fit_cache_token(t_array),
+            _fit_cache_token(p1_array),
+            None if p0_array is None else _fit_cache_token(p0_array),
+            _fit_cache_token(lower_array),
+            _fit_cache_token(upper_array),
+        )
+        return _fit_cache_array(popt_token), _fit_cache_array(pcov_token)
+    except TypeError:
+        popt, pcov = curve_fit(
+            decay_func,
+            t_array,
+            p1_array,
+            p0=p0_array,
+            bounds=(lower_array, upper_array),
+        )
+        return popt, pcov
 
 def generate_chirp_envelope(
     t_arr: np.ndarray, 

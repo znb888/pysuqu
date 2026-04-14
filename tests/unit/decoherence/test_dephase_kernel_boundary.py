@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -159,4 +159,3 @@ class DecoherenceDephaseKernelBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

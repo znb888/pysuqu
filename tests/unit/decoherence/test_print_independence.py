@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 import warnings
 from contextlib import redirect_stdout
 from io import StringIO
@@ -379,4 +379,3 @@ class DecoherenceRoundFPrintIndependenceTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

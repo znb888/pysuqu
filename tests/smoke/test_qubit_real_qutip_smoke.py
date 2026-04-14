@@ -1,4 +1,4 @@
-﻿import json
+import json
 import subprocess
 import sys
 import textwrap
@@ -2030,4 +2030,3 @@ class RealQutipGateSmokeTests(unittest.TestCase):
         self.assertEqual(payload['point_marker'], ['o'])
         self.assertEqual(payload['point_size'], [20])
         self.assertTrue(payload['shown'])
-

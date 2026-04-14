@@ -1,4 +1,4 @@
-﻿import importlib.util
+import importlib.util
 import importlib
 import io
 import subprocess
@@ -7,6 +7,7 @@ import unittest
 import warnings
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -152,6 +153,74 @@ assert np.allclose(np.real(wave), np.ones(4))
         self.assertEqual(knee_idx, 0)
         self.assertEqual(caught, [])
 
+    def test_fit_decay_reuses_identical_inputs_without_sharing_cached_arrays(self):
+        mathlib = load_module('funclib_mathlib_round_ah_fit_cache', 'mathlib.py')
+        t = np.linspace(1.0e-6, 5.0e-6, 5)
+        p1 = mathlib.tphi_decay(t, 4.0e-6, 9.0e-6, 1.0, 0.0)
+        p0 = np.array([4.0e-6, 9.0e-6, 1.0, 0.0])
+        bounds = ([0.0, 0.0, 0.0, -1.0], [np.inf, np.inf, 2.0, 1.0])
+        expected_popt = p0.copy()
+        expected_pcov = np.diag([0.25e-12, 0.49e-12, 1.0e-4, 1.0e-4])
+
+        with patch.object(
+            mathlib,
+            'curve_fit',
+            return_value=(expected_popt.copy(), expected_pcov.copy()),
+        ) as mocked_curve_fit:
+            first_popt, first_pcov = mathlib.fit_decay(
+                t,
+                p1,
+                mathlib.tphi_decay,
+                p0=p0.copy(),
+                bounds=bounds,
+            )
+            second_popt, second_pcov = mathlib.fit_decay(
+                t.copy(),
+                p1.copy(),
+                mathlib.tphi_decay,
+                p0=p0.copy(),
+                bounds=(np.array(bounds[0]), np.array(bounds[1])),
+            )
+
+            self.assertEqual(mocked_curve_fit.call_count, 1)
+            np.testing.assert_allclose(first_popt, expected_popt)
+            np.testing.assert_allclose(second_pcov, expected_pcov)
+
+            first_popt[0] = -1.0
+            first_pcov[0, 0] = -1.0
+            third_popt, third_pcov = mathlib.fit_decay(
+                t,
+                p1,
+                mathlib.tphi_decay,
+                p0=p0.copy(),
+                bounds=bounds,
+            )
+
+        self.assertEqual(mocked_curve_fit.call_count, 1)
+        self.assertAlmostEqual(third_popt[0], expected_popt[0])
+        self.assertAlmostEqual(third_pcov[0, 0], expected_pcov[0, 0])
+
+    def test_fit_decay_invalidates_cache_when_trace_changes(self):
+        mathlib = load_module('funclib_mathlib_round_ah_fit_invalidate', 'mathlib.py')
+        t = np.linspace(1.0e-6, 5.0e-6, 5)
+        p1 = mathlib.tphi_decay(t, 4.0e-6, 9.0e-6, 1.0, 0.0)
+        changed_p1 = p1.copy()
+        changed_p1[-1] += 1.0e-3
+        p0 = np.array([4.0e-6, 9.0e-6, 1.0, 0.0])
+        bounds = ([0.0, 0.0, 0.0, -1.0], [np.inf, np.inf, 2.0, 1.0])
+        expected_popt = p0.copy()
+        expected_pcov = np.diag([0.25e-12, 0.49e-12, 1.0e-4, 1.0e-4])
+
+        with patch.object(
+            mathlib,
+            'curve_fit',
+            return_value=(expected_popt.copy(), expected_pcov.copy()),
+        ) as mocked_curve_fit:
+            mathlib.fit_decay(t, p1, mathlib.tphi_decay, p0=p0.copy(), bounds=bounds)
+            mathlib.fit_decay(t, changed_p1, mathlib.tphi_decay, p0=p0.copy(), bounds=bounds)
+
+        self.assertEqual(mocked_curve_fit.call_count, 2)
+
     def test_thermal_photon_matches_kelvin_contract(self):
         mathlib = load_module('funclib_mathlib_round_g_thermal', 'mathlib.py')
 
@@ -284,4 +353,3 @@ assert np.allclose(np.real(wave), np.ones(4))
 
 if __name__ == '__main__':
     unittest.main()
-

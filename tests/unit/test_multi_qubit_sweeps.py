@@ -1,4 +1,4 @@
-﻿import inspect
+import inspect
 import unittest
 from unittest import mock
 
@@ -167,4 +167,3 @@ class MultiQubitSweepWrapperTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

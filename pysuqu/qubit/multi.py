@@ -6,12 +6,14 @@ USTC
 Since 2023-12-05
 '''
 # import
+from collections import OrderedDict
+from functools import lru_cache
 import numpy as np
 import matplotlib.pyplot as plt
-from copy import copy
 # local lib
 from ..funclib import *
 from ..funclib.qutiplib import cal_product_state_list
+from .circuit import project_transformed_flux, project_transformed_junction_ratio
 from .analysis import (
     analyze_multi_qubit_coupler_sensitivity,
     calculate_multi_qubit_coupler_self_sensitivity,
@@ -21,9 +23,106 @@ from .analysis import (
     plot_multi_qubit_sensitivity_curve,
 )
 from .base import ParameterizedQubit, e, hbar, pi
+from .solver import HamiltonianEvo
 from .single import GroundedTransmon, RLINE
 
 RNAN = 1e20
+_QCRFGR_PROBE_FREQUENCY_CACHE_MAXSIZE = 128
+_QCRFGR_PROBE_FREQUENCY_CACHE = OrderedDict()
+_QCRFGR_METRIC_STATE_LABELS = ((1, 0), (0, 1), (2, 0))
+_QCRFGR_COUPLER_OVERLAP_STATE_LABELS = ((1, 0), (0, 1))
+
+
+def _array_cache_key(values) -> tuple[float, ...]:
+    """Convert a numeric array-like payload into a stable exact-input cache key."""
+    return tuple(float(value) for value in np.asarray(values, dtype=float).reshape(-1).tolist())
+
+
+def _make_qcrfgr_probe_frequency_cache_key(
+    model,
+    probe_flux_transformed,
+    probe_ratio_transformed,
+    qubit_idx: int | None,
+) -> tuple[object, ...]:
+    """Build the exact-input cache key for repeated identical QCRFGR probe requests."""
+    ejmax_to_use = (
+        model._ParameterizedQubit__Ej0
+        if hasattr(model, '_ParameterizedQubit__Ej0')
+        else model.Ejmax
+    )
+    return (
+        tuple(int(level) for level in np.asarray(model._Nlevel).reshape(-1).tolist()),
+        tuple(float(charge) for charge in np.asarray(model._charges).reshape(-1).tolist()),
+        _array_cache_key(model.Ec),
+        _array_cache_key(model.El),
+        _array_cache_key(ejmax_to_use),
+        _array_cache_key(probe_flux_transformed),
+        _array_cache_key(probe_ratio_transformed),
+        -1 if qubit_idx is None else int(qubit_idx),
+    )
+
+
+def _get_cached_qcrfgr_probe_frequency(cache_key: tuple[object, ...]) -> float | None:
+    """Return the cached QCRFGR probe result when the exact-input key has been seen before."""
+    cached_frequency = _QCRFGR_PROBE_FREQUENCY_CACHE.get(cache_key)
+    if cached_frequency is not None:
+        _QCRFGR_PROBE_FREQUENCY_CACHE.move_to_end(cache_key)
+    return cached_frequency
+
+
+def _store_cached_qcrfgr_probe_frequency(cache_key: tuple[object, ...], frequency: float) -> None:
+    """Store one exact-input QCRFGR probe result with a small LRU-style eviction policy."""
+    _QCRFGR_PROBE_FREQUENCY_CACHE[cache_key] = frequency
+    _QCRFGR_PROBE_FREQUENCY_CACHE.move_to_end(cache_key)
+    if len(_QCRFGR_PROBE_FREQUENCY_CACHE) > _QCRFGR_PROBE_FREQUENCY_CACHE_MAXSIZE:
+        _QCRFGR_PROBE_FREQUENCY_CACHE.popitem(last=False)
+
+
+def _clear_qcrfgr_probe_frequency_cache() -> None:
+    """Clear the process-level QCRFGR probe cache used by repeated identical fast-path calls."""
+    _QCRFGR_PROBE_FREQUENCY_CACHE.clear()
+
+
+def _normalize_state_labels(state_labels: tuple[tuple[int, ...], ...]) -> list[list[int]]:
+    """Convert cached exact-input state labels into the list-of-list form expected by qutip helpers."""
+    return [list(state) for state in state_labels]
+
+
+def _normalize_nlevel_cache_key(nlevel) -> tuple[int, ...]:
+    """Convert an `Nlevel` payload into a stable exact-input cache key."""
+    return tuple(int(level) for level in np.asarray(nlevel).reshape(-1).tolist())
+
+
+@lru_cache(maxsize=32)
+def _get_cached_qcrfgr_metric_state_sets(
+    nlevel_key: tuple[int, ...],
+) -> tuple[tuple[object, ...], tuple[object, ...]]:
+    """Build and cache the repeated QCRFGR product-state sets used by constructor metrics."""
+    nlevel_list = list(nlevel_key)
+    metric_states = tuple(
+        cal_product_state_list(
+            _normalize_state_labels(_QCRFGR_METRIC_STATE_LABELS),
+            nlevel_list,
+        )
+    )
+    coupler_overlap_states = tuple(
+        cal_product_state_list(
+            _normalize_state_labels(_QCRFGR_COUPLER_OVERLAP_STATE_LABELS),
+            nlevel_list,
+        )
+    )
+    return metric_states, coupler_overlap_states
+
+
+def _clear_qcrfgr_metric_state_cache() -> None:
+    """Clear the exact-input QCRFGR product-state cache used by repeated constructor metrics."""
+    _get_cached_qcrfgr_metric_state_sets.cache_clear()
+
+
+def _calculate_qcrfgr_overlap_coupling(model, overlap_states) -> float:
+    """Calculate the overlap-mode qubit-coupler coupling from prebuilt product states."""
+    hamil = model.get_hamiltonian()
+    return abs(overlap_states[1].dag() * hamil * overlap_states[0]) / 2 / pi
 
 
 def _validate_readout_couple_mode(couple_mode: str) -> None:
@@ -88,15 +187,16 @@ class QCRFGRModel(ParameterizedQubit):
         self.print_basic_info()
 
     def _refresh_basic_metrics(self):
-        stateNumList = [[1,0],[0,1],[2,0]]
-        standard_state = cal_product_state_list(stateNumList, self._Nlevel)
+        standard_state, coupler_overlap_states = _get_cached_qcrfgr_metric_state_sets(
+            _normalize_nlevel_cache_key(self._Nlevel)
+        )
         state_index = [self.find_state(state) for state in standard_state]
 
         self.qubit_f01 = self.get_energylevel(state_index[0])/2/pi
         self.qubit_anharm = self.get_energylevel(state_index[2])/2/pi-2*self.qubit_f01
         self.coupler_f01 = self.get_energylevel(state_index[1])/2/pi
         self.rq_g = self.get_readout_couple(readout_freq=6.5e9, couple_mode='capac', is_print=False)
-        self.qc_g = self.get_coupler_couple(is_print=False)
+        self.qc_g = _calculate_qcrfgr_overlap_coupling(self, coupler_overlap_states)
 
     def change_hamiltonian(self, new_hamiltonian):
         updated = super().change_hamiltonian(new_hamiltonian)
@@ -122,10 +222,10 @@ class QCRFGRModel(ParameterizedQubit):
             eta = self._capac[1,1]/(self._capac[0,0]+self._capac[1,1])
             self.qc_g = self._capac[0][2]*eta*np.sqrt(self.qubit_f01*self.coupler_f01/Cqsum/Ccsum)/2
         elif mode == 'overlap':
-            statelist = [[1,0],[0,1]]
-            standard_state = cal_product_state_list(statelist, self._Nlevel)
-            hamil = self.get_hamiltonian()
-            self.qc_g = abs(standard_state[1].dag()*hamil*standard_state[0])/2/pi
+            _, standard_state = _get_cached_qcrfgr_metric_state_sets(
+                _normalize_nlevel_cache_key(self._Nlevel)
+            )
+            self.qc_g = _calculate_qcrfgr_overlap_coupling(self, standard_state)
         
         if is_print:
             print(f"Qubit-Coupler direct coupling: {self.qc_g*1e3:.3f}MHz")
@@ -567,6 +667,59 @@ def _qcrfgr_get_qubit_frequency_at_coupler_flux(
     )
 
 
+def _qcrfgr_probe_frequency_at_coupler_flux_fast(
+    self,
+    coupler_flux: float,
+    qubit_idx: int | None = None,
+    flux_offset: float = 0.0,
+) -> float:
+    probe_flux = np.array(self._flux, dtype=float, copy=True)
+    probe_flux[2, 2] = coupler_flux + flux_offset
+
+    probe_flux_transformed = project_transformed_flux(
+        probe_flux,
+        self._ParameterizedQubit__struct,
+        self.SMatrix_retainNodes,
+    )
+    probe_ratio_transformed = getattr(self, '_junc_ratio_transformed', None)
+    if probe_ratio_transformed is None:
+        probe_ratio_transformed = project_transformed_junction_ratio(
+            self._junc_ratio,
+            self._ParameterizedQubit__struct,
+            self.SMatrix_retainNodes,
+        )
+
+    cache_key = _make_qcrfgr_probe_frequency_cache_key(
+        self,
+        probe_flux_transformed,
+        probe_ratio_transformed,
+        qubit_idx,
+    )
+    cached_frequency = _get_cached_qcrfgr_probe_frequency(cache_key)
+    if cached_frequency is not None:
+        return cached_frequency
+
+    ejmax_to_use = (
+        self._ParameterizedQubit__Ej0
+        if hasattr(self, '_ParameterizedQubit__Ej0')
+        else self.Ejmax
+    )
+    probe_ej = self._Ejphi(ejmax_to_use, probe_flux_transformed, probe_ratio_transformed)
+    probe_hamiltonian = self._generate_hamiltonian(
+        self.Ec,
+        self.El,
+        probe_ej,
+        transient=True,
+    )
+    probe_solver = HamiltonianEvo(probe_hamiltonian)
+    state_index = probe_solver.find_state([1, 0])
+    if isinstance(state_index, list):
+        state_index = state_index[0]
+    frequency = probe_solver.get_energylevel(state_index) / 2 / pi
+    _store_cached_qcrfgr_probe_frequency(cache_key, frequency)
+    return frequency
+
+
 def _qcrfgr_plot_sensitivity_curve(
     self,
     coupler_flux_point: float,
@@ -674,6 +827,7 @@ QCRFGRModel._cal_sensitivity_numerical = _qcrfgr_cal_sensitivity_numerical
 QCRFGRModel._cal_sensitivity_analytical = _qcrfgr_cal_sensitivity_analytical
 QCRFGRModel._cal_coupler_self_sensitivity = _qcrfgr_cal_coupler_self_sensitivity
 QCRFGRModel._get_qubit_frequency_at_coupler_flux = _qcrfgr_get_qubit_frequency_at_coupler_flux
+QCRFGRModel._probe_frequency_at_coupler_flux_fast = _qcrfgr_probe_frequency_at_coupler_flux_fast
 QCRFGRModel._plot_sensitivity_curve = _qcrfgr_plot_sensitivity_curve
 
 FGF1V1Coupling.cal_coupler_sensitivity = _fgf1_cal_coupler_sensitivity

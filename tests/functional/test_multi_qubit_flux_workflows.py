@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from unittest import mock
 
 import numpy as np
@@ -7,7 +7,7 @@ from tests.support import install_test_stubs
 
 install_test_stubs()
 
-from pysuqu.qubit.base import ParameterizedQubit
+from pysuqu.qubit.base import ParameterizedQubit, QubitBase
 from pysuqu.qubit.multi import FGF1V1Coupling
 from pysuqu.qubit.sweeps import (
     sweep_multi_qubit_coupling_strength_vs_flux,
@@ -24,6 +24,12 @@ class FakeHamiltonian:
 
 
 class FGF1V1FluxWorkflowTests(unittest.TestCase):
+    def setUp(self):
+        QubitBase._clear_exact_solve_template_cache()
+
+    def tearDown(self):
+        QubitBase._clear_exact_solve_template_cache()
+
     def make_model(self):
         model = FGF1V1Coupling.__new__(FGF1V1Coupling)
         model._flux = np.array(
@@ -105,4 +111,3 @@ class FGF1V1FluxWorkflowTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

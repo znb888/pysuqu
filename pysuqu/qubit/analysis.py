@@ -177,6 +177,10 @@ def get_multi_qubit_frequency_at_coupler_flux(
     flux_offset: float = 0.0,
 ) -> float:
     """Probe the requested qubit frequency while restoring the original flux state."""
+    fast_probe = getattr(qubit, '_probe_frequency_at_coupler_flux_fast', None)
+    if qubit_fluxes is None and callable(fast_probe):
+        return fast_probe(coupler_flux, qubit_idx=qubit_idx, flux_offset=flux_offset)
+
     original_flux = copy(qubit._flux)
 
     try:

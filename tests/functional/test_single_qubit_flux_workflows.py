@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from unittest import mock
 
 import numpy as np
@@ -70,4 +70,3 @@ class FloatingTransmonFluxWorkflowTests(unittest.TestCase):
         self.assertEqual(qubit.change_hamiltonian.call_count, 0)
         self.assertEqual(qubit._recalculate_hamiltonian.call_count, 3)
         np.testing.assert_allclose(qubit._flux, np.array([[0.0, 0.25], [0.25, 0.0]]))
-

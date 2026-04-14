@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 
 from tests.support import install_test_stubs
 
@@ -79,4 +79,3 @@ class QubitPackageExportTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

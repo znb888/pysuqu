@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from pathlib import Path
 
 import numpy as np
@@ -219,4 +219,3 @@ class QubitCircuitModuleTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

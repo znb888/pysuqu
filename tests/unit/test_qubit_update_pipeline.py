@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from unittest import mock
 
 import numpy as np
@@ -7,7 +7,9 @@ from tests.support import install_test_stubs
 
 install_test_stubs()
 
-from pysuqu.qubit.base import ParameterizedQubit
+from qutip import basis, tensor
+
+from pysuqu.qubit.base import AbstractQubit, ParameterizedQubit
 from pysuqu.qubit import circuit
 from pysuqu.qubit.multi import FGF1V1Coupling, FGF2V7Coupling, QCRFGRModel
 from pysuqu.qubit.solver import HamiltonianEvo
@@ -78,6 +80,31 @@ class SpectrumResultContainerTests(unittest.TestCase):
         self.assertEqual(evo.solver_result.destroy_operators, ['a'])
         self.assertEqual(evo.solver_result.number_operators, ['n'])
         self.assertEqual(evo.solver_result.phase_operators, ['phi'])
+
+    def test_find_state_and_find_state_list_use_internal_eigensystem_on_hot_path(self):
+        ground = tensor(basis(2, 0), basis(2, 0))
+        first_excited = tensor(basis(2, 1), basis(2, 0))
+        second_excited = tensor(basis(2, 0), basis(2, 1))
+        doubly_excited = tensor(basis(2, 1), basis(2, 1))
+
+        class FakeHamiltonian:
+            dims = [[2, 2], [2, 2]]
+
+            def eigenstates(self):
+                return np.array([0.0, 1.0, 2.0, 3.0]), [
+                    ground,
+                    first_excited,
+                    second_excited,
+                    doubly_excited,
+                ]
+
+        evo = HamiltonianEvo(FakeHamiltonian())
+        evo.get_eigenstate = mock.Mock(side_effect=AssertionError('hot path should reuse _eigenstates directly'))
+
+        self.assertEqual(evo.find_state([1, 0]), 1)
+        self.assertEqual(evo.find_state_list([[1, 0], [0, 1]]), [1, 2])
+        evo.get_eigenstate.assert_not_called()
+
 
 
 class FakeHamiltonian:
@@ -218,6 +245,190 @@ class ParameterizedQubitRebuildTests(unittest.TestCase):
         self.assertEqual(qubit.solver_result.number_operators, ['n'])
         self.assertEqual(qubit.solver_result.phase_operators, ['phi'])
 
+    def test_hamiltonian_operator_cache_reuses_scaffolding_until_cache_key_changes(self):
+        qubit = self.make_qubit()
+        qubit._charges = np.array([0.0])
+        qubit._Nlevel = np.array([2])
+        qubit._numQubits = 1
+
+        first = qubit._hamiltonianOperator()
+        second = qubit._hamiltonianOperator()
+
+        self.assertIs(first, second)
+        self.assertIs(first[0][0], second[0][0])
+        self.assertIs(first[4][0], second[4][0])
+        self.assertIs(first[5][0][0], second[5][0][0])
+
+        qubit._charges = np.array([0.5])
+        third = qubit._hamiltonianOperator()
+
+        self.assertIsNot(first, third)
+        self.assertIsNot(first[0][0], third[0][0])
+        self.assertIsNot(first[4][0], third[4][0])
+        self.assertIsNot(first[5][0][0], third[5][0][0])
+
+        qubit._Nlevel = np.array([3])
+        fourth = qubit._hamiltonianOperator()
+
+        self.assertIsNot(third, fourth)
+        self.assertIsNot(third[0][0], fourth[0][0])
+        self.assertIsNot(third[4][0], fourth[4][0])
+        self.assertIsNot(third[5][0][0], fourth[5][0][0])
+
+    def test_pair_phase_power_cache_reuses_exact_scale_tuple_and_invalidates_when_inputs_change(self):
+        qubit = self.make_qubit()
+        qubit._charges = np.array([0.0, 0.0])
+        qubit._Nlevel = np.array([2, 3])
+        qubit._numQubits = 2
+
+        cache_key = qubit._get_hamiltonian_operator_cache_key()
+        baseline_scales = qubit._get_phi_scale_cache_key([1.0, 2.0])
+        first = ParameterizedQubit._build_cached_pair_power_terms(*cache_key, baseline_scales)
+        second = ParameterizedQubit._build_cached_pair_power_terms(*cache_key, baseline_scales)
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first[0][0], (0, 1))
+        self.assertIs(first, second)
+        self.assertIs(first[0][1][0], second[0][1][0])
+
+        changed_scale = ParameterizedQubit._build_cached_pair_power_terms(
+            *cache_key,
+            qubit._get_phi_scale_cache_key([1.0, 2.5]),
+        )
+
+        self.assertIsNot(first, changed_scale)
+        self.assertIsNot(first[0][1][0], changed_scale[0][1][0])
+
+        qubit._charges = np.array([0.5, 0.0])
+        changed_key = qubit._get_hamiltonian_operator_cache_key()
+        changed_charge = ParameterizedQubit._build_cached_pair_power_terms(*changed_key, baseline_scales)
+
+        self.assertIsNot(first, changed_charge)
+        self.assertIsNot(first[0][1][0], changed_charge[0][1][0])
+
+    def test_scaled_phase_term_cache_reuses_exact_scale_tuple_and_invalidates_when_inputs_change(self):
+        qubit = self.make_qubit()
+        qubit._charges = np.array([0.0, 0.0])
+        qubit._Nlevel = np.array([2, 3])
+        qubit._numQubits = 2
+
+        cache_key = qubit._get_hamiltonian_operator_cache_key()
+        baseline_scales = qubit._get_phi_scale_cache_key([1.0, 2.0])
+        first = ParameterizedQubit._build_cached_scaled_phase_terms(*cache_key, baseline_scales)
+        second = ParameterizedQubit._build_cached_scaled_phase_terms(*cache_key, baseline_scales)
+
+        self.assertEqual(len(first[0]), 2)
+        self.assertEqual(len(first[1]), 2)
+        self.assertIs(first, second)
+        self.assertIs(first[0][0], second[0][0])
+        self.assertIs(first[1][1][2], second[1][1][2])
+
+        changed_scale = ParameterizedQubit._build_cached_scaled_phase_terms(
+            *cache_key,
+            qubit._get_phi_scale_cache_key([1.0, 2.5]),
+        )
+
+        self.assertIsNot(first, changed_scale)
+        self.assertIsNot(first[0][1], changed_scale[0][1])
+        self.assertIsNot(first[1][1][0], changed_scale[1][1][0])
+
+        qubit._charges = np.array([0.5, 0.0])
+        changed_key = qubit._get_hamiltonian_operator_cache_key()
+        changed_charge = ParameterizedQubit._build_cached_scaled_phase_terms(*changed_key, baseline_scales)
+
+        self.assertIsNot(first, changed_charge)
+        self.assertIsNot(first[0][0], changed_charge[0][0])
+        self.assertIsNot(first[1][0][0], changed_charge[1][0][0])
+
+    def test_truncated_operator_view_cache_reuses_exact_scale_tuple_and_invalidates_when_inputs_change(self):
+        qubit = self.make_qubit()
+        qubit._charges = np.array([0.0, 0.0])
+        qubit._Nlevel = np.array([2, 3])
+        qubit._numQubits = 2
+
+        cache_key = qubit._get_hamiltonian_operator_cache_key()
+        phi_scale_key = qubit._get_phi_scale_cache_key([1.0, 2.0])
+        ns_scale_key = qubit._get_ns_scale_cache_key([0.5, 1.5])
+        first = ParameterizedQubit._build_cached_truncated_operator_views(
+            *cache_key,
+            phi_scale_key,
+            ns_scale_key,
+        )
+        second = ParameterizedQubit._build_cached_truncated_operator_views(
+            *cache_key,
+            phi_scale_key,
+            ns_scale_key,
+        )
+
+        self.assertIs(first, second)
+        self.assertIs(first[0][0], second[0][0])
+        self.assertIs(first[1][1], second[1][1])
+        self.assertIs(first[2][0], second[2][0])
+
+        changed_ns = ParameterizedQubit._build_cached_truncated_operator_views(
+            *cache_key,
+            phi_scale_key,
+            qubit._get_ns_scale_cache_key([0.5, 1.75]),
+        )
+
+        self.assertIsNot(first, changed_ns)
+        self.assertIsNot(first[1][1], changed_ns[1][1])
+
+        changed_phi = ParameterizedQubit._build_cached_truncated_operator_views(
+            *cache_key,
+            qubit._get_phi_scale_cache_key([1.0, 2.5]),
+            ns_scale_key,
+        )
+
+        self.assertIsNot(first, changed_phi)
+        self.assertIsNot(first[2][1], changed_phi[2][1])
+
+        qubit._charges = np.array([0.5, 0.0])
+        changed_key = qubit._get_hamiltonian_operator_cache_key()
+        changed_charge = ParameterizedQubit._build_cached_truncated_operator_views(
+            *changed_key,
+            phi_scale_key,
+            ns_scale_key,
+        )
+
+        self.assertIsNot(first, changed_charge)
+        self.assertIsNot(first[0][0], changed_charge[0][0])
+
+    def test_transient_hamiltonian_build_preserves_existing_auxiliary_caches(self):
+        qubit = self.make_qubit()
+        qubit._cal_mode = 'Eigen'
+        qubit._charges = np.array([0.0])
+        qubit._Nlevel = np.array([2])
+        qubit.eigenHamiltonian = object()
+        qubit.couplingHamiltonian = object()
+        qubit.highorderHamiltonian = object()
+        qubit.destroyors = ['baseline-destroyor']
+        qubit.n_operators = ['baseline-number']
+        qubit.phi_operators = ['baseline-phase']
+
+        original_eigen = qubit.eigenHamiltonian
+        original_coupling = qubit.couplingHamiltonian
+        original_highorder = qubit.highorderHamiltonian
+        original_destroyors = qubit.destroyors
+        original_numbers = qubit.n_operators
+        original_phases = qubit.phi_operators
+
+        hamiltonian = ParameterizedQubit._generate_hamiltonian(
+            qubit,
+            np.array([[10.0]]),
+            np.array([[20.0]]),
+            np.array([[30.0]]),
+            transient=True,
+        )
+
+        self.assertEqual(hamiltonian.dims, [[2], [2]])
+        self.assertIs(qubit.eigenHamiltonian, original_eigen)
+        self.assertIs(qubit.couplingHamiltonian, original_coupling)
+        self.assertIs(qubit.highorderHamiltonian, original_highorder)
+        self.assertIs(qubit.destroyors, original_destroyors)
+        self.assertIs(qubit.n_operators, original_numbers)
+        self.assertIs(qubit.phi_operators, original_phases)
+
     def test_element_updates_rebuild_parameterized_qubit_via_circuit_module_end_to_end(self):
         qubit = self.make_circuit_rebuild_qubit()
         updated_capac = np.array(
@@ -297,6 +508,31 @@ class ParameterizedQubitRebuildTests(unittest.TestCase):
         self.assertEqual(qubit._last_changed_params, set())
 
 
+class AbstractQubitLazyMaxSpectrumTests(unittest.TestCase):
+    def test_max_spectrum_materializes_lazily_without_replacing_active_solver_state(self):
+        qubit = AbstractQubit(
+            frequency=5e9,
+            anharmonicity=-250e6,
+            qubit_type='Transmon',
+            is_print=False,
+        )
+
+        self.assertIsNone(qubit._max_spectrum_cache)
+        active_hamiltonian = qubit.solver_result.hamiltonian
+        active_levels = np.array(qubit.get_energylevel(), copy=True)
+
+        e_max = qubit.E_max
+        state_max = qubit.state_max
+
+        self.assertIsNotNone(qubit._max_spectrum_cache)
+        self.assertIs(e_max, qubit.E_max)
+        self.assertIs(state_max, qubit.state_max)
+        self.assertGreaterEqual(len(e_max), 3)
+        self.assertEqual(len(e_max), len(state_max))
+        self.assertIs(qubit.solver_result.hamiltonian, active_hamiltonian)
+        np.testing.assert_allclose(qubit.get_energylevel(), active_levels)
+
+
 class MultiQubitRefreshTests(unittest.TestCase):
     def make_model(self, model_cls):
         model = model_cls.__new__(model_cls)
@@ -344,4 +580,3 @@ class MultiQubitRefreshTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -182,4 +182,3 @@ class QubitSplitModuleTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

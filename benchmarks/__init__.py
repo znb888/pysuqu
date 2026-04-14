@@ -1,1 +1,1 @@
-"""Public benchmark harnesses for repeatable local workflow measurements."""
+"""Repeatable benchmark harnesses for QuSim workflows."""

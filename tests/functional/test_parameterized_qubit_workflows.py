@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 
 import numpy as np
 
@@ -67,4 +67,3 @@ class ParameterizedQubitWorkflowTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

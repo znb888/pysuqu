@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from unittest.mock import patch
 
 import numpy as np
@@ -100,4 +100,3 @@ class ReadoutThermalNoiseBoundaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

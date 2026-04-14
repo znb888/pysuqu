@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 
@@ -91,4 +91,3 @@ class DecoherenceRoundHDisplayFormattingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

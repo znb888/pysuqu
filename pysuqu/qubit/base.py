@@ -2,7 +2,9 @@
 
 import math
 from abc import abstractmethod
+from collections import OrderedDict
 from copy import copy
+from functools import lru_cache
 from typing import List, Optional, Union
 
 import numpy as np
@@ -24,6 +26,10 @@ from .circuit import (
 from .solver import HamiltonianEvo
 
 Phi0 = hbar * pi / e
+_QUBIT_EXACT_SOLVE_TEMPLATE_CACHE_MAXSIZE = 64
+_QUBIT_EXACT_SOLVE_TEMPLATE_CACHE = OrderedDict()
+_PARAMETERIZED_EMATRIX_TEMPLATE_CACHE_MAXSIZE = 64
+_PARAMETERIZED_EMATRIX_TEMPLATE_CACHE = OrderedDict()
 
 
 class QubitBase(HamiltonianEvo):
@@ -36,6 +42,146 @@ class QubitBase(HamiltonianEvo):
         'charges': '_charges',
         'cal_mode': '_cal_mode',
     }
+
+    @staticmethod
+    def _clone_qobj(obj: Optional[Qobj]) -> Optional[Qobj]:
+        """Clone one qutip object for per-instance isolation across cached templates."""
+        if obj is None:
+            return None
+        if hasattr(obj, 'copy'):
+            return obj.copy()
+        return copy(obj)
+
+    @staticmethod
+    def _clone_ndarray(values: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        """Clone one ndarray-like payload for per-instance isolation across cached templates."""
+        if values is None:
+            return None
+        return np.array(values, copy=True)
+
+    @classmethod
+    def _clone_qobj_list(cls, objects: Optional[list[Qobj] | tuple[Qobj, ...]]) -> Optional[list[Qobj]]:
+        """Clone a qutip-object list for per-instance isolation across cached templates."""
+        if objects is None:
+            return None
+        return [cls._clone_qobj(obj) for obj in objects]
+
+    @classmethod
+    def _clone_ndarray_mapping(
+        cls,
+        mapping: Optional[dict[str, np.ndarray]],
+    ) -> Optional[dict[str, np.ndarray]]:
+        """Clone one mapping of ndarray payloads for per-instance isolation."""
+        if mapping is None:
+            return None
+        return {key: cls._clone_ndarray(value) for key, value in mapping.items()}
+
+    @staticmethod
+    def _get_array_cache_key(
+        values: np.ndarray,
+        *,
+        as_int: bool = False,
+    ) -> tuple[tuple[int, ...], tuple[float, ...]]:
+        """Normalize one numeric array into a shape-aware exact-input cache key."""
+        array = np.asarray(values)
+        if as_int:
+            flattened = tuple(int(value) for value in array.reshape(-1).tolist())
+        else:
+            flattened = tuple(float(value) for value in array.reshape(-1).tolist())
+        return tuple(int(dim) for dim in array.shape), flattened
+
+    def _get_exact_solve_template_cache_key(self) -> tuple[object, ...]:
+        """Return the exact-input constructor solve-template cache key."""
+        return (
+            self._cal_mode,
+            self._get_array_cache_key(self.Ec),
+            self._get_array_cache_key(self.El),
+            self._get_array_cache_key(self.Ej),
+            self._get_array_cache_key(self._charges),
+            self._get_array_cache_key(self._Nlevel, as_int=True),
+        )
+
+    @classmethod
+    def _get_cached_exact_solve_template(cls, cache_key: tuple[object, ...]) -> Optional[dict[str, object]]:
+        """Return one cached exact-input constructor solve template when available."""
+        template = _QUBIT_EXACT_SOLVE_TEMPLATE_CACHE.get(cache_key)
+        if template is not None:
+            _QUBIT_EXACT_SOLVE_TEMPLATE_CACHE.move_to_end(cache_key)
+        return template
+
+    @classmethod
+    def _store_cached_exact_solve_template(
+        cls,
+        cache_key: tuple[object, ...],
+        template: dict[str, object],
+    ) -> None:
+        """Store one exact-input constructor solve template with LRU-style eviction."""
+        _QUBIT_EXACT_SOLVE_TEMPLATE_CACHE[cache_key] = template
+        _QUBIT_EXACT_SOLVE_TEMPLATE_CACHE.move_to_end(cache_key)
+        if len(_QUBIT_EXACT_SOLVE_TEMPLATE_CACHE) > _QUBIT_EXACT_SOLVE_TEMPLATE_CACHE_MAXSIZE:
+            _QUBIT_EXACT_SOLVE_TEMPLATE_CACHE.popitem(last=False)
+
+    @classmethod
+    def _clear_exact_solve_template_cache(cls) -> None:
+        """Clear the exact-input constructor solve-template cache used by repeated builds."""
+        _QUBIT_EXACT_SOLVE_TEMPLATE_CACHE.clear()
+
+    def _restore_cached_exact_solve_template_if_available(self) -> bool:
+        """Restore one exact-input solve template when the live state matches a cached build."""
+        if getattr(self, '_cal_mode', None) != 'Eigen':
+            return False
+
+        cache_key = self._get_exact_solve_template_cache_key()
+        cached_template = self._get_cached_exact_solve_template(cache_key)
+        if cached_template is None:
+            return False
+
+        self._restore_exact_solve_template(cached_template)
+        return True
+
+    def _store_current_exact_solve_template(self) -> None:
+        """Persist the current exact-input solve template for later same-process reuse."""
+        if getattr(self, '_cal_mode', None) != 'Eigen':
+            return
+
+        self._store_cached_exact_solve_template(
+            self._get_exact_solve_template_cache_key(),
+            self._capture_exact_solve_template(),
+        )
+
+    def _capture_exact_solve_template(self) -> dict[str, object]:
+        """Capture the current solved constructor state for exact-input reuse."""
+        return {
+            'hamiltonian': self._clone_qobj(self._Hamiltonian),
+            'energylevels': np.array(self._energylevels, copy=True),
+            'eigenstates': tuple(self._clone_qobj(state) for state in self._eigenstates),
+            'destroyors': tuple(self._clone_qobj_list(getattr(self, 'destroyors', None)) or ()),
+            'number_operators': tuple(self._clone_qobj_list(getattr(self, 'n_operators', None)) or ()),
+            'phase_operators': tuple(self._clone_qobj_list(getattr(self, 'phi_operators', None)) or ()),
+            'eigen_hamiltonian': self._clone_qobj(getattr(self, 'eigenHamiltonian', None)),
+            'coupling_hamiltonian': self._clone_qobj(getattr(self, 'couplingHamiltonian', None)),
+            'highorder_hamiltonian': self._clone_qobj(getattr(self, 'highorderHamiltonian', None)),
+        }
+
+    def _restore_exact_solve_template(self, template: dict[str, object]) -> None:
+        """Restore one cached constructor solve template onto this instance."""
+        self._hamiltonian = self._clone_qobj(template['hamiltonian'])
+        self._Hamiltonian = self._hamiltonian
+        self._energylevels = np.array(template['energylevels'], copy=True)
+        self._eigenstates = self._clone_qobj_list(template['eigenstates'])
+        self.destroyors = self._clone_qobj_list(template['destroyors'])
+        self.n_operators = self._clone_qobj_list(template['number_operators'])
+        self.phi_operators = self._clone_qobj_list(template['phase_operators'])
+        self.eigenHamiltonian = self._clone_qobj(template['eigen_hamiltonian'])
+        self.couplingHamiltonian = self._clone_qobj(template['coupling_hamiltonian'])
+        self.highorderHamiltonian = self._clone_qobj(template['highorder_hamiltonian'])
+        self._Nlevel = list(self._Hamiltonian.dims[0])
+        self._qubits_num = len(self._Nlevel)
+        self._solver_result = self._build_solver_result(
+            self._Hamiltonian,
+            self._energylevels,
+            self._eigenstates,
+        )
 
     def _normalize_flux_input(self, value):
         """Accept scalar, reduced, or full flux forms for active qubit workflows."""
@@ -106,16 +252,45 @@ class QubitBase(HamiltonianEvo):
         self._cal_mode = cal_mode
         self._Nlevel = np.array(trunc_ener_level) if np.any(trunc_ener_level) else [10] * self._numQubits
 
-        hamil_max = self._generate_hamiltonian(self.Ec, self.El, self.Ejmax)
-        hamilmax = HamiltonianEvo(hamil_max)
-        self.E_max = hamilmax.get_energylevel()
-        self.state_max = hamilmax.get_eigenstate()
+        self._max_spectrum_inputs = (
+            np.array(self.Ec, copy=True),
+            np.array(self.El, copy=True),
+            np.array(self.Ejmax, copy=True),
+        )
+        self._max_spectrum_cache = None
 
         if not hasattr(self, '_flux'):
             self._flux = np.array(fluxes) if np.any(fluxes) else np.zeros_like(Ej)
         self._update_Ej()
-        self._hamiltonian = self._generate_hamiltonian(self.Ec, self.El, self.Ej)
-        super().__init__(self._hamiltonian, *args, **kwargs)
+        if self._restore_cached_exact_solve_template_if_available():
+            pass
+        else:
+            self._hamiltonian = self._generate_hamiltonian(self.Ec, self.El, self.Ej)
+            super().__init__(self._hamiltonian, *args, **kwargs)
+            self._store_current_exact_solve_template()
+
+    def _materialize_max_spectrum_cache(self) -> tuple[np.ndarray, list[Qobj]]:
+        """Build the max-bias spectrum lazily without disturbing the active solver state."""
+        if self._max_spectrum_cache is None:
+            ec, el, ejmax = self._max_spectrum_inputs
+            hamil_max = self._generate_hamiltonian(ec, el, ejmax, transient=True)
+            hamilmax = HamiltonianEvo(hamil_max)
+            self._max_spectrum_cache = (
+                hamilmax.get_energylevel(),
+                hamilmax.get_eigenstate(),
+            )
+
+        return self._max_spectrum_cache
+
+    @property
+    def E_max(self) -> np.ndarray:
+        """Sweet-spot energy levels [2*pi*GHz], materialized only when requested."""
+        return self._materialize_max_spectrum_cache()[0]
+
+    @property
+    def state_max(self) -> list[Qobj]:
+        """Sweet-spot eigenstates, materialized only when requested."""
+        return self._materialize_max_spectrum_cache()[1]
 
     def _update_Ej(self):
         """Update Ej based on current flux and junction ratio."""
@@ -128,23 +303,62 @@ class QubitBase(HamiltonianEvo):
             1 + ((ratio - 1) * np.tan(pi * flux) / (ratio + 1)) ** 2
         )
 
-    def _hamiltonianOperator(self) -> list[Qobj]:
+    def _get_hamiltonian_operator_cache_key(self) -> tuple[tuple[int, ...], tuple[float, ...], int]:
+        """Return the cache key for reusable Hamiltonian operator scaffolding."""
+        nlevel_key = tuple(int(level) for level in np.asarray(self._Nlevel).reshape(-1).tolist())
+        charges_key = tuple(float(charge) for charge in np.asarray(self._charges).reshape(-1).tolist())
+        return nlevel_key, charges_key, int(self._numQubits)
+
+    @staticmethod
+    @lru_cache(maxsize=64)
+    def _build_cached_hamiltonian_operators(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+    ) -> tuple[tuple[Qobj, ...], ...]:
+        """Construct reusable operator tensors once per truncation/charge configuration."""
         destroyors = []
         charge_op = []
-        N_level = np.asarray(self._Nlevel) + 8
-        for ii in range(self._numQubits):
-            opstr1 = [destroy(N_level[jj]) if ii == jj else qeye(N_level[jj]) for jj in range(self._numQubits)]
+        N_level = np.asarray(nlevel_key) + 8
+        for ii in range(num_qubits):
+            opstr1 = [destroy(N_level[jj]) if ii == jj else qeye(N_level[jj]) for jj in range(num_qubits)]
             opstr2 = [
-                self._charges[ii] * qeye(N_level[jj]) if ii == jj else qeye(N_level[jj])
-                for jj in range(self._numQubits)
+                charges_key[ii] * qeye(N_level[jj]) if ii == jj else qeye(N_level[jj])
+                for jj in range(num_qubits)
             ]
             destroyors.append(tensor(*opstr1))
             charge_op.append(tensor(*opstr2))
 
         ns_norm = [(-1j) * (des - des.dag()) / 2 for des in destroyors]
         phis_norm = [(des + des.dag()) for des in destroyors]
+        number_ops = [des.dag() * des for des in destroyors]
+        phis_norm_power_terms = [QubitBase._build_even_operator_powers(phi) for phi in phis_norm]
 
-        return [destroyors, ns_norm, phis_norm, charge_op]
+        return (
+            tuple(destroyors),
+            tuple(ns_norm),
+            tuple(phis_norm),
+            tuple(charge_op),
+            tuple(number_ops),
+            tuple(phis_norm_power_terms),
+        )
+
+    def _build_hamiltonian_operators(self) -> tuple[tuple[Qobj, ...], ...]:
+        """Return the reusable operator tensors for the current truncation and charges."""
+        return self._build_cached_hamiltonian_operators(*self._get_hamiltonian_operator_cache_key())
+
+    def _hamiltonianOperator(self) -> list[object]:
+        """Reuse Hamiltonian operator scaffolding until truncation or charge settings change."""
+        cache_key = self._get_hamiltonian_operator_cache_key()
+        cached_key = getattr(self, '_hamiltonian_operator_cache_key', None)
+        cached_operators = getattr(self, '_hamiltonian_operator_cache', None)
+
+        if cached_key != cache_key or cached_operators is None:
+            cached_operators = self._build_hamiltonian_operators()
+            self._hamiltonian_operator_cache_key = cache_key
+            self._hamiltonian_operator_cache = cached_operators
+
+        return cached_operators
 
     @staticmethod
     def _build_even_operator_powers(operator: Qobj) -> tuple[Qobj, Qobj, Qobj, Qobj]:
@@ -155,52 +369,192 @@ class QubitBase(HamiltonianEvo):
         operator_eighth = operator_fourth * operator_fourth
         return operator_squared, operator_fourth, operator_sixth, operator_eighth
 
+    @staticmethod
+    def _scale_even_operator_powers(
+        scale: float,
+        operator_powers: tuple[Qobj, Qobj, Qobj, Qobj],
+    ) -> tuple[Qobj, Qobj, Qobj, Qobj]:
+        """Scale cached even-power scaffolding for the current phase-operator prefactor."""
+        scale_squared = scale * scale
+        scale_fourth = scale_squared * scale_squared
+        scale_sixth = scale_fourth * scale_squared
+        scale_eighth = scale_fourth * scale_fourth
+        operator_squared, operator_fourth, operator_sixth, operator_eighth = operator_powers
+        return (
+            scale_squared * operator_squared,
+            scale_fourth * operator_fourth,
+            scale_sixth * operator_sixth,
+            scale_eighth * operator_eighth,
+        )
+
+    @staticmethod
+    def _get_pair_indices(num_qubits: int) -> tuple[tuple[int, int], ...]:
+        """Return the unordered qubit-pair indices used by the Hamiltonian assembly."""
+        return tuple(
+            (ii, jj)
+            for ii in range(num_qubits)
+            for jj in range(ii + 1, num_qubits)
+        )
+
+    @staticmethod
+    def _get_phi_scale_cache_key(phi_scales: list[float]) -> tuple[float, ...]:
+        """Return the exact-input cache key for scaled phase-operator reuse."""
+        return tuple(float(scale) for scale in phi_scales)
+
+    @staticmethod
+    def _get_ns_scale_cache_key(ns_scales: list[float]) -> tuple[float, ...]:
+        """Return the exact-input cache key for scaled number-operator reuse."""
+        return tuple(float(scale) for scale in ns_scales)
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _build_cached_scaled_phase_terms(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        phi_scale_key: tuple[float, ...],
+    ) -> tuple[tuple[Qobj, ...], tuple[tuple[Qobj, Qobj, Qobj, Qobj], ...]]:
+        """Build scaled phase operators and even-power terms once per exact scale tuple."""
+        _, _, phis_norm, _, _, phis_norm_power_terms = QubitBase._build_cached_hamiltonian_operators(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+        )
+        phis_op = tuple(
+            phi_scale_key[ii] * phis_norm[ii]
+            for ii in range(num_qubits)
+        )
+        phi_power_terms = tuple(
+            QubitBase._scale_even_operator_powers(phi_scale_key[ii], phis_norm_power_terms[ii])
+            for ii in range(num_qubits)
+        )
+        return phis_op, phi_power_terms
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _build_cached_pair_power_terms(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        phi_scale_key: tuple[float, ...],
+    ) -> tuple[tuple[tuple[int, int], tuple[Qobj, Qobj, Qobj, Qobj]], ...]:
+        """Build transient pair-power scaffolding once per exact scale tuple."""
+        phis_op, _ = QubitBase._build_cached_scaled_phase_terms(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+            phi_scale_key,
+        )
+        return tuple(
+            (
+                (ii, jj),
+                QubitBase._build_even_operator_powers(phis_op[ii] - phis_op[jj]),
+            )
+            for ii, jj in QubitBase._get_pair_indices(num_qubits)
+        )
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _build_cached_truncated_operator_views(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        phi_scale_key: tuple[float, ...],
+        ns_scale_key: tuple[float, ...],
+    ) -> tuple[tuple[Qobj, ...], tuple[Qobj, ...], tuple[Qobj, ...]]:
+        """Build constructor-side truncated operator views once per exact input scales."""
+        destroyors, ns_norm, _, charge_op, _, _ = QubitBase._build_cached_hamiltonian_operators(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+        )
+        phis_op, _ = QubitBase._build_cached_scaled_phase_terms(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+            phi_scale_key,
+        )
+        ns_op = tuple(
+            ns_scale_key[ii] * ns_norm[ii] - charge_op[ii]
+            for ii in range(num_qubits)
+        )
+        trunc_levels = list(nlevel_key)
+        return (
+            tuple(truncate_hilbert_space(a, trunc_levels) for a in destroyors),
+            tuple(truncate_hilbert_space(n, trunc_levels) for n in ns_op),
+            tuple(truncate_hilbert_space(phi, trunc_levels) for phi in phis_op),
+        )
+
     def _generate_hamiltonian(
         self,
         Ec: np.ndarray,
         El: np.ndarray,
         Ej: np.ndarray,
+        *,
+        transient: bool = False,
     ) -> Qobj:
         if self._cal_mode == 'Eigen':
-            destroyors, ns_norm, phis_norm, charge_op = self._hamiltonianOperator()
+            (
+                destroyors,
+                ns_norm,
+                phis_norm,
+                charge_op,
+                number_ops,
+                phis_norm_power_terms,
+            ) = self._hamiltonianOperator()
+            ns_scales = [
+                ((Ej[ii, ii] + El[ii, ii]) / 2 / Ec[ii, ii]) ** (1 / 4)
+                for ii in range(self._numQubits)
+            ]
             ns_op = [
-                ((Ej[ii, ii] + El[ii, ii]) / 2 / Ec[ii, ii]) ** (1 / 4) * ns_norm[ii] - charge_op[ii]
+                ns_scales[ii] * ns_norm[ii] - charge_op[ii]
                 for ii in range(self._numQubits)
             ]
-            phis_op = [
-                (2 * Ec[ii, ii] / (Ej[ii, ii] + El[ii, ii])) ** (1 / 4) * phis_norm[ii]
+            phi_scales = [
+                (2 * Ec[ii, ii] / (Ej[ii, ii] + El[ii, ii])) ** (1 / 4)
                 for ii in range(self._numQubits)
             ]
-            phi_power_terms = [self._build_even_operator_powers(phi_operator) for phi_operator in phis_op]
-            pair_power_terms = {
-                (ii, jj): self._build_even_operator_powers(phis_op[ii] - phis_op[jj])
-                for ii in range(self._numQubits)
-                for jj in range(ii + 1, self._numQubits)
-            }
+            operator_cache_key = self._get_hamiltonian_operator_cache_key()
+            phi_scale_key = self._get_phi_scale_cache_key(phi_scales)
+            ns_scale_key = self._get_ns_scale_cache_key(ns_scales)
+            phis_op, phi_power_terms = self._build_cached_scaled_phase_terms(
+                *operator_cache_key,
+                phi_scale_key,
+            )
+            # Off-diagonal terms only use even powers, so (phi_i - phi_j) and (phi_j - phi_i)
+            # can share the same cached matrices even when the coefficient matrices are asymmetric.
+            pair_indices = self._get_pair_indices(self._numQubits)
+            pair_power_terms = dict(
+                self._build_cached_pair_power_terms(
+                    *operator_cache_key,
+                    phi_scale_key,
+                )
+            )
             factorial_6 = math.factorial(6)
             factorial_8 = math.factorial(8)
             hamil_c_terms = []
             hamil_high_pair_terms = []
 
-            for ii in range(self._numQubits):
-                for jj in range(self._numQubits):
-                    if ii == jj:
-                        continue
+            for ii, jj in pair_indices:
+                ec_pair = Ec[ii, jj] + Ec[jj, ii]
+                el_pair = El[ii, jj] + El[jj, ii]
+                ej_pair = Ej[ii, jj] + Ej[jj, ii]
+                if ec_pair == 0 and el_pair == 0 and ej_pair == 0:
+                    continue
 
-                    pair_key = (ii, jj) if ii < jj else (jj, ii)
-                    delta_squared, delta_fourth, delta_sixth, delta_eighth = pair_power_terms[pair_key]
-                    hamil_c_terms.append(
-                        4 * Ec[ii, jj] * ns_op[ii] * ns_op[jj]
-                        + El[ii, jj] * phis_op[ii] * phis_op[jj] / 2
-                        - Ej[ii, jj] * (-delta_squared / 2 + delta_fourth / 24)
-                    )
-                    hamil_high_pair_terms.append(
-                        Ej[ii, jj] * (delta_sixth / factorial_6 - delta_eighth / factorial_8)
-                    )
+                delta_squared, delta_fourth, delta_sixth, delta_eighth = pair_power_terms[(ii, jj)]
+                hamil_c_terms.append(
+                    4 * ec_pair * ns_op[ii] * ns_op[jj]
+                    + el_pair * phis_op[ii] * phis_op[jj] / 2
+                    - ej_pair * (-delta_squared / 2 + delta_fourth / 24)
+                )
+                hamil_high_pair_terms.append(
+                    ej_pair * (delta_sixth / factorial_6 - delta_eighth / factorial_8)
+                )
 
             hamil_0 = sum(
                 [
-                    np.sqrt(8 * Ec[ii, ii] * (El[ii, ii] + Ej[ii, ii])) * destroyors[ii].dag() * destroyors[ii]
+                    np.sqrt(8 * Ec[ii, ii] * (El[ii, ii] + Ej[ii, ii])) * number_ops[ii]
                     - (Ej[ii, ii] * phi_power_terms[ii][1]) / 24
                     for ii in range(self._numQubits)
                 ]
@@ -215,15 +569,21 @@ class QubitBase(HamiltonianEvo):
             )
             hamil_high += sum(hamil_high_pair_terms)
 
-            self.eigenHamiltonian = hamil_0
-            self.couplingHamiltonian = hamil_c
-            self.highorderHamiltonian = hamil_high
             hamil_all = hamil_0 + hamil_c + hamil_high
 
             hamil_all = truncate_hilbert_space(hamil_all, self._Nlevel)
-            self.n_operators = [truncate_hilbert_space(n, self._Nlevel) for n in ns_op]
-            self.phi_operators = [truncate_hilbert_space(phi, self._Nlevel) for phi in phis_op]
-            self.destroyors = [truncate_hilbert_space(a, self._Nlevel) for a in destroyors]
+            if not transient:
+                self.eigenHamiltonian = hamil_0
+                self.couplingHamiltonian = hamil_c
+                self.highorderHamiltonian = hamil_high
+                cached_destroyors, cached_numbers, cached_phases = self._build_cached_truncated_operator_views(
+                    *operator_cache_key,
+                    phi_scale_key,
+                    ns_scale_key,
+                )
+                self.n_operators = list(cached_numbers)
+                self.phi_operators = list(cached_phases)
+                self.destroyors = list(cached_destroyors)
 
         elif self._cal_mode == 'Charge':
             nlist = np.arange(-self._Nlevel[0], self._Nlevel[0] + 1, 1) - self._charges[0]
@@ -356,6 +716,34 @@ class ParameterizedQubit(QubitBase):
     }
     _ELEMENT_PARAMS = {'capac', 'resis', 'induc', 'struct'}
 
+    @classmethod
+    def _get_cached_ematrix_template(
+        cls,
+        cache_key: tuple[object, ...],
+    ) -> Optional[dict[str, object]]:
+        """Return one cached exact-input element-matrix template when available."""
+        template = _PARAMETERIZED_EMATRIX_TEMPLATE_CACHE.get(cache_key)
+        if template is not None:
+            _PARAMETERIZED_EMATRIX_TEMPLATE_CACHE.move_to_end(cache_key)
+        return template
+
+    @classmethod
+    def _store_cached_ematrix_template(
+        cls,
+        cache_key: tuple[object, ...],
+        template: dict[str, object],
+    ) -> None:
+        """Store one exact-input element-matrix template with LRU-style eviction."""
+        _PARAMETERIZED_EMATRIX_TEMPLATE_CACHE[cache_key] = template
+        _PARAMETERIZED_EMATRIX_TEMPLATE_CACHE.move_to_end(cache_key)
+        if len(_PARAMETERIZED_EMATRIX_TEMPLATE_CACHE) > _PARAMETERIZED_EMATRIX_TEMPLATE_CACHE_MAXSIZE:
+            _PARAMETERIZED_EMATRIX_TEMPLATE_CACHE.popitem(last=False)
+
+    @classmethod
+    def _clear_ematrix_template_cache(cls) -> None:
+        """Clear the exact-input element-matrix template cache used by repeated builds."""
+        _PARAMETERIZED_EMATRIX_TEMPLATE_CACHE.clear()
+
     def __init__(
         self,
         capacitances: list[list],
@@ -392,6 +780,7 @@ class ParameterizedQubit(QubitBase):
             self._flux = np.array(fluxes) if np.any(fluxes) else np.zeros_like(self.__capac)
         self.__nodes = self.__capac.shape[0]
         self._junc_ratio = junc_ratio if np.any(junc_ratio) else np.ones_like(self._flux)
+        self._transformed_vars_dirty = True
         if np.any(structure_index):
             self._numQubits = len(structure_index)
             self.__struct = structure_index
@@ -415,18 +804,54 @@ class ParameterizedQubit(QubitBase):
             **kwargs,
         )
 
-    def _generate_Ematrix(self):
-        self.SMatrix, retainNodes = assemble_s_matrix_and_retain_nodes(self.__struct)
-        self.SMatrix_retainNodes = retainNodes
-        self.Maxwellmat, self.__Ec, self.__El, self.__Ej0 = convert_elements_to_energy_matrices(
-            self.__capac,
-            self.__induc,
-            self.__resis,
-            self.SMatrix,
-            retainNodes,
-            self.__struct,
-            convert_resistance_to_ej0,
+    def _get_ematrix_template_cache_key(self) -> tuple[object, ...]:
+        """Return the exact-input cache key for reusable circuit-element matrix templates."""
+        return (
+            tuple(int(item) for item in np.asarray(self.__struct).reshape(-1).tolist()),
+            self._get_array_cache_key(self.__capac),
+            self._get_array_cache_key(self.__induc),
+            self._get_array_cache_key(self.__resis),
         )
+
+    def _capture_ematrix_template(self) -> dict[str, object]:
+        """Capture the current circuit-element matrix bundle for exact-input reuse."""
+        return {
+            's_matrix': self._clone_ndarray(self.SMatrix),
+            'retain_nodes': tuple(int(node) for node in self.SMatrix_retainNodes),
+            'maxwell_matrix': self._clone_ndarray_mapping(self.Maxwellmat),
+            'ec_matrix': self._clone_ndarray(self.__Ec),
+            'el_matrix': self._clone_ndarray(self.__El),
+            'ej0_matrix': self._clone_ndarray(self.__Ej0),
+        }
+
+    def _restore_ematrix_template(self, template: dict[str, object]) -> None:
+        """Restore one cached circuit-element matrix bundle onto this instance."""
+        self.SMatrix = self._clone_ndarray(template['s_matrix'])
+        self.SMatrix_retainNodes = list(template['retain_nodes'])
+        self.Maxwellmat = self._clone_ndarray_mapping(template['maxwell_matrix'])
+        self.__Ec = self._clone_ndarray(template['ec_matrix'])
+        self.__El = self._clone_ndarray(template['el_matrix'])
+        self.__Ej0 = self._clone_ndarray(template['ej0_matrix'])
+
+    def _generate_Ematrix(self):
+        cache_key = self._get_ematrix_template_cache_key()
+        cached_template = self._get_cached_ematrix_template(cache_key)
+        if cached_template is None:
+            self.SMatrix, retainNodes = assemble_s_matrix_and_retain_nodes(self.__struct)
+            self.SMatrix_retainNodes = retainNodes
+            self.Maxwellmat, self.__Ec, self.__El, self.__Ej0 = convert_elements_to_energy_matrices(
+                self.__capac,
+                self.__induc,
+                self.__resis,
+                self.SMatrix,
+                retainNodes,
+                self.__struct,
+                convert_resistance_to_ej0,
+            )
+            self._store_cached_ematrix_template(cache_key, self._capture_ematrix_template())
+        else:
+            self._restore_ematrix_template(cached_template)
+            retainNodes = self.SMatrix_retainNodes
 
         self._flux_transformed = project_transformed_flux(self._flux, self.__struct, retainNodes)
         self._junc_ratio_transformed = project_transformed_junction_ratio(
@@ -434,6 +859,7 @@ class ParameterizedQubit(QubitBase):
             self.__struct,
             retainNodes,
         )
+        self._transformed_vars_dirty = False
 
         return self.__Ec, self.__El, self.__Ej0
 
@@ -459,6 +885,13 @@ class ParameterizedQubit(QubitBase):
         This method should be called after change_para updates _flux or _junc_ratio,
         before _update_Ej recalculates Ej.
         """
+        if (
+            not getattr(self, '_transformed_vars_dirty', True)
+            and hasattr(self, '_flux_transformed')
+            and hasattr(self, '_junc_ratio_transformed')
+        ):
+            return
+
         self._flux_transformed = project_transformed_flux(
             self._flux,
             self.__struct,
@@ -469,6 +902,7 @@ class ParameterizedQubit(QubitBase):
             self.__struct,
             self.SMatrix_retainNodes,
         )
+        self._transformed_vars_dirty = False
 
     def _update_Ej(self):
         """
@@ -502,6 +936,8 @@ class ParameterizedQubit(QubitBase):
         Handles flux transformation and Ej recalculation for ParameterizedQubit.
         """
         changed_params = getattr(self, '_last_changed_params', set())
+        if changed_params & (self._ELEMENT_PARAMS | {'flux', 'junc_ratio'}):
+            self._transformed_vars_dirty = True
 
         if changed_params & self._ELEMENT_PARAMS:
             self._normalize_element_inputs()
@@ -522,14 +958,136 @@ class ParameterizedQubit(QubitBase):
 
         self.Ej = self._Ejphi(ejmax_to_use, flux_to_use, junc_ratio_to_use)
 
+        if self._restore_cached_exact_solve_template_if_available():
+            self._last_changed_params = set()
+            return
+
         # Regenerate Hamiltonian
         self._hamiltonian = self._generate_hamiltonian(self.Ec, self.El, self.Ej)
         self.change_hamiltonian(self._hamiltonian)
+        self._store_current_exact_solve_template()
         self._last_changed_params = set()
 
 
 class AbstractQubit(QubitBase):
     """Abstract qubit class for generating qubits from frequency information."""
+
+    @staticmethod
+    def _clone_qobj(obj: Qobj) -> Qobj:
+        """Clone a qutip object for per-instance isolation across cached templates."""
+        if hasattr(obj, 'copy'):
+            return obj.copy()
+        return copy(obj)
+
+    @classmethod
+    def _clone_qobj_list(cls, objects: Optional[list[Qobj]]) -> Optional[list[Qobj]]:
+        if objects is None:
+            return None
+        return [cls._clone_qobj(obj) for obj in objects]
+
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def _solve_transmon_ec_ej(target_f01: float, target_anh: float) -> tuple[float, float, bool, int, float, float]:
+        """Cache the deterministic Transmon parameter inversion used by constructor-style callers."""
+        Ec_guess = -target_anh
+        Ej_guess = (target_f01 + Ec_guess) ** 2 / (8 * Ec_guess)
+
+        initial_guess = [Ec_guess, Ej_guess]
+
+        def cost_function(params):
+            Ec_curr, Ej_curr = params
+
+            if Ec_curr <= 0 or Ej_curr <= 0:
+                return 1e9
+
+            f01_calc, anh_calc = AbstractQubit.get_transmon_spectrum_fast(Ec_curr, Ej_curr)
+
+            weight_anh = 10.0
+            return (f01_calc - target_f01) ** 2 + weight_anh * (anh_calc - target_anh) ** 2
+
+        result = minimize(cost_function, initial_guess, method='Nelder-Mead', tol=1e-8)
+        Ec_final, Ej_final = (float(value) for value in result.x)
+        f01_final, anh_final = AbstractQubit.get_transmon_spectrum_fast(Ec_final, Ej_final)
+        return (
+            Ec_final,
+            Ej_final,
+            bool(result.success),
+            int(result.nit),
+            float(f01_final),
+            float(anh_final),
+        )
+
+    @classmethod
+    @lru_cache(maxsize=128)
+    def _build_cached_transmon_template(
+        cls,
+        target_f01: float,
+        target_anh: float,
+        target_f01_max: float,
+        energy_trunc_level: int,
+    ) -> dict[str, object]:
+        """Build and cache a solved single-qubit Transmon template for repeated constructor callers."""
+        if target_anh > 0:
+            target_anh = -target_anh
+
+        Ec_final, Ej_final, _, _, _, _ = cls._solve_transmon_ec_ej(target_f01_max, target_anh)
+        flux = np.arccos(((target_f01 - target_anh) / (target_f01_max - target_anh)) ** 2) / pi
+        template_qubit = QubitBase(
+            Ec=np.array([[Ec_final * 2 * pi]]),
+            El=np.array([[0.0]]),
+            Ej=np.array([[Ej_final * 2 * pi]]),
+            fluxes=[[flux]],
+            trunc_ener_level=[energy_trunc_level],
+        )
+        return {
+            'Ec': np.array(template_qubit.Ec, copy=True),
+            'El': np.array(template_qubit.El, copy=True),
+            'Ejmax': np.array(template_qubit.Ejmax, copy=True),
+            'Ej': np.array(template_qubit.Ej, copy=True),
+            'flux': float(flux),
+            'flux_matrix': np.array(template_qubit._flux, copy=True),
+            'junc_ratio': np.array(template_qubit._junc_ratio, copy=True),
+            'charges': np.array(template_qubit._charges, copy=True),
+            'cal_mode': template_qubit._cal_mode,
+            'hamiltonian': cls._clone_qobj(template_qubit._Hamiltonian),
+            'energylevels': np.array(template_qubit._energylevels, copy=True),
+            'eigenstates': tuple(cls._clone_qobj(state) for state in template_qubit._eigenstates),
+            'destroyors': tuple(cls._clone_qobj(op) for op in template_qubit.destroyors),
+            'number_operators': tuple(cls._clone_qobj(op) for op in template_qubit.n_operators),
+            'phase_operators': tuple(cls._clone_qobj(op) for op in template_qubit.phi_operators),
+        }
+
+    def _restore_cached_transmon_template(self, template: dict[str, object]) -> None:
+        """Restore a solved Transmon template without rerunning the constructor hot path."""
+        self.Ec = np.array(template['Ec'], copy=True)
+        self.El = np.array(template['El'], copy=True)
+        self.Ejmax = np.array(template['Ejmax'], copy=True)
+        self.Ej = np.array(template['Ej'], copy=True)
+        self._flux = np.array(template['flux_matrix'], copy=True)
+        self._junc_ratio = np.array(template['junc_ratio'], copy=True)
+        self._charges = np.array(template['charges'], copy=True)
+        self._cal_mode = template['cal_mode']
+        self._hamiltonian = self._clone_qobj(template['hamiltonian'])
+        self._Hamiltonian = self._hamiltonian
+        self._energylevels = np.array(template['energylevels'], copy=True)
+        self._eigenstates = self._clone_qobj_list(template['eigenstates'])
+        self.destroyors = self._clone_qobj_list(template['destroyors'])
+        self.n_operators = self._clone_qobj_list(template['number_operators'])
+        self.phi_operators = self._clone_qobj_list(template['phase_operators'])
+        self._numQubits = 1
+        self._Nlevel = list(self._Hamiltonian.dims[0])
+        self._qubits_num = len(self._Nlevel)
+        self._max_spectrum_inputs = (
+            np.array(self.Ec, copy=True),
+            np.array(self.El, copy=True),
+            np.array(self.Ejmax, copy=True),
+        )
+        self._max_spectrum_cache = None
+        self._solver_result = self._build_solver_result(
+            self._Hamiltonian,
+            self._energylevels,
+            self._eigenstates,
+        )
 
     def __init__(
         self,
@@ -560,16 +1118,26 @@ class AbstractQubit(QubitBase):
         self.qubit_type = qubit_type
         self.flux = np.arccos(((frequency - anharmonicity) / (frequency_max - anharmonicity)) ** 2) / pi
         self.energy_trunc_level = [energy_trunc_level]
-        self.cal_Emat_by_type(qubit_type)
-        super().__init__(
-            Ec=self.Ec,
-            El=self.El,
-            Ej=self.Ejmax,
-            fluxes=[[self.flux]],
-            trunc_ener_level=[energy_trunc_level],
-            *args,
-            **kwargs,
-        )
+        if qubit_type == 'Transmon':
+            template = self._build_cached_transmon_template(
+                self.qubit_f01,
+                self.qubit_anharm,
+                self.qubit_f01_max,
+                int(energy_trunc_level),
+            )
+            self.flux = template['flux']
+            self._restore_cached_transmon_template(template)
+        else:
+            self.cal_Emat_by_type(qubit_type)
+            super().__init__(
+                Ec=self.Ec,
+                El=self.El,
+                Ej=self.Ejmax,
+                fluxes=[[self.flux]],
+                trunc_ener_level=[energy_trunc_level],
+                *args,
+                **kwargs,
+            )
         self.qubit_f01 = self.get_energylevel(1) / 2 / pi
         self.qubit_anharm = self.get_energylevel(2) / 2 / pi - 2 * self.qubit_f01
         if is_print:
@@ -695,43 +1263,28 @@ class AbstractQubit(QubitBase):
         Iteratively finds the exact Ec and Ej that yield the target f01 and anharmonicity.
         Uses analytical formulas as the starting point (initial guess).
         """
+        target_f01 = float(target_f01)
+        target_anh = float(target_anh)
         if target_anh > 0:
             target_anh = -target_anh
             if is_print:
                 print("Note: Converted target anharmonicity to negative value.")
-
         Ec_guess = -target_anh
         Ej_guess = (target_f01 + Ec_guess) ** 2 / (8 * Ec_guess)
-
-        initial_guess = [Ec_guess, Ej_guess]
 
         if is_print:
             print(f"--- Optimization Start ---")
             print(f"Target: f01 = {target_f01:.5f} GHz, alpha = {target_anh:.5f} GHz")
             print(f"Initial Guess (Analytical): Ec = {Ec_guess:.4f}, Ej = {Ej_guess:.4f}")
-
-        def cost_function(params):
-            Ec_curr, Ej_curr = params
-
-            if Ec_curr <= 0 or Ej_curr <= 0:
-                return 1e9
-
-            f01_calc, anh_calc = self.get_transmon_spectrum_fast(Ec_curr, Ej_curr)
-
-            weight_anh = 10.0
-            error = (f01_calc - target_f01) ** 2 + weight_anh * (anh_calc - target_anh) ** 2
-            return error
-
-        result = minimize(cost_function, initial_guess, method='Nelder-Mead', tol=1e-8)
-
-        Ec_final, Ej_final = result.x
-
-        f01_final, anh_final = self.get_transmon_spectrum_fast(Ec_final, Ej_final)
+        Ec_final, Ej_final, success, iterations, f01_final, anh_final = self._solve_transmon_ec_ej(
+            target_f01,
+            target_anh,
+        )
 
         if is_print:
             print(f"--- Optimization Result ---")
-            print(f"Success: {result.success}")
-            print(f"Iterations: {result.nit}")
+            print(f"Success: {success}")
+            print(f"Iterations: {iterations}")
             print(f"Optimized Ec = {Ec_final:.6f} GHz")
             print(f"Optimized Ej = {Ej_final:.6f} GHz")
             print(f"Ej/Ec Ratio  = {Ej_final/Ec_final:.2f}")

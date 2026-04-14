@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from unittest import mock
@@ -117,4 +117,3 @@ class SingleQubitRuntimeBaselineTests(unittest.TestCase):
         self.assertAlmostEqual(qubit.qr_g / (2 * np.pi * 1e6), 62.478695239773046, places=6)
         self.assertAlmostEqual(spectrum.f01, qubit.f01, places=12)
         self.assertAlmostEqual(spectrum.anharmonicity, qubit.anharmonicity, places=12)
-

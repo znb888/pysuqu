@@ -2,17 +2,9 @@
 
 from .dequbit import Decoherence, RNoiseDecoherence, XYNoiseDecoherence, ZNoiseDecoherence
 from .electronics import ElectronicNoise
-from .results import (
-    BiasCurrentVoltageResult,
-    NoiseFitResult,
-    NoisePipelineStage,
-    T1Result,
-    TphiResult,
-    XYCurrentVoltageResult,
-)
+from .results import NoiseFitResult, NoisePipelineStage, T1Result, TphiResult
 
 __all__ = [
-    'BiasCurrentVoltageResult',
     'Decoherence',
     'ElectronicNoise',
     'NoiseFitResult',
@@ -20,7 +12,6 @@ __all__ = [
     'RNoiseDecoherence',
     'T1Result',
     'TphiResult',
-    'XYCurrentVoltageResult',
     'XYNoiseDecoherence',
     'ZNoiseDecoherence',
 ]

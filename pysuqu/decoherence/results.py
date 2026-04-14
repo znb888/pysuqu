@@ -52,7 +52,7 @@ class TphiResult:
 
 @dataclass(frozen=True)
 class T1Result:
-    """Structured draft for decoherence T1 contracts."""
+    """Structured XY/readout relaxation result in seconds."""
 
     value: float
     unit: str = 's'
@@ -141,7 +141,12 @@ class NoiseFitResult:
 
 @dataclass(frozen=True)
 class NoisePipelineStage:
-    """Explicit boundary for one stage of the electronic noise pipeline."""
+    """Immutable snapshot for one electronic-noise pipeline stage.
+
+    `frequency` is expressed in Hz. For spectral workflows, `psd_double`,
+    `psd_single`, and `psd_smooth` are in `A^2/Hz`, while `white_noise` keeps
+    the same PSD units and `white_noise_temperature` is expressed in K.
+    """
 
     frequency: object
     psd_double: object

@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 
 from .electronics import Sii_D2S, T2Sii_Double
+from .results import BiasCurrentVoltageResult, XYCurrentVoltageResult
 from ..funclib.mathlib import temp2nbar
 from ..qubit.base import Phi0
 
@@ -28,7 +29,7 @@ class ZDephasingAnalyzer:
         *,
         phi_fraction: float,
         attenuation_setup: np.ndarray,
-    ) -> dict[str, float]:
+    ) -> BiasCurrentVoltageResult:
         phi_bias = phi_fraction * Phi0
 
         chip_current_A = phi_bias / self.couple_term / 2
@@ -127,7 +128,7 @@ class XYRelaxationAnalyzer:
         *,
         phi_fraction: float,
         attenuation_setup: np.ndarray,
-    ) -> dict[str, float]:
+    ) -> XYCurrentVoltageResult:
         phi_bias = phi_fraction * Phi0
 
         chip_current_A = phi_bias / self.couple_term / 2

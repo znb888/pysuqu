@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from unittest.mock import patch
@@ -141,4 +141,3 @@ class DecoherenceRoundGPlotOptionalTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

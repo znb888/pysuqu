@@ -6,6 +6,7 @@ from typing import Mapping
 
 import numpy as np
 
+from .results import BiasCurrentVoltageResult, XYCurrentVoltageResult
 from ..qubit.base import Phi0
 
 
@@ -304,7 +305,7 @@ def format_readout_tphi_report(
 def format_bias_current_voltage_report(
     *,
     phi_fraction: float,
-    results: Mapping[str, float],
+    results: BiasCurrentVoltageResult,
 ) -> tuple[str, ...]:
     """Build the stable bias current/voltage display report."""
     phi_bias = results['phi_bias']
@@ -320,7 +321,7 @@ def format_bias_current_voltage_report(
 def format_xy_current_voltage_report(
     *,
     phi_fraction: float,
-    results: Mapping[str, float],
+    results: XYCurrentVoltageResult,
 ) -> tuple[str, ...]:
     """Build the stable XY control-line current/voltage display report."""
     phi_bias = results['phi_bias']

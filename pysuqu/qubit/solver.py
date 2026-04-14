@@ -133,7 +133,8 @@ class HamiltonianEvo:
             raise ValueError(f"State dims {state.dims[0]} do not match system qubits {num_qubit}")
 
         if state_space is None:
-            state_space = self.get_eigenstate()
+            # Internal hot paths only need the live eigensystem, not precision-truncated clones.
+            state_space = self._eigenstates
         total_eig_len = len(state_space)
         if mode == 'brief':
             search_len = min(4 * num_qubit, total_eig_len)
@@ -141,8 +142,11 @@ class HamiltonianEvo:
             search_len = total_eig_len
         else:
             raise ValueError(f"Unknown mode: '{mode}'. Use 'brev' or 'full'.")
-        probe_results = []
         is_state_ket = state.isket
+        idx1 = -1
+        val1 = float('-inf')
+        idx2 = -1
+        val2 = float('-inf')
 
         for i in range(search_len):
             eig_state = state_space[i]
@@ -152,12 +156,14 @@ class HamiltonianEvo:
             else:
                 fidelity = expect(ket2dm(eig_state), state)
 
-            probe_results.append((i, fidelity))
+            if fidelity > val1:
+                idx2, val2 = idx1, val1
+                idx1, val1 = i, fidelity
+            elif fidelity > val2:
+                idx2, val2 = i, fidelity
 
-        sorted_results = sorted(probe_results, key=lambda x: x[1], reverse=True)
-
-        idx1, val1 = sorted_results[0]
-        idx2, val2 = sorted_results[1]
+        if idx2 == -1:
+            return idx1
 
         if abs(val1 - val2) < threshold:
             return [idx1, idx2]
@@ -171,5 +177,7 @@ class HamiltonianEvo:
         state_space: List[Qobj] = None,
     ) -> Union[int, List[int]]:
         """Find a list of states in state_space by delegating to find_state."""
+        if state_space is None:
+            state_space = self._eigenstates
         index_list = [self.find_state(state, mode, threshold, state_space) for state in state_list]
         return index_list

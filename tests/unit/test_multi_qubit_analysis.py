@@ -1,4 +1,4 @@
-﻿import inspect
+import inspect
 import unittest
 import warnings
 from types import SimpleNamespace
@@ -10,6 +10,9 @@ from tests.support import install_test_stubs
 
 install_test_stubs()
 
+from qutip import basis, tensor
+
+from pysuqu.qubit import multi as multi_module
 from pysuqu.qubit.analysis import (
     analyze_multi_qubit_coupler_sensitivity,
     analyze_multi_qubit_coupler_sensitivity_result,
@@ -25,11 +28,18 @@ from pysuqu.qubit.types import CouplingResult, SensitivityResult, SpectrumResult
 
 
 class FakeHamiltonian:
-    def __init__(self, dims):
+    def __init__(self, dims, qubit_frequency_ghz=6.35):
         self.dims = dims
+        self.qubit_frequency_ghz = qubit_frequency_ghz
 
     def eigenstates(self):
-        return np.array([0.0, 1.0]), ['g', 'e']
+        ground = tensor(basis(3, 0), basis(3, 0))
+        qubit_excited = tensor(basis(3, 1), basis(3, 0))
+        coupler_excited = tensor(basis(3, 0), basis(3, 1))
+        return (
+            np.array([0.0, 2 * np.pi * self.qubit_frequency_ghz, 2 * np.pi * 9.0]),
+            [ground, qubit_excited, coupler_excited],
+        )
 
 
 class MultiQubitAnalysisTests(unittest.TestCase):
@@ -271,30 +281,71 @@ class MultiQubitAnalysisTests(unittest.TestCase):
         model.Ec = np.diag([1.0, 2.0])
         model.El = np.diag([4.0, 5.0])
         model.Ejmax = np.diag([7.0, 8.0])
-        model._hamiltonian = None
+        baseline_hamiltonian = FakeHamiltonian([[3, 3], [3, 3]], qubit_frequency_ghz=6.2)
+        baseline_eigenvalues, baseline_eigenstates = baseline_hamiltonian.eigenstates()
+        model._hamiltonian = baseline_hamiltonian
+        model._Hamiltonian = baseline_hamiltonian
+        model._energylevels = baseline_eigenvalues
+        model._eigenstates = baseline_eigenstates
         model._numQubits = 2
         model._Nlevel = [3, 3]
         model._cal_mode = 'Eigen'
         model._charges = np.array([0, 0])
-        model._generate_hamiltonian = mock.Mock(return_value=FakeHamiltonian([[3, 3], [3, 3]]))
+        model._generate_hamiltonian = mock.Mock(
+            return_value=FakeHamiltonian([[3, 3], [3, 3]], qubit_frequency_ghz=6.35)
+        )
         model._refresh_basic_metrics = mock.Mock(side_effect=lambda: setattr(model, 'qubit_f01', 6.0 + model._flux[2, 2]))
-        model.destroyors = ['a']
-        model.n_operators = ['n']
-        model.phi_operators = ['phi']
+        model.eigenHamiltonian = 'baseline-eigen'
+        model.couplingHamiltonian = 'baseline-coupling'
+        model.highorderHamiltonian = 'baseline-highorder'
+        model.destroyors = ['baseline-destroyor']
+        model.n_operators = ['baseline-number']
+        model.phi_operators = ['baseline-phase']
+        model._solver_result = SpectrumResult(
+            hamiltonian=baseline_hamiltonian,
+            eigenvalues=np.array(baseline_eigenvalues, copy=True),
+            eigenstates=list(baseline_eigenstates),
+            destroy_operators=model.destroyors,
+            number_operators=model.n_operators,
+            phase_operators=model.phi_operators,
+        )
         model.change_para = ParameterizedQubit.change_para.__get__(model, QCRFGRModel)
         return model
 
     def test_frequency_probe_restores_flux_state_via_analysis_helper(self):
+        multi_module._clear_qcrfgr_probe_frequency_cache()
         model = self.make_qcrfgr_like_model()
         original_flux = model._flux.copy()
+        original_solver_result = model.solver_result
+        original_destroyors = model.destroyors
+        original_numbers = model.n_operators
+        original_phases = model.phi_operators
 
         frequency = get_multi_qubit_frequency_at_coupler_flux(model, 0.35, qubit_idx=0)
 
         self.assertAlmostEqual(frequency, 6.35)
         np.testing.assert_allclose(model._flux, original_flux)
-        self.assertEqual(model._generate_hamiltonian.call_count, 2)
-        self.assertEqual(model._refresh_basic_metrics.call_count, 2)
-        self.assertIsInstance(model.solver_result, SpectrumResult)
+        self.assertEqual(model._generate_hamiltonian.call_count, 1)
+        self.assertEqual(model._generate_hamiltonian.call_args.kwargs, {'transient': True})
+        self.assertEqual(model._refresh_basic_metrics.call_count, 0)
+        self.assertIs(model.solver_result, original_solver_result)
+        self.assertIs(model.destroyors, original_destroyors)
+        self.assertIs(model.n_operators, original_numbers)
+        self.assertIs(model.phi_operators, original_phases)
+        multi_module._clear_qcrfgr_probe_frequency_cache()
+
+    def test_frequency_probe_reuses_identical_fast_path_result_for_same_inputs(self):
+        multi_module._clear_qcrfgr_probe_frequency_cache()
+        model = self.make_qcrfgr_like_model()
+
+        first = get_multi_qubit_frequency_at_coupler_flux(model, 0.35, qubit_idx=0)
+        second = get_multi_qubit_frequency_at_coupler_flux(model, 0.35, qubit_idx=0)
+
+        self.assertAlmostEqual(first, 6.35)
+        self.assertAlmostEqual(second, first)
+        self.assertEqual(model._generate_hamiltonian.call_count, 1)
+        self.assertEqual(model._refresh_basic_metrics.call_count, 0)
+        multi_module._clear_qcrfgr_probe_frequency_cache()
 
     def test_qcrfgr_wrapper_delegates_sensitivity_analysis(self):
         model = QCRFGRModel.__new__(QCRFGRModel)
@@ -562,4 +613,3 @@ class MultiQubitAnalysisTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

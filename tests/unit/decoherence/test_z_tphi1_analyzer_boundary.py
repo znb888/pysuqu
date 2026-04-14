@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from types import SimpleNamespace
@@ -83,4 +83,3 @@ class ZNoiseDecoherenceTphi1AnalyzerBoundaryTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

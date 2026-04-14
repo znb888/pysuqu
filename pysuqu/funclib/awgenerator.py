@@ -1,4 +1,4 @@
-﻿"""
+"""
 Lib for arbitrary wave generator. 
 
 """
@@ -265,7 +265,7 @@ def import_waveform_from_file(
     wav_amplitude_scale: float = 1.0,
 ) -> Union['EnvelopeParams', 'PulseEvent', 'ChannelSchedule']:
     """
-    Import waveform from file (CSV or WAV) and convert to PySuQu hierarchy object.
+    Import waveform from file (CSV or WAV) and convert to QuSim hierarchy object.
     
     Supports:
         - CSV files with time series and I/Q values
@@ -295,7 +295,7 @@ def import_waveform_from_file(
         wav_amplitude_scale (float): Scale factor for WAV amplitude.
     
     Returns:
-        Union[EnvelopeParams, PulseEvent, ChannelSchedule]: PySuQu hierarchy object.
+        Union[EnvelopeParams, PulseEvent, ChannelSchedule]: QuSim hierarchy object.
     
     Raises:
         FileNotFoundError: If the file does not exist.
@@ -906,6 +906,5 @@ class WaveformDerivatives:
         deriv = du * v + u * dv
         
         return wave, deriv
-
 
 

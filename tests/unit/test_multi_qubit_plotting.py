@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from unittest import mock
 
 import numpy as np
@@ -68,4 +68,3 @@ class MultiQubitPlottingTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-

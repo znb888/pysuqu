@@ -6,9 +6,11 @@ Lib for qutip utility functions.
  Since 2025-04-15
 '''
 
-import qutip as qt
-from qutip import Qobj, tensor, basis
+from functools import lru_cache
+
 import numpy as np
+import qutip as qt
+from qutip import Qobj, basis, tensor
 
 def truncate_precision(qobject: Qobj, threshold: float = 1e-15) -> Qobj:
     """
@@ -36,6 +38,21 @@ def truncate_precision(qobject: Qobj, threshold: float = 1e-15) -> Qobj:
     else:
         return new_qobj
 
+
+@lru_cache(maxsize=256)
+def _build_truncation_projector_pair(
+    old_dims_key: tuple[int, ...],
+    new_dims_key: tuple[int, ...],
+) -> tuple[Qobj, Qobj]:
+    """Build the reusable tensor projector pair for one exact Hilbert-space truncation."""
+    projectors = []
+    for old_d, new_d in zip(old_dims_key, new_dims_key):
+        proj_mat = np.eye(old_d)[:new_d, :]
+        projectors.append(Qobj(proj_mat))
+
+    projector = tensor(projectors)
+    return projector, projector.dag()
+
 def truncate_hilbert_space(qobj: Qobj, new_dims_list: list) -> Qobj:
     """
     Truncates the Hilbert space of a composite quantum system to specified lower dimensions
@@ -49,31 +66,30 @@ def truncate_hilbert_space(qobj: Qobj, new_dims_list: list) -> Qobj:
     Returns:
         Qobj: The truncated quantum object with updated dimensions.
     """
-    old_dims_list = qobj.dims[0]
+    old_dims_key = tuple(int(dim) for dim in qobj.dims[0])
+    new_dims_key = tuple(int(dim) for dim in new_dims_list)
 
-    if len(old_dims_list) != len(new_dims_list):
+    if len(old_dims_key) != len(new_dims_key):
         raise ValueError(
-            f"Dimension mismatch: input has {len(old_dims_list)} subsystems, "
-            f"but target dims provide {len(new_dims_list)}."
+            f"Dimension mismatch: input has {len(old_dims_key)} subsystems, "
+            f"but target dims provide {len(new_dims_key)}."
         )
 
-    projectors = []
+    if old_dims_key == new_dims_key:
+        return qobj
 
-    for old_d, new_d in zip(old_dims_list, new_dims_list):
+    for old_d, new_d in zip(old_dims_key, new_dims_key):
         if new_d > old_d:
             raise ValueError(f"New dimension {new_d} cannot be larger than old dimension {old_d}.")
 
-        proj_mat = np.eye(old_d)[:new_d, :]
-        projectors.append(Qobj(proj_mat))
-
-    P_total = tensor(projectors)
+    projector, projector_dag = _build_truncation_projector_pair(old_dims_key, new_dims_key)
 
     if qobj.isoper:
-        new_qobj = P_total * qobj * P_total.dag()
+        new_qobj = projector * qobj * projector_dag
     elif qobj.isket:
-        new_qobj = P_total * qobj
+        new_qobj = projector * qobj
     elif qobj.isbra:
-        new_qobj = qobj * P_total.dag()
+        new_qobj = qobj * projector_dag
     else:
         raise TypeError("Unsupported Qobj type. Must be Operator, Ket, or Bra.")
 

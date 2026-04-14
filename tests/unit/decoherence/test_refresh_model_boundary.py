@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -165,7 +165,63 @@ class DecoherenceRefreshModelBoundaryTests(unittest.TestCase):
         self.assertFalse(qubit_cls.call_args_list[2].kwargs['is_print'])
         self.assertFalse(noise_cls.call_args_list[2].kwargs['is_print'])
 
+    def test_refresh_model_normalizes_non_spectral_noise_type_before_rebuilding_noise(self):
+        freq, psd = self._sample_noise_inputs()
+        noise_calls = []
+
+        def qubit_builder(**kwargs):
+            return SimpleNamespace(role='qubit', kwargs=dict(kwargs))
+
+        def noise_builder(
+            *,
+            psd_freq,
+            psd_S,
+            noise_type,
+            noise_prop,
+            T_setup,
+            attenuation_setup,
+            is_spectral,
+            is_print,
+        ):
+            noise_calls.append(
+                {
+                    'psd_freq': np.array(psd_freq, copy=True),
+                    'psd_S': psd_S,
+                    'noise_type': noise_type,
+                    'noise_prop': noise_prop,
+                    'T_setup': np.array(T_setup, copy=True),
+                    'attenuation_setup': np.array(attenuation_setup, copy=True),
+                    'is_spectral': is_spectral,
+                    'is_print': is_print,
+                }
+            )
+            return SimpleNamespace(noise_type=noise_type)
+
+        model = Decoherence(
+            psd_freq=freq,
+            psd_S=psd,
+            couple_term=1.0,
+            couple_type='xy',
+            noise_type='1f',
+            noise_prop='single',
+            is_spectral=True,
+            is_print=False,
+            qubit_builder=qubit_builder,
+            noise_builder=noise_builder,
+        )
+
+        self.assertEqual(model.noise_type, '1f')
+        self.assertEqual(noise_calls[0]['noise_type'], '1f')
+
+        model.is_spectral = False
+        model.psd_S = -140.0
+        model.refresh_model(is_print=False)
+
+        self.assertEqual(model.noise_type, 'constant')
+        self.assertEqual(model.noise.noise_type, 'constant')
+        self.assertFalse(noise_calls[1]['is_spectral'])
+        self.assertEqual(noise_calls[1]['noise_type'], 'constant')
+
 
 if __name__ == '__main__':
     unittest.main()
-

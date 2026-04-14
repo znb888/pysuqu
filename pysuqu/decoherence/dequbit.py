@@ -4,6 +4,7 @@ Lib for calculation of decoherence of superconducting qubit.
 
 """
 # import
+from functools import lru_cache
 import inspect
 import warnings
 
@@ -96,26 +97,66 @@ class Decoherence:
         self._default_is_print = bool(is_print)
         self._qubit_builder = qubit_builder or AbstractQubit
         self._noise_builder = noise_builder or ElectronicNoise
-        if self.is_spectral:
-            self.noise_type = noise_type
-        else:
-            self.noise_type = 'constant'
+        self.noise_type = self._resolve_noise_type(
+            is_spectral=self.is_spectral,
+            noise_type=noise_type,
+        )
         
         # Initialize models
         self.refresh_model(*args, is_print=is_print, **kwargs)
 
     @staticmethod
-    def _builder_accepts_kwarg(builder, kwarg: str) -> bool:
+    def _inspect_builder_signature(builder) -> tuple[bool, frozenset[str]]:
         try:
             signature = inspect.signature(builder)
         except (TypeError, ValueError):
-            return True
+            return True, frozenset()
 
         for parameter in signature.parameters.values():
             if parameter.kind == inspect.Parameter.VAR_KEYWORD:
-                return True
+                return True, frozenset()
 
-        return kwarg in signature.parameters
+        allowed_kwargs = {
+            parameter.name
+            for parameter in signature.parameters.values()
+            if parameter.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+        return False, frozenset(allowed_kwargs)
+
+    @staticmethod
+    @lru_cache(maxsize=32)
+    def _inspect_builder_signature_cached(builder) -> tuple[bool, frozenset[str]]:
+        return Decoherence._inspect_builder_signature(builder)
+
+    @staticmethod
+    def _get_builder_signature_info(builder) -> tuple[bool, frozenset[str]]:
+        try:
+            return Decoherence._inspect_builder_signature_cached(builder)
+        except TypeError:
+            return Decoherence._inspect_builder_signature(builder)
+
+    @staticmethod
+    def _builder_accepts_kwarg(builder, kwarg: str) -> bool:
+        accepts_var_kwargs, allowed_kwargs = Decoherence._get_builder_signature_info(builder)
+        return accepts_var_kwargs or kwarg in allowed_kwargs
+
+    @staticmethod
+    def _filter_builder_kwargs(builder, kwargs: dict[str, object]) -> dict[str, object]:
+        accepts_var_kwargs, allowed_kwargs = Decoherence._get_builder_signature_info(builder)
+        if accepts_var_kwargs:
+            return dict(kwargs)
+
+        return {key: value for key, value in kwargs.items() if key in allowed_kwargs}
+
+    @staticmethod
+    def _resolve_noise_type(*, is_spectral: bool, noise_type: str) -> str:
+        if not is_spectral:
+            return 'constant'
+
+        return noise_type
 
     def _resolve_is_print(self, is_print: Optional[bool]) -> bool:
         if is_print is None:
@@ -125,39 +166,56 @@ class Decoherence:
 
     def _build_qubit(self, *args, is_print: Optional[bool] = None, **kwargs):
         resolved_is_print = self._resolve_is_print(is_print)
-        builder_kwargs = dict(kwargs)
+        builder_kwargs = self._filter_builder_kwargs(
+            self._qubit_builder,
+            {
+                **kwargs,
+                'frequency': self.qubit_freq,
+                'anharmonicity': self.qubit_anharm,
+                'frequency_max': self.qubit_freq_max,
+                'qubit_type': self.qubit_type,
+                'energy_trunc_level': self.energy_trunc_level,
+            },
+        )
         if self._builder_accepts_kwarg(self._qubit_builder, 'is_print'):
             builder_kwargs['is_print'] = resolved_is_print
 
-        return self._qubit_builder(
-            frequency=self.qubit_freq,
-            anharmonicity=self.qubit_anharm,
-            frequency_max=self.qubit_freq_max,
-            qubit_type=self.qubit_type,
-            energy_trunc_level=self.energy_trunc_level,
-            *args, **builder_kwargs
-        )
+        return self._qubit_builder(*args, **builder_kwargs)
 
     def _build_noise(self, *args, is_print: Optional[bool] = None, **kwargs):
         resolved_is_print = self._resolve_is_print(is_print)
-        builder_kwargs = dict(kwargs)
+        builder_kwargs = self._filter_builder_kwargs(
+            self._noise_builder,
+            {
+                **kwargs,
+                'psd_freq': self.psd_freq,
+                'psd_S': self.psd_S,
+                'noise_type': self.noise_type,
+                'noise_prop': self.noise_prop,
+                'T_setup': self.T_setup,
+                'attenuation_setup': self.attenuation_setup,
+                'is_spectral': self.is_spectral,
+            },
+        )
         if self._builder_accepts_kwarg(self._noise_builder, 'is_print'):
             builder_kwargs['is_print'] = resolved_is_print
 
-        return self._noise_builder(
-            psd_freq=self.psd_freq,
-            psd_S=self.psd_S,
-            noise_type=self.noise_type,
-            noise_prop=self.noise_prop,
-            T_setup=self.T_setup,
-            attenuation_setup=self.attenuation_setup,
-            is_spectral=self.is_spectral,
-            *args, **builder_kwargs
-        )
+        return self._noise_builder(*args, **builder_kwargs)
 
     def refresh_model(self, *args, is_print: Optional[bool] = None, **kwargs):
-        """Rebuild the qubit and noise dependencies from the current model state."""
+        """Rebuild the qubit and noise dependencies from the current model state.
+
+        The qubit and noise builders each receive only the keyword arguments they
+        declare, so qubit-only refresh hints do not leak into the noise builder
+        and vice versa. Non-spectral refreshes also normalize the facade-level
+        `noise_type` back to the public `constant` contract before rebuilding
+        the `ElectronicNoise` dependency.
+        """
         resolved_is_print = self._resolve_is_print(is_print)
+        self.noise_type = self._resolve_noise_type(
+            is_spectral=self.is_spectral,
+            noise_type=self.noise_type,
+        )
         self.qubit = self._build_qubit(*args, is_print=resolved_is_print, **kwargs)
         self.noise = self._build_noise(*args, is_print=resolved_is_print, **kwargs)
 
@@ -324,33 +382,29 @@ class ZNoiseDecoherence(Decoherence):
         phi_fraction: float = 0.25,
         is_print: bool = True,
     ) -> BiasCurrentVoltageResult:
-        """
-        Calculate bias current and voltage at chip and room temperature ends.
-        
+        """Calculate the stable Z-bias current/voltage mapping.
+
         Args:
-            phi_fraction (float): Fraction of Phi0 for bias flux, default 0.25 (for qubit)
-                Use 0.25 for qubit, 0.5 for coupler
-            is_print (bool): Whether to print the results
-        
+            phi_fraction: Fraction of `Phi0` used for the bias flux. Use `0.25` for
+                qubit bias and `0.5` for coupler bias.
+            is_print: Whether to emit the formatted display report.
+
         Returns:
-            dict: Dictionary containing all calculated values:
-                - phi_bias: Bias flux [Wb]
-                - chip_current_uA: Chip end current [uA]
-                - chip_voltage_mV: Chip end voltage [mV]
-                - total_attenuation_dB: Total attenuation [dB]
-                - room_current_mA: Room temperature end current [mA]
-                - room_voltage_mV: Room temperature end voltage [mV]
-                - room_power_dBm: Room temperature end power [dBm]
+            BiasCurrentVoltageResult: Public mapping with `phi_bias` in Wb,
+            chip-end current in `uA`, chip-end voltage in `mV`, total attenuation
+            in `dB`, room-end current in `mA`, room-end voltage in `mV`, and
+            room-end power in `dBm`.
         """
         results = self.z_analyzer.calculate_bias_current_voltage(
             phi_fraction=phi_fraction,
             attenuation_setup=self.attenuation_setup,
         )
-        
-        if is_print:
-            for line in format_bias_current_voltage_report(phi_fraction=phi_fraction, results=results):
-                print(line)
-        
+
+        self._emit_report(
+            format_bias_current_voltage_report(phi_fraction=phi_fraction, results=results),
+            is_print=is_print,
+        )
+
         return results
 
     def _build_tphi2_result(
@@ -651,7 +705,17 @@ class XYNoiseDecoherence(Decoherence):
         )
 
     def cal_t1(self, is_print: bool = True) -> T1Result:
-        """Calculate T1 limited by XY control line noise."""
+        """Calculate XY-control-limited relaxation as a seconds-facing result.
+
+        Args:
+            is_print: Whether to emit the formatted XY relaxation report.
+
+        Returns:
+            T1Result: Structured relaxation result in seconds. `value` matches
+                the compatibility attribute `self.T1`, while `fit_diagnostics`
+                exposes the calculated `gamma_up` and `gamma_down` rates in
+                `1/s`.
+        """
         analysis = self.xy_analyzer.calculate_t1(
             noise_output=self.noise.output_stage,
             qubit_freq=self.qubit_freq,
@@ -683,13 +747,19 @@ class XYNoiseDecoherence(Decoherence):
 
     def cal_thermal_exitation(self, T1: float = None, is_print: bool = True) -> Tuple[float, float]:
         """
-        Calculate thermal excitation probability.
-        
+        Calculate total and XY-only thermal excitation probabilities.
+
         Args:
-            T1 (float, optional): T1 relaxation time in [us]. Defaults to None.
-        
+            T1: Optional measured relaxation time in microseconds (`us`). When
+                omitted, the calculation falls back to the XY-only rates derived
+                by `cal_t1()`.
+            is_print: Whether to emit the formatted thermal-excitation report.
+
         Returns:
-            Tuple[float, float]: (Probability of thermal excitation, Probability of thermal excitation only XY)
+            Tuple[float, float]: `(total_probability, xy_only_probability)`.
+                The returned values are unitless probabilities and are also
+                stored on `self.thermal_exitation` and
+                `self.thermal_exitation_onlyxy` for compatibility.
         """
         if not hasattr(self, 'Gamma_up'):
             try:
@@ -702,18 +772,11 @@ class XYNoiseDecoherence(Decoherence):
                 )
                 return 0.0, 0.0
 
-        if T1 is not None:
-            thermal_excitation = self.xy_analyzer.calculate_thermal_excitation(
-                gamma_up=self.Gamma_up,
-                gamma_down=self.Gamma_down,
-                t1_us=T1,
-            )
-        else:
-            thermal_excitation = self.xy_analyzer.calculate_thermal_excitation(
-                gamma_up=self.Gamma_up,
-                gamma_down=self.Gamma_down,
-                t1_us=None,
-            )
+        thermal_excitation = self.xy_analyzer.calculate_thermal_excitation(
+            gamma_up=self.Gamma_up,
+            gamma_down=self.Gamma_down,
+            t1_us=T1,
+        )
 
         self.thermal_exitation, self.thermal_exitation_onlyxy = thermal_excitation
         if is_print:
@@ -733,34 +796,30 @@ class XYNoiseDecoherence(Decoherence):
         phi_fraction: float = 0.010 / (4 * np.pi),
         is_print: bool = True,
     ) -> XYCurrentVoltageResult:
-        """
-        Calculate XY control line current and voltage at chip and room temperature ends.
-        
+        """Calculate the stable XY control-line current/voltage mapping.
+
         Args:
-            phi_fraction (float): Fraction of Phi0 for bias flux, default 0.010/(4*pi) for XY control
-                This corresponds to Phi = 0.010*Phi0/2/np.pi/2 in the calculation script
-            is_print (bool): Whether to print the results
-        
+            phi_fraction: Fraction of `Phi0` used for the XY flux drive. The
+                default `0.010 / (4 * pi)` matches the historical script-level
+                `0.010*Phi0/2/pi/2` convention.
+            is_print: Whether to emit the formatted display report.
+
         Returns:
-            dict: Dictionary containing all calculated values:
-                - phi_bias: Bias flux [Wb]
-                - chip_current_uA: Chip end current [uA]
-                - chip_voltage_uV: Chip end voltage [uV]
-                - chip_power_dBm: Chip end power [dBm]
-                - total_attenuation_dB: Total attenuation [dB]
-                - room_current_mA: Room temperature end current [mA]
-                - room_voltage_mV: Room temperature end voltage [mV]
-                - room_power_dBm: Room temperature end power [dBm]
+            XYCurrentVoltageResult: Public mapping with `phi_bias` in Wb,
+            chip-end current in `uA`, chip-end voltage in `uV`, chip-end power in
+            `dBm`, total attenuation in `dB`, room-end current in `mA`,
+            room-end voltage in `mV`, and room-end power in `dBm`.
         """
         results = self.xy_analyzer.calculate_xy_current_voltage(
             phi_fraction=phi_fraction,
             attenuation_setup=self.attenuation_setup,
         )
-        
-        if is_print:
-            for line in format_xy_current_voltage_report(phi_fraction=phi_fraction, results=results):
-                print(line)
-        
+
+        self._emit_report(
+            format_xy_current_voltage_report(phi_fraction=phi_fraction, results=results),
+            is_print=is_print,
+        )
+
         return results
 
 

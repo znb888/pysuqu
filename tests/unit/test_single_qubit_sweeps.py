@@ -12,11 +12,13 @@ from tests.support import install_test_stubs
 install_test_stubs()
 
 from pysuqu.qubit.base import pi
-from pysuqu.qubit.single import GroundedTransmon
+from pysuqu.qubit.circuit import project_transformed_flux
 from pysuqu.qubit.sweeps import (
+    _get_single_qubit_sweep_relative_energy_cache_key_prefix,
     sweep_single_qubit_energy_vs_flux_base,
     sweep_single_qubit_energy_vs_flux_base_result,
 )
+from pysuqu.qubit.single import GroundedTransmon
 from pysuqu.qubit.types import SweepResult
 
 
@@ -170,6 +172,118 @@ class SingleQubitSweepFastPathTests(unittest.TestCase):
         restored_flux = optimized_qubit.get_element_matrices('flux')
         self.assertEqual(np.asarray(restored_flux).shape, ())
         self.assertAlmostEqual(float(restored_flux), _GROUNDED_TRANSMON_CONFIG['flux'])
+
+    def test_structured_helper_uses_transient_hamiltonian_generation_on_fast_path(self):
+        flux_offsets = [
+            np.array([[-0.03]], dtype=float),
+            np.array([[0.0]], dtype=float),
+            np.array([[0.025]], dtype=float),
+        ]
+        qubit = _construct_grounded_transmon()
+
+        with mock.patch.object(qubit, '_generate_hamiltonian', wraps=qubit._generate_hamiltonian) as generate:
+            result = sweep_single_qubit_energy_vs_flux_base_result(
+                qubit,
+                flux_offsets,
+                upper_level=3,
+            )
+
+        self.assertIsInstance(result, SweepResult)
+        self.assertEqual(generate.call_count, len(flux_offsets))
+        self.assertTrue(all(call.kwargs.get('transient') is True for call in generate.call_args_list))
+        restored_flux = qubit.get_element_matrices('flux')
+        self.assertAlmostEqual(float(np.asarray(restored_flux)), _GROUNDED_TRANSMON_CONFIG['flux'])
+
+    def test_structured_helper_reuses_cached_relative_spectra_on_repeat_sweeps(self):
+        flux_offsets = [
+            np.array([[-0.03]], dtype=float),
+            np.array([[0.0]], dtype=float),
+            np.array([[0.025]], dtype=float),
+        ]
+        qubit = _construct_grounded_transmon()
+
+        with mock.patch.object(qubit, '_generate_hamiltonian', wraps=qubit._generate_hamiltonian) as generate:
+            first = sweep_single_qubit_energy_vs_flux_base_result(
+                qubit,
+                flux_offsets,
+                upper_level=3,
+            )
+            second = sweep_single_qubit_energy_vs_flux_base_result(
+                qubit,
+                flux_offsets,
+                upper_level=3,
+            )
+
+        self.assertEqual(generate.call_count, len(flux_offsets))
+        for key, expected_values in first.series.items():
+            np.testing.assert_allclose(second.series[key], expected_values)
+        restored_flux = qubit.get_element_matrices('flux')
+        self.assertAlmostEqual(float(np.asarray(restored_flux)), _GROUNDED_TRANSMON_CONFIG['flux'])
+
+    def test_structured_helper_restores_fast_path_state_without_change_para(self):
+        flux_offsets = [
+            np.array([[-0.03]], dtype=float),
+            np.array([[0.0]], dtype=float),
+            np.array([[0.025]], dtype=float),
+        ]
+        qubit = _construct_grounded_transmon()
+        initial_flux = np.array(qubit.get_element_matrices('flux'), copy=True)
+        initial_level_1 = float(qubit.get_energylevel(1))
+
+        with mock.patch.object(qubit, 'change_para', wraps=qubit.change_para) as change_para:
+            result = sweep_single_qubit_energy_vs_flux_base_result(
+                qubit,
+                flux_offsets,
+                upper_level=3,
+            )
+
+        self.assertIsInstance(result, SweepResult)
+        self.assertEqual(change_para.call_count, 0)
+        restored_flux = np.array(qubit.get_element_matrices('flux'), copy=True)
+        np.testing.assert_allclose(restored_flux, initial_flux)
+        self.assertAlmostEqual(float(qubit.get_energylevel(1)), initial_level_1)
+
+    def test_structured_helper_batches_scalar_flux_projection_and_ej_updates(self):
+        flux_offsets = [
+            np.array([[-0.03]], dtype=float),
+            np.array([[0.0]], dtype=float),
+            np.array([[0.025]], dtype=float),
+        ]
+        qubit = _construct_grounded_transmon()
+
+        with mock.patch(
+            'pysuqu.qubit.sweeps._get_single_qubit_sweep_relative_energy_cache_key_prefix',
+            wraps=_get_single_qubit_sweep_relative_energy_cache_key_prefix,
+        ) as get_prefix, mock.patch(
+            'pysuqu.qubit.sweeps.project_transformed_flux',
+            wraps=project_transformed_flux,
+        ) as project_flux, mock.patch.object(
+            qubit,
+            '_Ejphi',
+            wraps=qubit._Ejphi,
+        ) as compute_ej, mock.patch.object(
+            qubit,
+            'change_para',
+            wraps=qubit.change_para,
+        ) as change_para, mock.patch.object(
+            qubit,
+            '_update_transformed_vars',
+            wraps=qubit._update_transformed_vars,
+        ) as update_vars:
+            result = sweep_single_qubit_energy_vs_flux_base_result(
+                qubit,
+                flux_offsets,
+                upper_level=3,
+            )
+
+        self.assertIsInstance(result, SweepResult)
+        self.assertEqual(get_prefix.call_count, 1)
+        self.assertEqual(project_flux.call_count, 0)
+        self.assertEqual(compute_ej.call_count, 1)
+        self.assertEqual(change_para.call_count, 0)
+        self.assertEqual(update_vars.call_count, 0)
+        restored_flux = qubit.get_element_matrices('flux')
+        self.assertAlmostEqual(float(np.asarray(restored_flux)), _GROUNDED_TRANSMON_CONFIG['flux'])
 
 
 if __name__ == '__main__':
