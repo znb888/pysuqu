@@ -65,8 +65,24 @@ def install_qutip_stub():
         def overlap(self, other):
             return np.vdot(self._data.reshape(-1), other.full().reshape(-1))
 
-        def eigenstates(self):
+        def eigenstates(
+            self,
+            sparse=False,
+            sort='low',
+            eigvals=0,
+            tol=0,
+            maxiter=100000,
+            phase_fix=None,
+            output_type='kets',
+        ):
             values, vectors = np.linalg.eigh(self._data)
+            if sort == 'high':
+                order = np.argsort(values)[::-1]
+                values = values[order]
+                vectors = vectors[:, order]
+            if eigvals:
+                values = values[:eigvals]
+                vectors = vectors[:, :eigvals]
             ket_dims = [list(self.dims[0]), [1] * len(self.dims[0])]
             states = [Qobj(vectors[:, idx].reshape((-1, 1)), dims=ket_dims) for idx in range(vectors.shape[1])]
             return values.real, states

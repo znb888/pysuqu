@@ -4,6 +4,7 @@ import math
 from abc import abstractmethod
 from collections import OrderedDict
 from copy import copy
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import List, Optional, Union
 
@@ -24,12 +25,137 @@ from .circuit import (
     update_full_flux_from_reduced,
 )
 from .solver import HamiltonianEvo
+from .types import SpectrumResult
 
 Phi0 = hbar * pi / e
 _QUBIT_EXACT_SOLVE_TEMPLATE_CACHE_MAXSIZE = 64
 _QUBIT_EXACT_SOLVE_TEMPLATE_CACHE = OrderedDict()
+_QUBIT_INSTANCE_EXACT_SOLVE_TEMPLATE_CACHE_MAXSIZE = 8
 _PARAMETERIZED_EMATRIX_TEMPLATE_CACHE_MAXSIZE = 64
 _PARAMETERIZED_EMATRIX_TEMPLATE_CACHE = OrderedDict()
+_FLUX_ONLY_REPLAY_PREPARATION_CACHE_MAXSIZE = 16
+
+
+@dataclass
+class ExactCoreState:
+    """Core exact-solve payload used by active and deferred restore paths."""
+
+    hamiltonian: Optional[object]
+    energylevels: Optional[np.ndarray]
+    eigenstates: Optional[list[object] | tuple[object, ...]]
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, object]) -> 'ExactCoreState':
+        return cls(
+            hamiltonian=payload.get('hamiltonian'),
+            energylevels=payload.get('energylevels'),
+            eigenstates=payload.get('eigenstates'),
+        )
+
+
+@dataclass
+class ExactAuxiliaryState:
+    """Auxiliary exact-solve payload used by active and deferred restore paths."""
+
+    destroyors: Optional[list[object] | tuple[object, ...]]
+    number_operators: Optional[list[object] | tuple[object, ...]]
+    phase_operators: Optional[list[object] | tuple[object, ...]]
+    eigen_hamiltonian: Optional[object]
+    coupling_hamiltonian: Optional[object]
+    highorder_hamiltonian: Optional[object]
+
+    @classmethod
+    def from_mapping(cls, payload: dict[str, object]) -> 'ExactAuxiliaryState':
+        return cls(
+            destroyors=payload.get('destroyors'),
+            number_operators=payload.get('number_operators'),
+            phase_operators=payload.get('phase_operators'),
+            eigen_hamiltonian=payload.get('eigen_hamiltonian'),
+            coupling_hamiltonian=payload.get('coupling_hamiltonian'),
+            highorder_hamiltonian=payload.get('highorder_hamiltonian'),
+        )
+
+
+@dataclass
+class CachedExactSolveTemplate:
+    """Process-level exact solve template reused across identical exact inputs."""
+
+    core: ExactCoreState
+    auxiliary: ExactAuxiliaryState
+
+    @classmethod
+    def from_legacy_dict(cls, payload) -> 'CachedExactSolveTemplate':
+        if isinstance(payload, cls):
+            return payload
+        return cls(
+            core=ExactCoreState.from_mapping(payload),
+            auxiliary=ExactAuxiliaryState.from_mapping(payload),
+        )
+
+
+@dataclass
+class OwnedExactSolveTemplate:
+    """Instance-owned exact solve template used for direct replay restores."""
+
+    core: ExactCoreState
+    pending_core: Optional[ExactCoreState]
+    auxiliary: ExactAuxiliaryState
+    solver_result: Optional[SpectrumResult]
+    pending_auxiliary: Optional[ExactAuxiliaryState]
+    nlevel: list[int]
+    qubits_num: int
+
+    @classmethod
+    def from_legacy_dict(cls, payload) -> 'OwnedExactSolveTemplate':
+        if isinstance(payload, cls):
+            return payload
+
+        pending_core_payload = payload.get('pending_core_template')
+        pending_auxiliary_payload = payload.get('pending_auxiliary_template')
+        nlevel = payload.get('nlevel')
+        if nlevel is None:
+            core_hamiltonian = payload.get('hamiltonian')
+            if core_hamiltonian is None and pending_core_payload is not None:
+                core_hamiltonian = pending_core_payload.get('hamiltonian')
+            nlevel = list(core_hamiltonian.dims[0]) if core_hamiltonian is not None else []
+
+        return cls(
+            core=ExactCoreState.from_mapping(payload),
+            pending_core=None if pending_core_payload is None else ExactCoreState.from_mapping(pending_core_payload),
+            auxiliary=ExactAuxiliaryState.from_mapping(payload),
+            solver_result=payload.get('solver_result'),
+            pending_auxiliary=(
+                None
+                if pending_auxiliary_payload is None
+                else ExactAuxiliaryState.from_mapping(pending_auxiliary_payload)
+            ),
+            nlevel=list(nlevel),
+            qubits_num=int(payload.get('qubits_num', len(nlevel))),
+        )
+
+
+@dataclass
+class FluxOnlyReplayPreparation:
+    """Prepared flux-only replay state kept alongside exact-template replay caches."""
+
+    flux_transformed: np.ndarray
+    Ej: np.ndarray
+    exact_solve_template_cache_key: tuple[object, ...]
+    instance_exact_solve_template: Optional[OwnedExactSolveTemplate] = None
+
+    @classmethod
+    def from_legacy_dict(cls, payload) -> 'FluxOnlyReplayPreparation':
+        if isinstance(payload, cls):
+            return payload
+        exact_template = payload.get('instance_exact_solve_template')
+        return cls(
+            flux_transformed=payload['flux_transformed'],
+            Ej=payload['Ej'],
+            exact_solve_template_cache_key=payload['exact_solve_template_cache_key'],
+            instance_exact_solve_template=(
+                None if exact_template is None else OwnedExactSolveTemplate.from_legacy_dict(exact_template)
+            ),
+        )
 
 
 class QubitBase(HamiltonianEvo):
@@ -42,6 +168,7 @@ class QubitBase(HamiltonianEvo):
         'charges': '_charges',
         'cal_mode': '_cal_mode',
     }
+    _EXACT_SOLVE_TEMPLATE_STATIC_KEY_PARAMS = frozenset({'Ec', 'El', 'charges', 'Nlevel', 'cal_mode'})
 
     @staticmethod
     def _clone_qobj(obj: Optional[Qobj]) -> Optional[Qobj]:
@@ -65,6 +192,141 @@ class QubitBase(HamiltonianEvo):
         if objects is None:
             return None
         return [cls._clone_qobj(obj) for obj in objects]
+
+    def _build_exact_restore_solver_result(self) -> SpectrumResult:
+        """Build the structured solver result for the current exact-restore state."""
+        self._materialize_pending_exact_core_state()
+        return SpectrumResult(
+            hamiltonian=self._Hamiltonian,
+            eigenvalues=self._energylevels,
+            eigenstates=self._eigenstates,
+            destroy_operators=getattr(self, '_destroyors_state', None),
+            number_operators=getattr(self, '_n_operators_state', None),
+            phase_operators=getattr(self, '_phi_operators_state', None),
+        )
+
+    def _materialize_pending_exact_core_state(self) -> None:
+        """Clone deferred exact-template core state only when a caller needs it."""
+        pending_state = getattr(self, '_pending_exact_core_template', None)
+        if pending_state is None:
+            return
+
+        hamiltonian = self._clone_qobj(pending_state.hamiltonian)
+        energylevels = np.array(pending_state.energylevels, copy=True)
+        eigenstates = self._clone_qobj_list(pending_state.eigenstates)
+
+        self._hamiltonian = hamiltonian
+        self._Hamiltonian = hamiltonian
+        self._energylevels = energylevels
+        self._eigenstates = eigenstates
+        self._pending_exact_core_template = None
+
+        active_template = getattr(self, '_active_exact_solve_template', None)
+        if active_template is not None:
+            active_template.core = ExactCoreState(
+                hamiltonian=hamiltonian,
+                energylevels=energylevels,
+                eigenstates=eigenstates,
+            )
+            active_template.pending_core = None
+
+        if self._solver_result is None and getattr(self, '_pending_exact_auxiliary_template', None) is None:
+            self._solver_result = self._build_exact_restore_solver_result()
+
+    def _materialize_pending_exact_auxiliary_state(self) -> None:
+        """Clone deferred exact-template auxiliary state only when a caller needs it."""
+        self._materialize_pending_exact_core_state()
+        pending_state = getattr(self, '_pending_exact_auxiliary_template', None)
+        if pending_state is None:
+            return
+
+        self._destroyors_state = self._clone_qobj_list(pending_state.destroyors)
+        self._n_operators_state = self._clone_qobj_list(pending_state.number_operators)
+        self._phi_operators_state = self._clone_qobj_list(pending_state.phase_operators)
+        self._eigen_hamiltonian_state = self._clone_qobj(pending_state.eigen_hamiltonian)
+        self._coupling_hamiltonian_state = self._clone_qobj(pending_state.coupling_hamiltonian)
+        self._highorder_hamiltonian_state = self._clone_qobj(pending_state.highorder_hamiltonian)
+        self._solver_result = self._build_exact_restore_solver_result()
+        self._pending_exact_auxiliary_template = None
+
+        active_template = getattr(self, '_active_exact_solve_template', None)
+        if active_template is not None:
+            active_template.auxiliary = ExactAuxiliaryState(
+                destroyors=self._destroyors_state,
+                number_operators=self._n_operators_state,
+                phase_operators=self._phi_operators_state,
+                eigen_hamiltonian=self._eigen_hamiltonian_state,
+                coupling_hamiltonian=self._coupling_hamiltonian_state,
+                highorder_hamiltonian=self._highorder_hamiltonian_state,
+            )
+            active_template.solver_result = self._solver_result
+            active_template.pending_auxiliary = None
+
+    @property
+    def destroyors(self):
+        """Return the current destroy operators, materializing deferred exact restores if needed."""
+        self._materialize_pending_exact_auxiliary_state()
+        return getattr(self, '_destroyors_state', None)
+
+    @destroyors.setter
+    def destroyors(self, value) -> None:
+        self._pending_exact_auxiliary_template = None
+        self._destroyors_state = value
+
+    @property
+    def n_operators(self):
+        """Return the current number operators, materializing deferred exact restores if needed."""
+        self._materialize_pending_exact_auxiliary_state()
+        return getattr(self, '_n_operators_state', None)
+
+    @n_operators.setter
+    def n_operators(self, value) -> None:
+        self._pending_exact_auxiliary_template = None
+        self._n_operators_state = value
+
+    @property
+    def phi_operators(self):
+        """Return the current phase operators, materializing deferred exact restores if needed."""
+        self._materialize_pending_exact_auxiliary_state()
+        return getattr(self, '_phi_operators_state', None)
+
+    @phi_operators.setter
+    def phi_operators(self, value) -> None:
+        self._pending_exact_auxiliary_template = None
+        self._phi_operators_state = value
+
+    @property
+    def eigenHamiltonian(self):
+        """Return the current eigen-basis Hamiltonian, materializing deferred restores if needed."""
+        self._materialize_pending_exact_auxiliary_state()
+        return getattr(self, '_eigen_hamiltonian_state', None)
+
+    @eigenHamiltonian.setter
+    def eigenHamiltonian(self, value) -> None:
+        self._pending_exact_auxiliary_template = None
+        self._eigen_hamiltonian_state = value
+
+    @property
+    def couplingHamiltonian(self):
+        """Return the current coupling Hamiltonian, materializing deferred restores if needed."""
+        self._materialize_pending_exact_auxiliary_state()
+        return getattr(self, '_coupling_hamiltonian_state', None)
+
+    @couplingHamiltonian.setter
+    def couplingHamiltonian(self, value) -> None:
+        self._pending_exact_auxiliary_template = None
+        self._coupling_hamiltonian_state = value
+
+    @property
+    def highorderHamiltonian(self):
+        """Return the current higher-order Hamiltonian, materializing deferred restores if needed."""
+        self._materialize_pending_exact_auxiliary_state()
+        return getattr(self, '_highorder_hamiltonian_state', None)
+
+    @highorderHamiltonian.setter
+    def highorderHamiltonian(self, value) -> None:
+        self._pending_exact_auxiliary_template = None
+        self._highorder_hamiltonian_state = value
 
     @classmethod
     def _clone_ndarray_mapping(
@@ -90,19 +352,44 @@ class QubitBase(HamiltonianEvo):
             flattened = tuple(float(value) for value in array.reshape(-1).tolist())
         return tuple(int(dim) for dim in array.shape), flattened
 
+    def _invalidate_exact_solve_template_cache_key_prefix(self) -> None:
+        """Drop the cached exact-solve key prefix when one static input changes."""
+        self._exact_solve_template_cache_key_prefix = None
+        self._invalidate_exact_solve_template_cache_key()
+
+    def _invalidate_exact_solve_template_cache_key(self) -> None:
+        """Drop the cached exact-solve key when the live `Ej` payload changes."""
+        self._exact_solve_template_cache_key = None
+
+    def _get_exact_solve_template_cache_key_prefix(self) -> tuple[object, ...]:
+        """Return the cached exact-solve key prefix shared across flux-only replays."""
+        cache_key_prefix = getattr(self, '_exact_solve_template_cache_key_prefix', None)
+        if cache_key_prefix is None:
+            cache_key_prefix = (
+                self._cal_mode,
+                self._get_array_cache_key(self.Ec),
+                self._get_array_cache_key(self.El),
+                self._get_array_cache_key(self._charges),
+                self._get_array_cache_key(self._Nlevel, as_int=True),
+            )
+            self._exact_solve_template_cache_key_prefix = cache_key_prefix
+        return cache_key_prefix
+
     def _get_exact_solve_template_cache_key(self) -> tuple[object, ...]:
         """Return the exact-input constructor solve-template cache key."""
-        return (
-            self._cal_mode,
-            self._get_array_cache_key(self.Ec),
-            self._get_array_cache_key(self.El),
-            self._get_array_cache_key(self.Ej),
-            self._get_array_cache_key(self._charges),
-            self._get_array_cache_key(self._Nlevel, as_int=True),
-        )
+        cache_key = getattr(self, '_exact_solve_template_cache_key', None)
+        if cache_key is None:
+            cache_key = self._get_exact_solve_template_cache_key_prefix() + (
+                self._get_array_cache_key(self.Ej),
+            )
+            self._exact_solve_template_cache_key = cache_key
+        return cache_key
 
     @classmethod
-    def _get_cached_exact_solve_template(cls, cache_key: tuple[object, ...]) -> Optional[dict[str, object]]:
+    def _get_cached_exact_solve_template(
+        cls,
+        cache_key: tuple[object, ...],
+    ) -> Optional[CachedExactSolveTemplate]:
         """Return one cached exact-input constructor solve template when available."""
         template = _QUBIT_EXACT_SOLVE_TEMPLATE_CACHE.get(cache_key)
         if template is not None:
@@ -113,7 +400,7 @@ class QubitBase(HamiltonianEvo):
     def _store_cached_exact_solve_template(
         cls,
         cache_key: tuple[object, ...],
-        template: dict[str, object],
+        template: CachedExactSolveTemplate,
     ) -> None:
         """Store one exact-input constructor solve template with LRU-style eviction."""
         _QUBIT_EXACT_SOLVE_TEMPLATE_CACHE[cache_key] = template
@@ -126,17 +413,67 @@ class QubitBase(HamiltonianEvo):
         """Clear the exact-input constructor solve-template cache used by repeated builds."""
         _QUBIT_EXACT_SOLVE_TEMPLATE_CACHE.clear()
 
+    def _get_instance_exact_solve_template_cache(self) -> OrderedDict:
+        """Return the per-instance exact-template cache used for same-instance replay restores."""
+        cache = getattr(self, '_instance_exact_solve_templates', None)
+        if cache is None:
+            cache = OrderedDict()
+            self._instance_exact_solve_templates = cache
+        return cache
+
+    def _get_instance_exact_solve_template(
+        self,
+        cache_key: tuple[object, ...],
+    ) -> Optional[OwnedExactSolveTemplate]:
+        """Return one same-instance owned exact template when available."""
+        cache = self._get_instance_exact_solve_template_cache()
+        template = cache.get(cache_key)
+        if template is not None:
+            cache.move_to_end(cache_key)
+        return template
+
+    def _store_instance_exact_solve_template(
+        self,
+        cache_key: tuple[object, ...],
+        template: OwnedExactSolveTemplate,
+    ) -> None:
+        """Store one same-instance exact template with a small LRU-style eviction policy."""
+        cache = self._get_instance_exact_solve_template_cache()
+        cache[cache_key] = template
+        cache.move_to_end(cache_key)
+        if len(cache) > _QUBIT_INSTANCE_EXACT_SOLVE_TEMPLATE_CACHE_MAXSIZE:
+            cache.popitem(last=False)
+
     def _restore_cached_exact_solve_template_if_available(self) -> bool:
         """Restore one exact-input solve template when the live state matches a cached build."""
         if getattr(self, '_cal_mode', None) != 'Eigen':
             return False
 
+        if getattr(self, '_last_changed_params', None) == {'flux'}:
+            prepared_template = getattr(self, '_prepared_flux_only_replay_exact_template', None)
+            if prepared_template is not None:
+                self._restore_owned_exact_solve_template(prepared_template)
+                return True
+
         cache_key = self._get_exact_solve_template_cache_key()
+        self._exact_solve_template_cache_key = cache_key
+        instance_template = self._get_instance_exact_solve_template(cache_key)
+        if instance_template is not None:
+            self._restore_owned_exact_solve_template(instance_template)
+            seed_prepared_template = getattr(self, '_seed_current_flux_only_replay_exact_template', None)
+            if callable(seed_prepared_template):
+                seed_prepared_template(instance_template)
+            return True
+
         cached_template = self._get_cached_exact_solve_template(cache_key)
         if cached_template is None:
             return False
 
-        self._restore_exact_solve_template(cached_template)
+        owned_template = self._restore_exact_solve_template(cached_template)
+        self._store_instance_exact_solve_template(cache_key, owned_template)
+        seed_prepared_template = getattr(self, '_seed_current_flux_only_replay_exact_template', None)
+        if callable(seed_prepared_template):
+            seed_prepared_template(owned_template)
         return True
 
     def _store_current_exact_solve_template(self) -> None:
@@ -144,44 +481,117 @@ class QubitBase(HamiltonianEvo):
         if getattr(self, '_cal_mode', None) != 'Eigen':
             return
 
-        self._store_cached_exact_solve_template(
-            self._get_exact_solve_template_cache_key(),
-            self._capture_exact_solve_template(),
-        )
+        cache_key = self._get_exact_solve_template_cache_key()
+        exact_template = self._capture_exact_solve_template()
+        owned_template = self._capture_owned_exact_solve_template()
+        self._store_cached_exact_solve_template(cache_key, exact_template)
+        self._store_instance_exact_solve_template(cache_key, owned_template)
+        seed_prepared_template = getattr(self, '_seed_current_flux_only_replay_exact_template', None)
+        if callable(seed_prepared_template):
+            seed_prepared_template(owned_template)
 
-    def _capture_exact_solve_template(self) -> dict[str, object]:
+    def _capture_exact_solve_template(self) -> CachedExactSolveTemplate:
         """Capture the current solved constructor state for exact-input reuse."""
-        return {
-            'hamiltonian': self._clone_qobj(self._Hamiltonian),
-            'energylevels': np.array(self._energylevels, copy=True),
-            'eigenstates': tuple(self._clone_qobj(state) for state in self._eigenstates),
-            'destroyors': tuple(self._clone_qobj_list(getattr(self, 'destroyors', None)) or ()),
-            'number_operators': tuple(self._clone_qobj_list(getattr(self, 'n_operators', None)) or ()),
-            'phase_operators': tuple(self._clone_qobj_list(getattr(self, 'phi_operators', None)) or ()),
-            'eigen_hamiltonian': self._clone_qobj(getattr(self, 'eigenHamiltonian', None)),
-            'coupling_hamiltonian': self._clone_qobj(getattr(self, 'couplingHamiltonian', None)),
-            'highorder_hamiltonian': self._clone_qobj(getattr(self, 'highorderHamiltonian', None)),
-        }
-
-    def _restore_exact_solve_template(self, template: dict[str, object]) -> None:
-        """Restore one cached constructor solve template onto this instance."""
-        self._hamiltonian = self._clone_qobj(template['hamiltonian'])
-        self._Hamiltonian = self._hamiltonian
-        self._energylevels = np.array(template['energylevels'], copy=True)
-        self._eigenstates = self._clone_qobj_list(template['eigenstates'])
-        self.destroyors = self._clone_qobj_list(template['destroyors'])
-        self.n_operators = self._clone_qobj_list(template['number_operators'])
-        self.phi_operators = self._clone_qobj_list(template['phase_operators'])
-        self.eigenHamiltonian = self._clone_qobj(template['eigen_hamiltonian'])
-        self.couplingHamiltonian = self._clone_qobj(template['coupling_hamiltonian'])
-        self.highorderHamiltonian = self._clone_qobj(template['highorder_hamiltonian'])
-        self._Nlevel = list(self._Hamiltonian.dims[0])
-        self._qubits_num = len(self._Nlevel)
-        self._solver_result = self._build_solver_result(
-            self._Hamiltonian,
-            self._energylevels,
-            self._eigenstates,
+        return CachedExactSolveTemplate(
+            core=ExactCoreState(
+                hamiltonian=self._clone_qobj(self._Hamiltonian),
+                energylevels=np.array(self._energylevels, copy=True),
+                eigenstates=tuple(self._clone_qobj(state) for state in self._eigenstates),
+            ),
+            auxiliary=ExactAuxiliaryState(
+                destroyors=tuple(self._clone_qobj_list(getattr(self, 'destroyors', None)) or ()),
+                number_operators=tuple(self._clone_qobj_list(getattr(self, 'n_operators', None)) or ()),
+                phase_operators=tuple(self._clone_qobj_list(getattr(self, 'phi_operators', None)) or ()),
+                eigen_hamiltonian=self._clone_qobj(getattr(self, 'eigenHamiltonian', None)),
+                coupling_hamiltonian=self._clone_qobj(getattr(self, 'couplingHamiltonian', None)),
+                highorder_hamiltonian=self._clone_qobj(getattr(self, 'highorderHamiltonian', None)),
+            ),
         )
+
+    def _capture_owned_exact_solve_template(self) -> OwnedExactSolveTemplate:
+        """Capture the live exact-template state for same-instance replay reuse."""
+        return OwnedExactSolveTemplate(
+            core=ExactCoreState(
+                hamiltonian=self._Hamiltonian,
+                energylevels=self._energylevels,
+                eigenstates=self._eigenstates,
+            ),
+            pending_core=copy(getattr(self, '_pending_exact_core_template', None)),
+            auxiliary=ExactAuxiliaryState(
+                destroyors=getattr(self, 'destroyors', None),
+                number_operators=getattr(self, 'n_operators', None),
+                phase_operators=getattr(self, 'phi_operators', None),
+                eigen_hamiltonian=getattr(self, 'eigenHamiltonian', None),
+                coupling_hamiltonian=getattr(self, 'couplingHamiltonian', None),
+                highorder_hamiltonian=getattr(self, 'highorderHamiltonian', None),
+            ),
+            solver_result=self._solver_result,
+            pending_auxiliary=copy(getattr(self, '_pending_exact_auxiliary_template', None)),
+            nlevel=list(self._Nlevel),
+            qubits_num=self._qubits_num,
+        )
+
+    def _build_owned_exact_solve_template(self, template) -> OwnedExactSolveTemplate:
+        """Defer one process-level exact template's core clones until a caller needs them."""
+        cached_template = CachedExactSolveTemplate.from_legacy_dict(template)
+        nlevel = list(cached_template.core.hamiltonian.dims[0])
+        return OwnedExactSolveTemplate(
+            core=ExactCoreState(
+                hamiltonian=None,
+                energylevels=None,
+                eigenstates=None,
+            ),
+            pending_core=ExactCoreState(
+                hamiltonian=cached_template.core.hamiltonian,
+                energylevels=cached_template.core.energylevels,
+                eigenstates=cached_template.core.eigenstates,
+            ),
+            auxiliary=ExactAuxiliaryState(
+                destroyors=None,
+                number_operators=None,
+                phase_operators=None,
+                eigen_hamiltonian=None,
+                coupling_hamiltonian=None,
+                highorder_hamiltonian=None,
+            ),
+            solver_result=None,
+            pending_auxiliary=ExactAuxiliaryState(
+                destroyors=cached_template.auxiliary.destroyors,
+                number_operators=cached_template.auxiliary.number_operators,
+                phase_operators=cached_template.auxiliary.phase_operators,
+                eigen_hamiltonian=cached_template.auxiliary.eigen_hamiltonian,
+                coupling_hamiltonian=cached_template.auxiliary.coupling_hamiltonian,
+                highorder_hamiltonian=cached_template.auxiliary.highorder_hamiltonian,
+            ),
+            nlevel=nlevel,
+            qubits_num=len(nlevel),
+        )
+
+    def _restore_owned_exact_solve_template(self, template) -> None:
+        """Restore one instance-owned exact template without recloning its solved payload."""
+        owned_template = OwnedExactSolveTemplate.from_legacy_dict(template)
+        self._active_exact_solve_template = owned_template
+        self._hamiltonian = owned_template.core.hamiltonian
+        self._Hamiltonian = self._hamiltonian
+        self._energylevels = owned_template.core.energylevels
+        self._eigenstates = owned_template.core.eigenstates
+        self._pending_exact_core_template = owned_template.pending_core
+        self._destroyors_state = owned_template.auxiliary.destroyors
+        self._n_operators_state = owned_template.auxiliary.number_operators
+        self._phi_operators_state = owned_template.auxiliary.phase_operators
+        self._eigen_hamiltonian_state = owned_template.auxiliary.eigen_hamiltonian
+        self._coupling_hamiltonian_state = owned_template.auxiliary.coupling_hamiltonian
+        self._highorder_hamiltonian_state = owned_template.auxiliary.highorder_hamiltonian
+        self._Nlevel = list(owned_template.nlevel)
+        self._qubits_num = int(owned_template.qubits_num)
+        self._solver_result = owned_template.solver_result
+        self._pending_exact_auxiliary_template = copy(owned_template.pending_auxiliary)
+
+    def _restore_exact_solve_template(self, template) -> OwnedExactSolveTemplate:
+        """Restore one process-level exact template by first cloning it into instance-owned state."""
+        owned_template = self._build_owned_exact_solve_template(template)
+        self._restore_owned_exact_solve_template(owned_template)
+        return owned_template
 
     def _normalize_flux_input(self, value):
         """Accept scalar, reduced, or full flux forms for active qubit workflows."""
@@ -251,6 +661,7 @@ class QubitBase(HamiltonianEvo):
         self._charges = np.array(charges) if np.any(charges) else np.array([0] * self._numQubits)
         self._cal_mode = cal_mode
         self._Nlevel = np.array(trunc_ener_level) if np.any(trunc_ener_level) else [10] * self._numQubits
+        self._invalidate_exact_solve_template_cache_key_prefix()
 
         self._max_spectrum_inputs = (
             np.array(self.Ec, copy=True),
@@ -296,6 +707,7 @@ class QubitBase(HamiltonianEvo):
         """Update Ej based on current flux and junction ratio."""
         flux_to_use = np.asarray(self._flux)
         ratio_to_use = np.asarray(self._junc_ratio)
+        self._invalidate_exact_solve_template_cache_key()
         self.Ej = self._Ejphi(self.Ejmax, flux_to_use, ratio_to_use)
 
     def _Ejphi(self, Ej0: float, flux: float, ratio: float) -> float:
@@ -388,6 +800,11 @@ class QubitBase(HamiltonianEvo):
         )
 
     @staticmethod
+    def _append_qobj_term(total: Optional[Qobj], term: Qobj) -> Qobj:
+        """Accumulate one Qobj term without paying the extra `sum(..., 0)` add step."""
+        return term if total is None else total + term
+
+    @staticmethod
     def _get_pair_indices(num_qubits: int) -> tuple[tuple[int, int], ...]:
         """Return the unordered qubit-pair indices used by the Hamiltonian assembly."""
         return tuple(
@@ -408,14 +825,75 @@ class QubitBase(HamiltonianEvo):
 
     @staticmethod
     @lru_cache(maxsize=256)
+    def _build_cached_scaled_phase_power_terms(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        phi_scale_key: tuple[float, ...],
+    ) -> tuple[tuple[Qobj, Qobj, Qobj, Qobj], ...]:
+        """Build scaled even-power phase terms without materializing scaled phase operators."""
+        _, _, _, _, _, phis_norm_power_terms = QubitBase._build_cached_hamiltonian_operators(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+        )
+        return tuple(
+            QubitBase._scale_even_operator_powers(phi_scale_key[ii], phis_norm_power_terms[ii])
+            for ii in range(num_qubits)
+        )
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _build_cached_diagonal_hamiltonian_terms(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        ec_diag_key: tuple[float, ...],
+        el_diag_key: tuple[float, ...],
+        ej_diag_key: tuple[float, ...],
+        phi_scale_key: tuple[float, ...],
+    ) -> tuple[Qobj, Qobj, Qobj]:
+        """Build exact-input diagonal base/high-order terms plus their merged bundle once per solve state."""
+        _, _, _, _, number_ops, phis_norm_power_terms = QubitBase._build_cached_hamiltonian_operators(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+        )
+        inverse_factorial_6 = 1.0 / math.factorial(6)
+        inverse_factorial_8 = 1.0 / math.factorial(8)
+        inverse_24 = 1.0 / 24.0
+        hamil_0_terms = []
+        hamil_high_terms = []
+
+        for ii in range(num_qubits):
+            phi_scale_squared = phi_scale_key[ii] * phi_scale_key[ii]
+            phi_scale_fourth = phi_scale_squared * phi_scale_squared
+            phi_scale_sixth = phi_scale_fourth * phi_scale_squared
+            phi_scale_eighth = phi_scale_fourth * phi_scale_fourth
+            harmonic_coeff = math.sqrt(8.0 * ec_diag_key[ii] * (el_diag_key[ii] + ej_diag_key[ii]))
+            hamil_0_terms.append(
+                harmonic_coeff * number_ops[ii]
+                - (inverse_24 * ej_diag_key[ii] * phi_scale_fourth) * phis_norm_power_terms[ii][1]
+            )
+            hamil_high_terms.append(
+                (inverse_factorial_6 * ej_diag_key[ii] * phi_scale_sixth) * phis_norm_power_terms[ii][2]
+                - (inverse_factorial_8 * ej_diag_key[ii] * phi_scale_eighth) * phis_norm_power_terms[ii][3]
+            )
+
+        hamil_0 = sum(hamil_0_terms)
+        hamil_high = sum(hamil_high_terms)
+        return hamil_0, hamil_high, hamil_0 + hamil_high
+
+    @staticmethod
+    @lru_cache(maxsize=256)
     def _build_cached_scaled_phase_terms(
         nlevel_key: tuple[int, ...],
         charges_key: tuple[float, ...],
         num_qubits: int,
         phi_scale_key: tuple[float, ...],
     ) -> tuple[tuple[Qobj, ...], tuple[tuple[Qobj, Qobj, Qobj, Qobj], ...]]:
-        """Build scaled phase operators and even-power terms once per exact scale tuple."""
-        _, _, phis_norm, _, _, phis_norm_power_terms = QubitBase._build_cached_hamiltonian_operators(
+        """Build scaled phase operators plus even-power terms when both views are needed."""
+        _, _, phis_norm, _, _, _ = QubitBase._build_cached_hamiltonian_operators(
             nlevel_key,
             charges_key,
             num_qubits,
@@ -424,9 +902,11 @@ class QubitBase(HamiltonianEvo):
             phi_scale_key[ii] * phis_norm[ii]
             for ii in range(num_qubits)
         )
-        phi_power_terms = tuple(
-            QubitBase._scale_even_operator_powers(phi_scale_key[ii], phis_norm_power_terms[ii])
-            for ii in range(num_qubits)
+        phi_power_terms = QubitBase._build_cached_scaled_phase_power_terms(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+            phi_scale_key,
         )
         return phis_op, phi_power_terms
 
@@ -439,18 +919,367 @@ class QubitBase(HamiltonianEvo):
         phi_scale_key: tuple[float, ...],
     ) -> tuple[tuple[tuple[int, int], tuple[Qobj, Qobj, Qobj, Qobj]], ...]:
         """Build transient pair-power scaffolding once per exact scale tuple."""
-        phis_op, _ = QubitBase._build_cached_scaled_phase_terms(
-            nlevel_key,
-            charges_key,
-            num_qubits,
-            phi_scale_key,
-        )
         return tuple(
             (
                 (ii, jj),
-                QubitBase._build_even_operator_powers(phis_op[ii] - phis_op[jj]),
+                QubitBase._build_cached_pair_power_term(
+                    nlevel_key,
+                    charges_key,
+                    num_qubits,
+                    ii,
+                    jj,
+                    (phi_scale_key[ii], phi_scale_key[jj]),
+                ),
             )
             for ii, jj in QubitBase._get_pair_indices(num_qubits)
+        )
+
+    @staticmethod
+    @lru_cache(maxsize=512)
+    def _build_cached_pair_power_term(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        ii: int,
+        jj: int,
+        pair_phi_scale_key: tuple[float, float],
+    ) -> tuple[Qobj, Qobj, Qobj, Qobj]:
+        """Build one exact-input pair delta power bundle without tying unrelated qubit scales together."""
+        _, _, phis_norm, _, _, _ = QubitBase._build_cached_hamiltonian_operators(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+        )
+        return QubitBase._build_even_operator_powers(
+            pair_phi_scale_key[0] * phis_norm[ii]
+            - pair_phi_scale_key[1] * phis_norm[jj]
+        )
+
+    @staticmethod
+    @lru_cache(maxsize=512)
+    def _build_cached_pair_operator_products(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        ii: int,
+        jj: int,
+    ) -> tuple[Qobj, Qobj, Qobj, Qobj, Qobj]:
+        """Build one scale-independent pair-product bundle for later scalar aggregation reuse."""
+        (
+            _,
+            ns_norm,
+            phis_norm,
+            charge_op,
+            _,
+            _,
+        ) = QubitBase._build_cached_hamiltonian_operators(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+        )
+        return (
+            phis_norm[ii] * phis_norm[jj],
+            ns_norm[ii] * ns_norm[jj],
+            ns_norm[ii] * charge_op[jj],
+            charge_op[ii] * ns_norm[jj],
+            charge_op[ii] * charge_op[jj],
+        )
+
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def _build_cached_pair_number_term(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        ii: int,
+        jj: int,
+        pair_ns_scale_key: tuple[float, float],
+    ) -> Qobj:
+        """Build one exact-input pair number term from cached scale-independent products."""
+        (
+            _,
+            ns_pair_product,
+            ns_charge_right_product,
+            charge_left_ns_product,
+            charge_pair_product,
+        ) = QubitBase._build_cached_pair_operator_products(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+            ii,
+            jj,
+        )
+        pair_scale_product = pair_ns_scale_key[0] * pair_ns_scale_key[1]
+        left_charge = charges_key[ii]
+        right_charge = charges_key[jj]
+
+        if left_charge == 0.0 and right_charge == 0.0:
+            return pair_scale_product * ns_pair_product
+        if left_charge == 0.0:
+            return pair_scale_product * ns_pair_product - pair_ns_scale_key[0] * ns_charge_right_product
+        if right_charge == 0.0:
+            return pair_scale_product * ns_pair_product - pair_ns_scale_key[1] * charge_left_ns_product
+        return (
+            pair_scale_product * ns_pair_product
+            - pair_ns_scale_key[0] * ns_charge_right_product
+            - pair_ns_scale_key[1] * charge_left_ns_product
+            + charge_pair_product
+        )
+
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def _build_cached_pair_number_contribution(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        ii: int,
+        jj: int,
+        pair_ns_scale_key: tuple[float, float],
+        pair_ec: float,
+    ) -> Qobj:
+        """Build one exact-input weighted pair charging contribution for warmed reuse."""
+        return (4.0 * pair_ec) * QubitBase._build_cached_pair_number_term(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+            ii,
+            jj,
+            pair_ns_scale_key,
+        )
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _build_cached_pair_number_bundle(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        ns_scale_key: tuple[float, ...],
+        pair_ec_key: tuple[float, ...],
+    ) -> Optional[Qobj]:
+        """Build one exact-input combined pair-charge bundle for later cold-path reuse."""
+        hamil_c = None
+        for (ii, jj), pair_ec in zip(QubitBase._get_pair_indices(num_qubits), pair_ec_key):
+            if pair_ec == 0.0:
+                continue
+            hamil_c = QubitBase._append_qobj_term(
+                hamil_c,
+                QubitBase._build_cached_pair_number_contribution(
+                    nlevel_key,
+                    charges_key,
+                    num_qubits,
+                    ii,
+                    jj,
+                    (ns_scale_key[ii], ns_scale_key[jj]),
+                    pair_ec,
+                ),
+            )
+        return hamil_c
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _build_cached_charge_only_hamiltonian_terms(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        ec_diag_key: tuple[float, ...],
+        el_diag_key: tuple[float, ...],
+        ej_diag_key: tuple[float, ...],
+        phi_scale_key: tuple[float, ...],
+        ns_scale_key: tuple[float, ...],
+        pair_ec_key: tuple[float, ...],
+    ) -> tuple[Qobj, Qobj, Optional[Qobj], Qobj]:
+        """Build one exact-input charge-only Hamiltonian bundle for later cold-path reuse."""
+        hamil_0, hamil_high, hamil_diag_total = QubitBase._build_cached_diagonal_hamiltonian_terms(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+            ec_diag_key,
+            el_diag_key,
+            ej_diag_key,
+            phi_scale_key,
+        )
+        hamil_c = QubitBase._build_cached_pair_number_bundle(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+            ns_scale_key,
+            pair_ec_key,
+        )
+        if hamil_c is None:
+            return hamil_0, hamil_high, None, hamil_diag_total
+        return hamil_0, hamil_high, hamil_c, hamil_diag_total + hamil_c
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _build_cached_truncated_charge_only_hamiltonian(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        ec_diag_key: tuple[float, ...],
+        el_diag_key: tuple[float, ...],
+        ej_diag_key: tuple[float, ...],
+        phi_scale_key: tuple[float, ...],
+        ns_scale_key: tuple[float, ...],
+        pair_ec_key: tuple[float, ...],
+    ) -> Qobj:
+        """Build one exact-input truncated charge-only Hamiltonian for later cold-path reuse."""
+        return truncate_hilbert_space(
+            QubitBase._build_cached_charge_only_hamiltonian_terms(
+                nlevel_key,
+                charges_key,
+                num_qubits,
+                ec_diag_key,
+                el_diag_key,
+                ej_diag_key,
+                phi_scale_key,
+                ns_scale_key,
+                pair_ec_key,
+            )[3],
+            nlevel_key,
+        )
+
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def _build_cached_pair_phase_product(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        ii: int,
+        jj: int,
+        pair_phi_scale_key: tuple[float, float],
+    ) -> Qobj:
+        """Build one exact-input pair phase-product term from cached scale-independent products."""
+        (
+            phi_pair_product,
+            _,
+            _,
+            _,
+            _,
+        ) = QubitBase._build_cached_pair_operator_products(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+            ii,
+            jj,
+        )
+        return (pair_phi_scale_key[0] * pair_phi_scale_key[1]) * phi_pair_product
+
+    @staticmethod
+    @lru_cache(maxsize=1024)
+    def _build_cached_pair_delta_terms(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        ii: int,
+        jj: int,
+        pair_phi_scale_key: tuple[float, float],
+    ) -> tuple[Qobj, Qobj, Qobj, Qobj]:
+        """Build one exact-input pair delta-power bundle only when a pair Ej term needs it."""
+        (
+            phi_pair_product,
+            _,
+            _,
+            _,
+            _,
+        ) = QubitBase._build_cached_pair_operator_products(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+            ii,
+            jj,
+        )
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            phis_norm_power_terms,
+        ) = QubitBase._build_cached_hamiltonian_operators(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+        )
+        delta_squared = (
+            (pair_phi_scale_key[0] * pair_phi_scale_key[0]) * phis_norm_power_terms[ii][0]
+            + (pair_phi_scale_key[1] * pair_phi_scale_key[1]) * phis_norm_power_terms[jj][0]
+            - (2.0 * pair_phi_scale_key[0] * pair_phi_scale_key[1]) * phi_pair_product
+        )
+        delta_fourth = delta_squared * delta_squared
+        delta_sixth = delta_fourth * delta_squared
+        delta_eighth = delta_fourth * delta_fourth
+        return delta_squared, delta_fourth, delta_sixth, delta_eighth
+
+    @staticmethod
+    @lru_cache(maxsize=256)
+    def _build_cached_pair_interaction_terms(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        phi_scale_key: tuple[float, ...],
+        ns_scale_key: tuple[float, ...],
+    ) -> tuple[tuple[tuple[int, int], tuple[Qobj, Qobj, Qobj, Qobj, Qobj, Qobj]], ...]:
+        """Build transient pair interaction bundles once per exact scale tuple."""
+        return tuple(
+            (
+                (ii, jj),
+                QubitBase._build_cached_pair_interaction_term(
+                    nlevel_key,
+                    charges_key,
+                    num_qubits,
+                    ii,
+                    jj,
+                    (phi_scale_key[ii], phi_scale_key[jj]),
+                    (ns_scale_key[ii], ns_scale_key[jj]),
+                ),
+            )
+            for ii, jj in QubitBase._get_pair_indices(num_qubits)
+        )
+
+    @staticmethod
+    @lru_cache(maxsize=512)
+    def _build_cached_pair_interaction_term(
+        nlevel_key: tuple[int, ...],
+        charges_key: tuple[float, ...],
+        num_qubits: int,
+        ii: int,
+        jj: int,
+        pair_phi_scale_key: tuple[float, float],
+        pair_ns_scale_key: tuple[float, float],
+    ) -> tuple[Qobj, Qobj, Qobj, Qobj, Qobj, Qobj]:
+        """Build one exact-input pair bundle with reused pair products and delta powers."""
+        (
+            _,
+            ns_norm,
+            phis_norm,
+            charge_op,
+            _,
+            phis_norm_power_terms,
+        ) = QubitBase._build_cached_hamiltonian_operators(
+            nlevel_key,
+            charges_key,
+            num_qubits,
+        )
+        phi_pair_product = (pair_phi_scale_key[0] * pair_phi_scale_key[1]) * (phis_norm[ii] * phis_norm[jj])
+        ns_pair_product = (
+            (pair_ns_scale_key[0] * ns_norm[ii] - charge_op[ii])
+            * (pair_ns_scale_key[1] * ns_norm[jj] - charge_op[jj])
+        )
+        delta_squared = (
+            (pair_phi_scale_key[0] * pair_phi_scale_key[0]) * phis_norm_power_terms[ii][0]
+            + (pair_phi_scale_key[1] * pair_phi_scale_key[1]) * phis_norm_power_terms[jj][0]
+            - (2.0 * phi_pair_product)
+        )
+        delta_fourth = delta_squared * delta_squared
+        delta_sixth = delta_fourth * delta_squared
+        delta_eighth = delta_fourth * delta_fourth
+        return (
+            ns_pair_product,
+            phi_pair_product,
+            delta_squared,
+            delta_fourth,
+            delta_sixth,
+            delta_eighth,
         )
 
     @staticmethod
@@ -494,20 +1323,8 @@ class QubitBase(HamiltonianEvo):
         transient: bool = False,
     ) -> Qobj:
         if self._cal_mode == 'Eigen':
-            (
-                destroyors,
-                ns_norm,
-                phis_norm,
-                charge_op,
-                number_ops,
-                phis_norm_power_terms,
-            ) = self._hamiltonianOperator()
             ns_scales = [
                 ((Ej[ii, ii] + El[ii, ii]) / 2 / Ec[ii, ii]) ** (1 / 4)
-                for ii in range(self._numQubits)
-            ]
-            ns_op = [
-                ns_scales[ii] * ns_norm[ii] - charge_op[ii]
                 for ii in range(self._numQubits)
             ]
             phi_scales = [
@@ -517,61 +1334,118 @@ class QubitBase(HamiltonianEvo):
             operator_cache_key = self._get_hamiltonian_operator_cache_key()
             phi_scale_key = self._get_phi_scale_cache_key(phi_scales)
             ns_scale_key = self._get_ns_scale_cache_key(ns_scales)
-            phis_op, phi_power_terms = self._build_cached_scaled_phase_terms(
-                *operator_cache_key,
-                phi_scale_key,
-            )
+            ec_diag_key = tuple(float(Ec[ii, ii]) for ii in range(self._numQubits))
+            el_diag_key = tuple(float(El[ii, ii]) for ii in range(self._numQubits))
+            ej_diag_key = tuple(float(Ej[ii, ii]) for ii in range(self._numQubits))
             # Off-diagonal terms only use even powers, so (phi_i - phi_j) and (phi_j - phi_i)
             # can share the same cached matrices even when the coefficient matrices are asymmetric.
             pair_indices = self._get_pair_indices(self._numQubits)
-            pair_power_terms = dict(
-                self._build_cached_pair_power_terms(
+            inverse_factorial_6 = 1.0 / math.factorial(6)
+            inverse_factorial_8 = 1.0 / math.factorial(8)
+            inverse_24 = 1.0 / 24.0
+            pair_ec_key = tuple(
+                float(Ec[ii, jj] + Ec[jj, ii])
+                for ii, jj in pair_indices
+            )
+            pair_el_key = tuple(
+                float(El[ii, jj] + El[jj, ii])
+                for ii, jj in pair_indices
+            )
+            pair_ej_key = tuple(
+                float(Ej[ii, jj] + Ej[jj, ii])
+                for ii, jj in pair_indices
+            )
+
+            if not any(pair_el_key) and not any(pair_ej_key):
+                hamil_0, hamil_high, hamil_c, _ = self._build_cached_charge_only_hamiltonian_terms(
                     *operator_cache_key,
+                    ec_diag_key,
+                    el_diag_key,
+                    ej_diag_key,
+                    phi_scale_key,
+                    ns_scale_key,
+                    pair_ec_key,
+                )
+                hamil_all = self._build_cached_truncated_charge_only_hamiltonian(
+                    *operator_cache_key,
+                    ec_diag_key,
+                    el_diag_key,
+                    ej_diag_key,
+                    phi_scale_key,
+                    ns_scale_key,
+                    pair_ec_key,
+                )
+            else:
+                hamil_0, hamil_high_diag, hamil_diag_total = self._build_cached_diagonal_hamiltonian_terms(
+                    *operator_cache_key,
+                    ec_diag_key,
+                    el_diag_key,
+                    ej_diag_key,
                     phi_scale_key,
                 )
-            )
-            factorial_6 = math.factorial(6)
-            factorial_8 = math.factorial(8)
-            hamil_c_terms = []
-            hamil_high_pair_terms = []
-
-            for ii, jj in pair_indices:
-                ec_pair = Ec[ii, jj] + Ec[jj, ii]
-                el_pair = El[ii, jj] + El[jj, ii]
-                ej_pair = Ej[ii, jj] + Ej[jj, ii]
-                if ec_pair == 0 and el_pair == 0 and ej_pair == 0:
-                    continue
-
-                delta_squared, delta_fourth, delta_sixth, delta_eighth = pair_power_terms[(ii, jj)]
-                hamil_c_terms.append(
-                    4 * ec_pair * ns_op[ii] * ns_op[jj]
-                    + el_pair * phis_op[ii] * phis_op[jj] / 2
-                    - ej_pair * (-delta_squared / 2 + delta_fourth / 24)
+                hamil_c = self._build_cached_pair_number_bundle(
+                    *operator_cache_key,
+                    ns_scale_key,
+                    pair_ec_key,
                 )
-                hamil_high_pair_terms.append(
-                    ej_pair * (delta_sixth / factorial_6 - delta_eighth / factorial_8)
-                )
+                hamil_high_pair = None
 
-            hamil_0 = sum(
-                [
-                    np.sqrt(8 * Ec[ii, ii] * (El[ii, ii] + Ej[ii, ii])) * number_ops[ii]
-                    - (Ej[ii, ii] * phi_power_terms[ii][1]) / 24
-                    for ii in range(self._numQubits)
-                ]
-            )
-            hamil_c = sum(hamil_c_terms)
-            hamil_high = sum(
-                [
-                    Ej[ii, ii] * phi_power_terms[ii][2] / factorial_6
-                    - Ej[ii, ii] * phi_power_terms[ii][3] / factorial_8
-                    for ii in range(self._numQubits)
-                ]
-            )
-            hamil_high += sum(hamil_high_pair_terms)
+                for (ii, jj), ec_pair, el_pair, ej_pair in zip(
+                    pair_indices,
+                    pair_ec_key,
+                    pair_el_key,
+                    pair_ej_key,
+                ):
+                    if ec_pair == 0 and el_pair == 0 and ej_pair == 0:
+                        continue
 
-            hamil_all = hamil_0 + hamil_c + hamil_high
+                    if el_pair != 0:
+                        hamil_c = self._append_qobj_term(
+                            hamil_c,
+                            (0.5 * el_pair)
+                            * self._build_cached_pair_phase_product(
+                                *operator_cache_key,
+                                ii,
+                                jj,
+                                (phi_scale_key[ii], phi_scale_key[jj]),
+                            ),
+                        )
+                    if ej_pair != 0:
+                        (
+                            delta_squared,
+                            delta_fourth,
+                            delta_sixth,
+                            delta_eighth,
+                        ) = self._build_cached_pair_delta_terms(
+                            *operator_cache_key,
+                            ii,
+                            jj,
+                            (phi_scale_key[ii], phi_scale_key[jj]),
+                        )
+                        hamil_c = self._append_qobj_term(
+                            hamil_c,
+                            (0.5 * ej_pair) * delta_squared
+                            - (inverse_24 * ej_pair) * delta_fourth,
+                        )
+                        hamil_high_pair = self._append_qobj_term(
+                            hamil_high_pair,
+                            (inverse_factorial_6 * ej_pair) * delta_sixth
+                            - (inverse_factorial_8 * ej_pair) * delta_eighth,
+                        )
 
-            hamil_all = truncate_hilbert_space(hamil_all, self._Nlevel)
+                if hamil_high_pair is None:
+                    hamil_high = hamil_high_diag
+                    hamil_all = hamil_diag_total
+                else:
+                    hamil_high = hamil_high_diag + hamil_high_pair
+                    hamil_all = hamil_0 + hamil_high
+                if hamil_c is None:
+                    hamil_c = 0
+                else:
+                    hamil_all = hamil_all + hamil_c
+
+            if any(pair_el_key) or any(pair_ej_key):
+                hamil_all = truncate_hilbert_space(hamil_all, self._Nlevel)
             if not transient:
                 self.eigenHamiltonian = hamil_0
                 self.couplingHamiltonian = hamil_c
@@ -634,6 +1508,14 @@ class QubitBase(HamiltonianEvo):
 
         for target_attr, value, _ in resolved_updates:
             setattr(self, target_attr, value)
+
+        exact_solve_static_key_params = self._EXACT_SOLVE_TEMPLATE_STATIC_KEY_PARAMS | getattr(
+            self,
+            '_ELEMENT_PARAMS',
+            set(),
+        )
+        if self._last_changed_params & exact_solve_static_key_params:
+            self._invalidate_exact_solve_template_cache_key_prefix()
 
         self._recalculate_hamiltonian()
 
@@ -780,7 +1662,7 @@ class ParameterizedQubit(QubitBase):
             self._flux = np.array(fluxes) if np.any(fluxes) else np.zeros_like(self.__capac)
         self.__nodes = self.__capac.shape[0]
         self._junc_ratio = junc_ratio if np.any(junc_ratio) else np.ones_like(self._flux)
-        self._transformed_vars_dirty = True
+        self._mark_transformed_vars_dirty(flux=True, junc_ratio=True)
         if np.any(structure_index):
             self._numQubits = len(structure_index)
             self.__struct = structure_index
@@ -824,6 +1706,38 @@ class ParameterizedQubit(QubitBase):
             'ej0_matrix': self._clone_ndarray(self.__Ej0),
         }
 
+    def _mark_transformed_vars_dirty(
+        self,
+        *,
+        flux: bool = False,
+        junc_ratio: bool = False,
+    ) -> None:
+        """Mark one or both transformed projection views dirty for the next refresh."""
+        if flux:
+            self._flux_transformed_dirty = True
+        if junc_ratio:
+            self._junc_ratio_transformed_dirty = True
+        self._transformed_vars_dirty = bool(
+            getattr(self, '_flux_transformed_dirty', False)
+            or getattr(self, '_junc_ratio_transformed_dirty', False)
+        )
+
+    def _mark_transformed_vars_clean(
+        self,
+        *,
+        flux: bool = False,
+        junc_ratio: bool = False,
+    ) -> None:
+        """Mark one or both transformed projection views clean after refresh."""
+        if flux:
+            self._flux_transformed_dirty = False
+        if junc_ratio:
+            self._junc_ratio_transformed_dirty = False
+        self._transformed_vars_dirty = bool(
+            getattr(self, '_flux_transformed_dirty', False)
+            or getattr(self, '_junc_ratio_transformed_dirty', False)
+        )
+
     def _restore_ematrix_template(self, template: dict[str, object]) -> None:
         """Restore one cached circuit-element matrix bundle onto this instance."""
         self.SMatrix = self._clone_ndarray(template['s_matrix'])
@@ -832,6 +1746,89 @@ class ParameterizedQubit(QubitBase):
         self.__Ec = self._clone_ndarray(template['ec_matrix'])
         self.__El = self._clone_ndarray(template['el_matrix'])
         self.__Ej0 = self._clone_ndarray(template['ej0_matrix'])
+
+    def _get_flux_only_replay_preparation_cache(self) -> OrderedDict:
+        """Return the per-instance flux-only replay cache used by repeated exact-input sweeps."""
+        cache = getattr(self, '_flux_only_replay_preparation_cache', None)
+        if cache is None:
+            cache = OrderedDict()
+            self._flux_only_replay_preparation_cache = cache
+        return cache
+
+    def _clear_prepared_flux_only_replay_exact_template(self) -> None:
+        """Drop the direct same-instance exact template prepared for one flux-only replay."""
+        self._prepared_flux_only_replay_exact_template = None
+
+    def _clear_flux_only_replay_preparation_cache(self) -> None:
+        """Drop cached flux-only replay preparation when a non-flux input changes."""
+        cache = getattr(self, '_flux_only_replay_preparation_cache', None)
+        if cache is not None:
+            cache.clear()
+        self._clear_prepared_flux_only_replay_exact_template()
+
+    @staticmethod
+    def _get_flux_only_replay_preparation_cache_key(flux) -> tuple[tuple[int, ...], str, bytes]:
+        """Return a compact key for one normalized flux payload on the same instance."""
+        flux_array = np.asarray(flux)
+        if not flux_array.flags.c_contiguous:
+            flux_array = np.ascontiguousarray(flux_array)
+        return tuple(int(dim) for dim in flux_array.shape), flux_array.dtype.str, flux_array.tobytes()
+
+    def _get_cached_flux_only_replay_preparation(self) -> Optional[FluxOnlyReplayPreparation]:
+        """Return cached transformed flux / `Ej` prep for one repeated flux-only replay."""
+        cache = getattr(self, '_flux_only_replay_preparation_cache', None)
+        if cache is None:
+            return None
+
+        cache_key = self._get_flux_only_replay_preparation_cache_key(self._flux)
+        cached_state = cache.get(cache_key)
+        if cached_state is not None:
+            cache.move_to_end(cache_key)
+        return cached_state
+
+    def _store_flux_only_replay_preparation(
+        self,
+        flux_transformed: np.ndarray,
+        Ej: np.ndarray,
+        exact_solve_template_cache_key: tuple[object, ...],
+    ) -> None:
+        """Store one prepared flux-only replay payload for later same-instance reuse."""
+        cache = self._get_flux_only_replay_preparation_cache()
+        cache_key = self._get_flux_only_replay_preparation_cache_key(self._flux)
+        self._clear_prepared_flux_only_replay_exact_template()
+        cache[cache_key] = FluxOnlyReplayPreparation(
+            flux_transformed=self._clone_ndarray(flux_transformed),
+            Ej=self._clone_ndarray(Ej),
+            exact_solve_template_cache_key=exact_solve_template_cache_key,
+        )
+        cache.move_to_end(cache_key)
+        if len(cache) > _FLUX_ONLY_REPLAY_PREPARATION_CACHE_MAXSIZE:
+            cache.popitem(last=False)
+
+    def _seed_current_flux_only_replay_exact_template(self, template) -> None:
+        """Attach the current owned exact template to the active flux-only replay cache entry."""
+        owned_template = OwnedExactSolveTemplate.from_legacy_dict(template)
+        self._prepared_flux_only_replay_exact_template = owned_template
+        cache = getattr(self, '_flux_only_replay_preparation_cache', None)
+        if cache is None:
+            return
+
+        cache_key = self._get_flux_only_replay_preparation_cache_key(self._flux)
+        cached_state = cache.get(cache_key)
+        if cached_state is None:
+            return
+
+        cached_state.instance_exact_solve_template = owned_template
+        cache.move_to_end(cache_key)
+
+    def _restore_flux_only_replay_preparation(self, cached_state) -> None:
+        """Restore cached transformed flux / `Ej` prep for one repeated flux-only replay."""
+        preparation = FluxOnlyReplayPreparation.from_legacy_dict(cached_state)
+        self._flux_transformed = self._clone_ndarray(preparation.flux_transformed)
+        self._mark_transformed_vars_clean(flux=True)
+        self.Ej = self._clone_ndarray(preparation.Ej)
+        self._exact_solve_template_cache_key = preparation.exact_solve_template_cache_key
+        self._prepared_flux_only_replay_exact_template = preparation.instance_exact_solve_template
 
     def _generate_Ematrix(self):
         cache_key = self._get_ematrix_template_cache_key()
@@ -859,7 +1856,7 @@ class ParameterizedQubit(QubitBase):
             self.__struct,
             retainNodes,
         )
-        self._transformed_vars_dirty = False
+        self._mark_transformed_vars_clean(flux=True, junc_ratio=True)
 
         return self.__Ec, self.__El, self.__Ej0
 
@@ -885,24 +1882,32 @@ class ParameterizedQubit(QubitBase):
         This method should be called after change_para updates _flux or _junc_ratio,
         before _update_Ej recalculates Ej.
         """
-        if (
-            not getattr(self, '_transformed_vars_dirty', True)
-            and hasattr(self, '_flux_transformed')
-            and hasattr(self, '_junc_ratio_transformed')
-        ):
+        flux_dirty = getattr(
+            self,
+            '_flux_transformed_dirty',
+            not hasattr(self, '_flux_transformed'),
+        )
+        junc_ratio_dirty = getattr(
+            self,
+            '_junc_ratio_transformed_dirty',
+            not hasattr(self, '_junc_ratio_transformed'),
+        )
+        if not (flux_dirty or junc_ratio_dirty):
             return
 
-        self._flux_transformed = project_transformed_flux(
-            self._flux,
-            self.__struct,
-            self.SMatrix_retainNodes,
-        )
-        self._junc_ratio_transformed = project_transformed_junction_ratio(
-            self._junc_ratio,
-            self.__struct,
-            self.SMatrix_retainNodes,
-        )
-        self._transformed_vars_dirty = False
+        if flux_dirty:
+            self._flux_transformed = project_transformed_flux(
+                self._flux,
+                self.__struct,
+                self.SMatrix_retainNodes,
+            )
+        if junc_ratio_dirty:
+            self._junc_ratio_transformed = project_transformed_junction_ratio(
+                self._junc_ratio,
+                self.__struct,
+                self.SMatrix_retainNodes,
+            )
+        self._mark_transformed_vars_clean(flux=True, junc_ratio=True)
 
     def _update_Ej(self):
         """
@@ -936,8 +1941,19 @@ class ParameterizedQubit(QubitBase):
         Handles flux transformation and Ej recalculation for ParameterizedQubit.
         """
         changed_params = getattr(self, '_last_changed_params', set())
-        if changed_params & (self._ELEMENT_PARAMS | {'flux', 'junc_ratio'}):
-            self._transformed_vars_dirty = True
+        flux_only_replay_preparation = None
+        if changed_params == {'flux'} and getattr(self, '_cal_mode', None) == 'Eigen':
+            flux_only_replay_preparation = self._get_cached_flux_only_replay_preparation()
+        else:
+            self._clear_flux_only_replay_preparation_cache()
+
+        if changed_params & self._ELEMENT_PARAMS:
+            self._mark_transformed_vars_dirty(flux=True, junc_ratio=True)
+        else:
+            self._mark_transformed_vars_dirty(
+                flux='flux' in changed_params,
+                junc_ratio='junc_ratio' in changed_params,
+            )
 
         if changed_params & self._ELEMENT_PARAMS:
             self._normalize_element_inputs()
@@ -946,19 +1962,36 @@ class ParameterizedQubit(QubitBase):
             self.El = self.__El
             self.Ejmax = self.__Ej0
 
-        # Update transformed variables
-        self._update_transformed_vars()
+        if flux_only_replay_preparation is not None:
+            self._restore_flux_only_replay_preparation(flux_only_replay_preparation)
+        else:
+            # Update transformed variables
+            self._update_transformed_vars()
 
-        # Recalculate Ej using transformed variables
-        junc_ratio_to_use = (
-            self._junc_ratio_transformed if hasattr(self, '_junc_ratio_transformed') else self._junc_ratio
-        )
-        flux_to_use = self._flux_transformed
-        ejmax_to_use = self._ParameterizedQubit__Ej0 if hasattr(self, '_ParameterizedQubit__Ej0') else self.Ejmax
+            # Recalculate Ej using transformed variables
+            junc_ratio_to_use = (
+                self._junc_ratio_transformed if hasattr(self, '_junc_ratio_transformed') else self._junc_ratio
+            )
+            flux_to_use = self._flux_transformed
+            ejmax_to_use = (
+                self._ParameterizedQubit__Ej0 if hasattr(self, '_ParameterizedQubit__Ej0') else self.Ejmax
+            )
 
-        self.Ej = self._Ejphi(ejmax_to_use, flux_to_use, junc_ratio_to_use)
+            self._invalidate_exact_solve_template_cache_key()
+            self.Ej = self._Ejphi(ejmax_to_use, flux_to_use, junc_ratio_to_use)
+            if changed_params == {'flux'} and getattr(self, '_cal_mode', None) == 'Eigen':
+                exact_solve_template_cache_key = self._get_exact_solve_template_cache_key()
+                self._exact_solve_template_cache_key = exact_solve_template_cache_key
+                self._store_flux_only_replay_preparation(
+                    self._flux_transformed,
+                    self.Ej,
+                    exact_solve_template_cache_key,
+                )
 
         if self._restore_cached_exact_solve_template_if_available():
+            refresh_basic_metrics = getattr(self, '_refresh_basic_metrics', None)
+            if callable(refresh_basic_metrics):
+                refresh_basic_metrics()
             self._last_changed_params = set()
             return
 

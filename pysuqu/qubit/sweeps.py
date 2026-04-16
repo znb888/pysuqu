@@ -10,6 +10,12 @@ from .plotting import (
     plot_multi_qubit_energy_vs_flux,
 )
 from .base import ParameterizedQubit, pi
+from .multi import (
+    FGF1V1Coupling,
+    _get_cached_fgf1v1_metric_state_sets,
+    _get_cached_fgf1v1_overlap_basis_indices,
+    _normalize_nlevel_cache_key,
+)
 from .types import CouplingResult, SweepResult
 
 
@@ -375,33 +381,190 @@ def sweep_multi_qubit_energy_vs_flux(
     )
 
 
-def sweep_multi_qubit_coupling_strength_vs_flux(
-    qubit,
-    coupler_flux: list[float],
-    method: str = 'ES',
-    is_plot: bool = True,
-) -> CouplingResult:
-    """Return the structured result for representative multi-qubit coupling strengths across coupler flux bias points."""
-    return sweep_multi_qubit_coupling_strength_vs_flux_result(
-        qubit,
-        coupler_flux,
-        method=method,
-        is_plot=is_plot,
+def _supports_fast_multi_qubit_coupling_sweep(qubit, method: str) -> bool:
+    """Return whether the sweep can use the FGF1V1 low-spectrum coupling fast path."""
+    return (
+        method == 'ES'
+        and isinstance(qubit, FGF1V1Coupling)
+        and getattr(qubit, '_cal_mode', None) == 'Eigen'
+        and hasattr(qubit, '_qrcouple_term')
+        and hasattr(qubit, 'Maxwellmat')
+        and hasattr(qubit, '_ParameterizedQubit__struct')
+        and hasattr(qubit, 'SMatrix_retainNodes')
     )
 
 
-def sweep_multi_qubit_coupling_strength_vs_flux_result(
+def _resolve_multi_qubit_coupling_sweep_solver_mode(qubit, method: str, solver_mode: str) -> str:
+    """Resolve the requested coupling-sweep execution mode into one concrete path."""
+    normalized_mode = str(solver_mode).lower()
+    if normalized_mode not in {'auto', 'full', 'fast'}:
+        raise ValueError("solver_mode must be one of {'auto', 'full', 'fast'}.")
+
+    fast_supported = _supports_fast_multi_qubit_coupling_sweep(qubit, method)
+    if normalized_mode == 'auto':
+        return 'fast' if fast_supported else 'full'
+    if normalized_mode == 'fast' and not fast_supported:
+        raise ValueError(
+            "solver_mode='fast' is only supported for FGF1V1Coupling with method='ES' in Eigen mode."
+        )
+    return normalized_mode
+
+
+def _solve_low_spectrum_eigensystem(hamiltonian, eigvals: int):
+    """Solve only the low spectrum needed by the FGF1V1 coupling sweep fast path."""
+    matrix_shape = getattr(hamiltonian, 'shape', (eigvals, eigvals))
+    dimension = int(matrix_shape[0]) if matrix_shape else int(eigvals)
+    use_sparse = dimension > 128 and eigvals < dimension
+    return hamiltonian.eigenstates(
+        sparse=use_sparse,
+        sort='low',
+        eigvals=eigvals,
+    )
+
+
+def _calculate_fgf1v1_es_coupling_fast(
+    qubit,
+    target_flux,
+    *,
+    metric_states,
+    qc_overlap_indices,
+    qq_overlap_indices,
+    junc_ratio_to_use,
+    ejmax_to_use,
+    struct,
+    retain_nodes,
+    eigvals,
+) -> float:
+    """Return one FGF1V1 ES coupling value without rebuilding the full steady-state object."""
+    flux_transformed = project_transformed_flux(
+        target_flux,
+        struct,
+        retain_nodes,
+    )
+    Ej = qubit._Ejphi(ejmax_to_use, flux_transformed, junc_ratio_to_use)
+    hamiltonian = qubit._generate_hamiltonian(qubit.Ec, qubit.El, Ej, transient=True)
+    eigenvalues, eigenstates = _solve_low_spectrum_eigensystem(hamiltonian, eigvals=eigvals)
+    eigenstates = list(eigenstates)
+    state_index = tuple(qubit.find_state_list(metric_states, state_space=eigenstates))
+    relative_levels = np.asarray(eigenvalues, dtype=float) - float(np.asarray(eigenvalues, dtype=float)[0])
+
+    qubit1_f01 = float(relative_levels[state_index[1]] / 2 / pi)
+    qubit2_f01 = float(relative_levels[state_index[2]] / 2 / pi)
+    coupler_f01 = float(relative_levels[state_index[3]] / 2 / pi)
+
+    q1c_g = abs(hamiltonian[qc_overlap_indices[1], qc_overlap_indices[0]]) / 2 / pi
+    q2c_g = abs(hamiltonian[qc_overlap_indices[1], qc_overlap_indices[2]]) / 2 / pi
+    qc_g = float((q1c_g + q2c_g) / 2)
+    qq_g = float(abs(hamiltonian[qq_overlap_indices[1], qq_overlap_indices[0]]) / 2 / pi)
+
+    delta1 = qubit1_f01 - coupler_f01
+    delta2 = qubit2_f01 - coupler_f01
+    sum1 = qubit1_f01 + coupler_f01
+    sum2 = qubit2_f01 + coupler_f01
+    return float(qc_g * qc_g * (1 / delta1 + 1 / delta2 - 1 / sum1 - 1 / sum2) / 2 + qq_g)
+
+
+def _build_multi_qubit_coupling_strength_vs_flux_result_fast(
     qubit,
     coupler_flux: list[float],
-    method: str = 'ES',
-    is_plot: bool = True,
+    method: str,
+    is_plot: bool,
 ) -> CouplingResult:
-    """Return the preferred structured result for a representative coupling-strength sweep."""
+    """Build one FGF1V1 coupling sweep through a low-spectrum transient Hamiltonian path."""
+    flux_origin = np.array(qubit._flux, dtype=float, copy=True)
+    baseline_coupler_flux = float(flux_origin[2, 2])
+    baseline_coupling = None
+    if any(np.isclose(flux, baseline_coupler_flux) for flux in coupler_flux):
+        if hasattr(qubit, 'qq_geff'):
+            baseline_coupling = float(qubit.qq_geff)
+        else:
+            baseline_coupling = float(qubit.get_qq_ecouple(method=method, is_print=False))
+
+    if (
+        not hasattr(qubit, '_junc_ratio_transformed')
+        or getattr(qubit, '_junc_ratio_transformed_dirty', False)
+    ):
+        qubit._update_transformed_vars()
+
+    nlevel_key = _normalize_nlevel_cache_key(qubit._Nlevel)
+    metric_states, _, _ = _get_cached_fgf1v1_metric_state_sets(nlevel_key)
+    qc_overlap_indices, qq_overlap_indices = _get_cached_fgf1v1_overlap_basis_indices(nlevel_key)
+    struct = getattr(qubit, '_ParameterizedQubit__struct')
+    retain_nodes = getattr(qubit, 'SMatrix_retainNodes')
+    junc_ratio_to_use = (
+        qubit._junc_ratio_transformed if hasattr(qubit, '_junc_ratio_transformed') else qubit._junc_ratio
+    )
+    ejmax_to_use = qubit._ParameterizedQubit__Ej0 if hasattr(qubit, '_ParameterizedQubit__Ej0') else qubit.Ejmax
+    eigvals = max(len(metric_states), 4 * int(getattr(qubit, '_numQubits', 0)))
+
+    g_list = []
+    cached_couplings = {}
+    if baseline_coupling is not None:
+        cached_couplings[baseline_coupler_flux] = baseline_coupling
+
+    for flux in coupler_flux:
+        flux_key = float(flux)
+        if flux_key in cached_couplings:
+            g_list.append(cached_couplings[flux_key])
+            continue
+
+        target_flux = np.array(flux_origin, copy=True)
+        target_flux[2, 2] = flux_key
+        coupling = _calculate_fgf1v1_es_coupling_fast(
+            qubit,
+            target_flux,
+            metric_states=metric_states,
+            qc_overlap_indices=qc_overlap_indices,
+            qq_overlap_indices=qq_overlap_indices,
+            junc_ratio_to_use=junc_ratio_to_use,
+            ejmax_to_use=ejmax_to_use,
+            struct=struct,
+            retain_nodes=retain_nodes,
+            eigvals=eigvals,
+        )
+        cached_couplings[flux_key] = coupling
+        g_list.append(coupling)
+
+    result = CouplingResult(
+        sweep_parameter='coupler_flux',
+        sweep_values=list(coupler_flux),
+        coupling_values=g_list,
+        metadata={
+            'method': method,
+            'path': 'fgf1v1_low_spectrum_fast',
+            'solver_mode': 'fast',
+        },
+    )
+    if is_plot:
+        plot_multi_qubit_coupling_strength_vs_flux(coupler_flux, result)
+
+    min_point = int(np.argmin(np.abs(result.coupling_values)))
+    print(
+        f'The turn-off point: {result.sweep_values[min_point]} '
+        f'(g={result.coupling_values[min_point]})'
+    )
+    return result
+
+
+def _build_multi_qubit_coupling_strength_vs_flux_result_generic(
+    qubit,
+    coupler_flux: list[float],
+    method: str,
+    is_plot: bool,
+) -> CouplingResult:
+    """Build the coupling sweep through the legacy full-spectrum recompute path."""
     flux_origin = copy(qubit._flux)
     g_list = []
+    baseline_coupler_flux = float(np.asarray(flux_origin, dtype=float)[2, 2])
+    baseline_coupling = None
+    if any(np.isclose(flux, baseline_coupler_flux) for flux in coupler_flux):
+        baseline_coupling = qubit.get_qq_ecouple(method=method, is_print=False)
 
     try:
         for flux in coupler_flux:
+            if baseline_coupling is not None and np.isclose(flux, baseline_coupler_flux):
+                g_list.append(baseline_coupling)
+                continue
             qubit._flux[2, 2] = flux
             qubit.change_para(flux=qubit._flux)
             g_list.append(qubit.get_qq_ecouple(method=method, is_print=False))
@@ -410,7 +573,11 @@ def sweep_multi_qubit_coupling_strength_vs_flux_result(
             sweep_parameter='coupler_flux',
             sweep_values=list(coupler_flux),
             coupling_values=g_list,
-            metadata={'method': method},
+            metadata={
+                'method': method,
+                'path': 'generic_full_spectrum',
+                'solver_mode': 'full',
+            },
         )
         if is_plot:
             plot_multi_qubit_coupling_strength_vs_flux(coupler_flux, result)
@@ -424,3 +591,48 @@ def sweep_multi_qubit_coupling_strength_vs_flux_result(
     finally:
         qubit._flux = flux_origin
         qubit.change_para(flux=flux_origin)
+
+
+def sweep_multi_qubit_coupling_strength_vs_flux(
+    qubit,
+    coupler_flux: list[float],
+    method: str = 'ES',
+    solver_mode: str = 'auto',
+    is_plot: bool = True,
+) -> CouplingResult:
+    """Return the structured result for representative multi-qubit coupling strengths across coupler flux bias points."""
+    return sweep_multi_qubit_coupling_strength_vs_flux_result(
+        qubit,
+        coupler_flux,
+        method=method,
+        solver_mode=solver_mode,
+        is_plot=is_plot,
+    )
+
+
+def sweep_multi_qubit_coupling_strength_vs_flux_result(
+    qubit,
+    coupler_flux: list[float],
+    method: str = 'ES',
+    solver_mode: str = 'auto',
+    is_plot: bool = True,
+) -> CouplingResult:
+    """Return the preferred structured result for a representative coupling-strength sweep."""
+    resolved_solver_mode = _resolve_multi_qubit_coupling_sweep_solver_mode(
+        qubit,
+        method,
+        solver_mode,
+    )
+    if resolved_solver_mode == 'fast':
+        return _build_multi_qubit_coupling_strength_vs_flux_result_fast(
+            qubit,
+            coupler_flux,
+            method=method,
+            is_plot=is_plot,
+        )
+    return _build_multi_qubit_coupling_strength_vs_flux_result_generic(
+        qubit,
+        coupler_flux,
+        method=method,
+        is_plot=is_plot,
+    )

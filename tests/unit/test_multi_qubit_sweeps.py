@@ -124,6 +124,25 @@ class MultiQubitSweepWrapperTests(unittest.TestCase):
         np.testing.assert_allclose(qubit._flux, original_flux)
         self.assertEqual(qubit.change_para.call_count, 3)
 
+    def test_structured_coupling_sweep_helper_reuses_current_bias_when_requested(self):
+        qubit = mock.Mock()
+        qubit._flux = np.zeros((5, 5), dtype=float)
+        qubit.get_qq_ecouple.side_effect = [-0.25, 1.0]
+        original_flux = qubit._flux.copy()
+
+        result = sweep_multi_qubit_coupling_strength_vs_flux_result(
+            qubit,
+            [0.25, 0.0],
+            method='ES',
+            is_plot=False,
+        )
+
+        self.assertIsInstance(result, CouplingResult)
+        np.testing.assert_allclose(result.coupling_values, np.array([1.0, -0.25]))
+        np.testing.assert_allclose(qubit._flux, original_flux)
+        self.assertEqual(qubit.change_para.call_count, 2)
+        self.assertEqual(qubit.get_qq_ecouple.call_count, 2)
+
     def test_coupling_strength_sweep_helper_delegates_plotting_branch_to_plotting_module(self):
         qubit = mock.Mock()
         qubit._flux = np.zeros((5, 5), dtype=float)
@@ -163,6 +182,19 @@ class MultiQubitSweepWrapperTests(unittest.TestCase):
         plot_args = plot.call_args.args
         self.assertEqual(plot_args[0], [0.25, 0.35])
         self.assertIs(plot_args[1], result)
+
+    def test_structured_coupling_sweep_helper_rejects_unknown_solver_mode(self):
+        qubit = mock.Mock()
+        qubit._flux = np.zeros((5, 5), dtype=float)
+
+        with self.assertRaisesRegex(ValueError, 'solver_mode'):
+            sweep_multi_qubit_coupling_strength_vs_flux_result(
+                qubit,
+                [0.25, 0.35],
+                method='ES',
+                solver_mode='mystery',
+                is_plot=False,
+            )
 
 
 if __name__ == '__main__':

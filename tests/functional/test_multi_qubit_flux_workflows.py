@@ -80,6 +80,38 @@ class FGF1V1FluxWorkflowTests(unittest.TestCase):
         model.change_para = ParameterizedQubit.change_para.__get__(model, FGF1V1Coupling)
         return model
 
+    @staticmethod
+    def build_real_stubbed_model():
+        c_j = 9.8e-15
+        c_q1_total = 165e-15
+        c_q2_total = 165e-15
+        c_qc = 23.2e-15
+        c_q_ground = 5.2e-15
+        c_qq = 2.1e-15
+        c_coupler_total = 142e-15
+        c_11_ground = c_q1_total - c_qc - c_qq - c_q_ground
+        c_12_ground = c_q2_total - c_q_ground
+        capacitance_list = [
+            c_11_ground,
+            c_12_ground,
+            c_q_ground + c_j,
+            c_coupler_total - 2 * c_qc + 6 * c_j,
+            c_q_ground + c_j,
+            c_12_ground,
+            c_11_ground,
+            c_qq,
+            c_qc,
+            c_qc,
+        ]
+        return FGF1V1Coupling(
+            capacitance_list=capacitance_list,
+            junc_resis_list=[7400, 7400 / 6, 7400],
+            qrcouple=[18.34e-15, 0.02e-15],
+            flux_list=[0.11, 0.11, 0.11],
+            trunc_ener_level=[3, 2, 3],
+            is_print=False,
+        )
+
     def test_envs_flux_walks_coupler_biases_and_restores_original_flux(self):
         model = self.make_model()
         original_flux = model._flux.copy()
@@ -107,6 +139,67 @@ class FGF1V1FluxWorkflowTests(unittest.TestCase):
         self.assertEqual(model._generate_hamiltonian.call_count, 3)
         self.assertEqual(model._refresh_basic_metrics.call_count, 3)
         self.assertEqual(model.get_qq_ecouple.call_count, 2)
+
+    def test_coupling_strength_vs_coupler_flux_reuses_original_bias_metric(self):
+        model = self.make_model()
+        original_flux = model._flux.copy()
+        model.get_qq_ecouple = mock.Mock(side_effect=[-0.4, 1.2])
+
+        coupling = sweep_multi_qubit_coupling_strength_vs_flux(model, [0.25, 0.2], is_plot=False)
+
+        np.testing.assert_allclose(coupling.coupling_values, np.array([1.2, -0.4]))
+        np.testing.assert_allclose(model._flux, original_flux)
+        self.assertEqual(model._generate_hamiltonian.call_count, 2)
+        self.assertEqual(model._refresh_basic_metrics.call_count, 2)
+        self.assertEqual(model.get_qq_ecouple.call_count, 2)
+
+    def test_fast_es_coupling_sweep_matches_generic_path_for_real_fgf1v1_model(self):
+        flux_axis = [0.095, 0.11, 0.125, 0.14]
+
+        fast_model = self.build_real_stubbed_model()
+        original_fast_flux = np.array(fast_model._flux, copy=True)
+        fast_result = sweep_multi_qubit_coupling_strength_vs_flux(
+            fast_model,
+            flux_axis,
+            method='ES',
+            solver_mode='fast',
+            is_plot=False,
+        )
+
+        slow_model = self.build_real_stubbed_model()
+        slow_result = sweep_multi_qubit_coupling_strength_vs_flux(
+            slow_model,
+            flux_axis,
+            method='ES',
+            solver_mode='full',
+            is_plot=False,
+        )
+
+        np.testing.assert_allclose(
+            fast_result.coupling_values,
+            slow_result.coupling_values,
+            rtol=0.0,
+            atol=1e-12,
+        )
+        np.testing.assert_allclose(fast_model._flux, original_fast_flux)
+        np.testing.assert_allclose(slow_model._flux, original_fast_flux)
+        self.assertEqual(fast_result.metadata['path'], 'fgf1v1_low_spectrum_fast')
+        self.assertEqual(fast_result.metadata['solver_mode'], 'fast')
+        self.assertEqual(slow_result.metadata['path'], 'generic_full_spectrum')
+        self.assertEqual(slow_result.metadata['solver_mode'], 'full')
+
+    def test_auto_solver_mode_prefers_fast_path_for_supported_fgf1v1_es_sweep(self):
+        model = self.build_real_stubbed_model()
+
+        result = sweep_multi_qubit_coupling_strength_vs_flux(
+            model,
+            [0.095, 0.11],
+            method='ES',
+            solver_mode='auto',
+            is_plot=False,
+        )
+
+        self.assertEqual(result.metadata['solver_mode'], 'fast')
 
 
 if __name__ == '__main__':

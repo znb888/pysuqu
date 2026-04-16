@@ -1,5 +1,7 @@
 import unittest
 from unittest import mock
+from contextlib import redirect_stdout
+from io import StringIO
 
 import numpy as np
 
@@ -9,7 +11,10 @@ install_test_stubs()
 
 from pysuqu.qubit.base import QubitBase, pi
 from pysuqu.qubit.single import FloatingTransmon, GroundedTransmon
-from pysuqu.qubit.sweeps import sweep_single_qubit_energy_vs_flux_base
+from pysuqu.qubit.sweeps import (
+    sweep_single_qubit_energy_vs_flux_base,
+    sweep_single_qubit_energy_vs_flux_base_result,
+)
 
 
 class GroundedTransmonFluxWorkflowTests(unittest.TestCase):
@@ -37,6 +42,16 @@ class GroundedTransmonFluxWorkflowTests(unittest.TestCase):
 
 
 class FloatingTransmonFluxWorkflowTests(unittest.TestCase):
+    @staticmethod
+    def _construct_real_floating_transmon():
+        basic_element = [157e-15 - 3.8e-15, 157e-15 - 3.8e-15, 3.8e-15 + 9.8e-15, 8700]
+        with redirect_stdout(StringIO()):
+            return FloatingTransmon(
+                basic_element,
+                trunc_ener_level=20,
+                cal_mode='Eigen',
+            )
+
     def test_envs_flux_updates_matrix_flux_and_restores_scalar_flux(self):
         qubit = FloatingTransmon.__new__(FloatingTransmon)
         qubit._Nlevel = 7
@@ -70,3 +85,39 @@ class FloatingTransmonFluxWorkflowTests(unittest.TestCase):
         self.assertEqual(qubit.change_hamiltonian.call_count, 0)
         self.assertEqual(qubit._recalculate_hamiltonian.call_count, 3)
         np.testing.assert_allclose(qubit._flux, np.array([[0.0, 0.25], [0.25, 0.0]]))
+
+    def test_scalar_change_para_projects_floating_flux_without_integer_truncation(self):
+        qubit = self._construct_real_floating_transmon()
+        baseline_flux = np.array(qubit.get_element_matrices('flux'), copy=True)
+        baseline_level_1 = float(qubit.get_energylevel(1))
+        target_flux = 0.3
+
+        try:
+            qubit.change_para(flux=target_flux)
+
+            np.testing.assert_allclose(
+                qubit.get_element_matrices('flux'),
+                np.array([[0.0, target_flux], [target_flux, 0.0]]),
+            )
+            self.assertGreater(abs(float(qubit.get_energylevel(1)) - baseline_level_1), 1e-6)
+        finally:
+            qubit.change_para(flux=baseline_flux)
+
+    def test_structured_sweep_helper_tracks_real_floating_transmon_flux_spectrum(self):
+        qubit = self._construct_real_floating_transmon()
+        flux_origin = np.array(qubit.get_element_matrices('flux'), copy=True)
+        result = sweep_single_qubit_energy_vs_flux_base_result(
+            qubit,
+            [
+                np.array([[0.0, 0.2], [0.2, 0.0]]),
+                np.array([[0.0, 0.3], [0.3, 0.0]]),
+                np.array([[0.0, 0.4], [0.4, 0.0]]),
+            ],
+            upper_level=2,
+        )
+
+        self.assertEqual(result.sweep_parameter, 'flux_offset')
+        self.assertEqual(len(result.sweep_values), 3)
+        self.assertGreater(np.ptp(result.series['level_1']), 1e-6)
+        self.assertGreater(np.ptp(result.series['level_2']), 1e-6)
+        np.testing.assert_allclose(qubit.get_element_matrices('flux'), flux_origin)

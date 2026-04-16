@@ -40,7 +40,11 @@ def update_full_flux_from_reduced(
     retain_nodes: Sequence[int],
 ) -> np.ndarray:
     """Update a full flux matrix from a reduced one using the retained-node layout."""
-    full_flux = np.array(current_full, copy=True)
+    full_flux = np.array(
+        current_full,
+        dtype=np.result_type(current_full, reduced_flux, float),
+        copy=True,
+    )
 
     for ii, retain_node in enumerate(retain_nodes):
         if struct[ii] == 2:

@@ -7,6 +7,7 @@ Since 2023-12-05
 '''
 # import
 from collections import OrderedDict
+from dataclasses import dataclass
 from functools import lru_cache
 import numpy as np
 import matplotlib.pyplot as plt
@@ -29,8 +30,83 @@ from .single import GroundedTransmon, RLINE
 RNAN = 1e20
 _QCRFGR_PROBE_FREQUENCY_CACHE_MAXSIZE = 128
 _QCRFGR_PROBE_FREQUENCY_CACHE = OrderedDict()
+_FGF1V1_BASIC_METRIC_CACHE_MAXSIZE = 128
+_FGF1V1_BASIC_METRIC_CACHE = OrderedDict()
+_FGF1V1_METRIC_STATE_INDEX_CACHE_MAXSIZE = 128
+_FGF1V1_METRIC_STATE_INDEX_CACHE = OrderedDict()
+_FGF1V1_INSTANCE_BASIC_METRIC_CACHE_MAXSIZE = 16
 _QCRFGR_METRIC_STATE_LABELS = ((1, 0), (0, 1), (2, 0))
 _QCRFGR_COUPLER_OVERLAP_STATE_LABELS = ((1, 0), (0, 1))
+_FGF1V1_METRIC_STATE_LABELS = ((0, 0, 0), (0, 0, 1), (1, 0, 0), (0, 1, 0), (1, 0, 1), (0, 0, 2), (2, 0, 0))
+_FGF1V1_QC_OVERLAP_STATE_LABELS = ((0, 0, 1), (0, 1, 0), (1, 0, 0))
+_FGF1V1_QQ_OVERLAP_STATE_LABELS = ((0, 0, 1), (1, 0, 0))
+
+
+@dataclass(frozen=True)
+class FGF1V1BasicMetricBundle:
+    """Typed derived-metric payload reused across FGF1V1 replay cache layers."""
+
+    qubit1_f01: float
+    qubit2_f01: float
+    qubit_f01: float
+    coupler_f01: float
+    qubit1_anharm: float
+    qubit2_anharm: float
+    qubit_anharm: float
+    qr_g: float
+    qq_g: float
+    qc_g: float
+    qq_geff: float
+
+    @classmethod
+    def capture(cls, model) -> 'FGF1V1BasicMetricBundle':
+        """Capture the current FGF1V1 derived metrics from one live model instance."""
+        return cls(
+            qubit1_f01=float(model.qubit1_f01),
+            qubit2_f01=float(model.qubit2_f01),
+            qubit_f01=float(model.qubit_f01),
+            coupler_f01=float(model.coupler_f01),
+            qubit1_anharm=float(model.qubit1_anharm),
+            qubit2_anharm=float(model.qubit2_anharm),
+            qubit_anharm=float(model.qubit_anharm),
+            qr_g=float(model.qr_g),
+            qq_g=float(model.qq_g),
+            qc_g=float(model.qc_g),
+            qq_geff=float(model.qq_geff),
+        )
+
+    @classmethod
+    def from_mapping(cls, payload) -> 'FGF1V1BasicMetricBundle':
+        """Normalize either the typed bundle or the previous dict-shaped payload."""
+        if isinstance(payload, cls):
+            return payload
+        return cls(
+            qubit1_f01=float(payload['qubit1_f01']),
+            qubit2_f01=float(payload['qubit2_f01']),
+            qubit_f01=float(payload['qubit_f01']),
+            coupler_f01=float(payload['coupler_f01']),
+            qubit1_anharm=float(payload['qubit1_anharm']),
+            qubit2_anharm=float(payload['qubit2_anharm']),
+            qubit_anharm=float(payload['qubit_anharm']),
+            qr_g=float(payload['qr_g']),
+            qq_g=float(payload['qq_g']),
+            qc_g=float(payload['qc_g']),
+            qq_geff=float(payload['qq_geff']),
+        )
+
+    def restore_onto(self, model) -> None:
+        """Restore the cached FGF1V1 derived metrics onto one live model instance."""
+        model.qubit1_f01 = self.qubit1_f01
+        model.qubit2_f01 = self.qubit2_f01
+        model.qubit_f01 = self.qubit_f01
+        model.coupler_f01 = self.coupler_f01
+        model.qubit1_anharm = self.qubit1_anharm
+        model.qubit2_anharm = self.qubit2_anharm
+        model.qubit_anharm = self.qubit_anharm
+        model.qr_g = self.qr_g
+        model.qq_g = self.qq_g
+        model.qc_g = self.qc_g
+        model.qq_geff = self.qq_geff
 
 
 def _array_cache_key(values) -> tuple[float, ...]:
@@ -93,6 +169,19 @@ def _normalize_nlevel_cache_key(nlevel) -> tuple[int, ...]:
     return tuple(int(level) for level in np.asarray(nlevel).reshape(-1).tolist())
 
 
+def _build_tensor_basis_state_index(
+    state_label: tuple[int, ...],
+    nlevel_key: tuple[int, ...],
+) -> int:
+    """Return the tensor-basis linear index for one product-state label."""
+    state_index = 0
+    stride = 1
+    for level, dimension in zip(reversed(state_label), reversed(nlevel_key)):
+        state_index += int(level) * stride
+        stride *= int(dimension)
+    return state_index
+
+
 @lru_cache(maxsize=32)
 def _get_cached_qcrfgr_metric_state_sets(
     nlevel_key: tuple[int, ...],
@@ -117,6 +206,249 @@ def _get_cached_qcrfgr_metric_state_sets(
 def _clear_qcrfgr_metric_state_cache() -> None:
     """Clear the exact-input QCRFGR product-state cache used by repeated constructor metrics."""
     _get_cached_qcrfgr_metric_state_sets.cache_clear()
+
+
+@lru_cache(maxsize=32)
+def _get_cached_fgf1v1_metric_state_sets(
+    nlevel_key: tuple[int, ...],
+) -> tuple[tuple[object, ...], tuple[object, ...], tuple[object, ...]]:
+    """Build and cache the repeated FGF1V1 product-state sets used by sweep-side metrics."""
+    nlevel_list = list(nlevel_key)
+    metric_states = tuple(
+        cal_product_state_list(
+            _normalize_state_labels(_FGF1V1_METRIC_STATE_LABELS),
+            nlevel_list,
+        )
+    )
+    qc_overlap_states = tuple(
+        cal_product_state_list(
+            _normalize_state_labels(_FGF1V1_QC_OVERLAP_STATE_LABELS),
+            nlevel_list,
+        )
+    )
+    qq_overlap_states = tuple(
+        cal_product_state_list(
+            _normalize_state_labels(_FGF1V1_QQ_OVERLAP_STATE_LABELS),
+            nlevel_list,
+        )
+    )
+    return metric_states, qc_overlap_states, qq_overlap_states
+
+
+def _clear_fgf1v1_metric_state_cache() -> None:
+    """Clear the exact-input FGF1V1 product-state cache used by repeated metric refreshes."""
+    _get_cached_fgf1v1_metric_state_sets.cache_clear()
+
+
+@lru_cache(maxsize=32)
+def _get_cached_fgf1v1_overlap_basis_indices(
+    nlevel_key: tuple[int, ...],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Build the tensor-basis indices for the repeated FGF1V1 overlap states."""
+    qc_overlap_indices = tuple(
+        _build_tensor_basis_state_index(state_label, nlevel_key)
+        for state_label in _FGF1V1_QC_OVERLAP_STATE_LABELS
+    )
+    qq_overlap_indices = tuple(
+        _build_tensor_basis_state_index(state_label, nlevel_key)
+        for state_label in _FGF1V1_QQ_OVERLAP_STATE_LABELS
+    )
+    return qc_overlap_indices, qq_overlap_indices
+
+
+def _make_fgf1v1_basic_metric_cache_key(model) -> tuple[object, ...] | None:
+    """Build the exact-input FGF1V1 metric cache key for repeated identical replay refreshes."""
+    maxwellmat = getattr(model, 'Maxwellmat', None)
+    if maxwellmat is None or 'capac' not in maxwellmat or not hasattr(model, '_qrcouple_term'):
+        return None
+
+    qrcouple = tuple(float(value) for value in np.asarray(model._qrcouple_term, dtype=float).reshape(-1).tolist())
+    return (
+        model._get_exact_solve_template_cache_key(),
+        qrcouple,
+        float(maxwellmat['capac'][0, 0]),
+        float(maxwellmat['capac'][1, 1]),
+        float(model._capac[0, 1]),
+        float(model._capac[1, 0]),
+    )
+
+
+def _get_cached_fgf1v1_basic_metrics(
+    cache_key: tuple[object, ...] | None,
+) -> FGF1V1BasicMetricBundle | None:
+    """Return cached FGF1V1 derived metrics when the exact-input replay key has been seen before."""
+    if cache_key is None:
+        return None
+
+    cached_metrics = _FGF1V1_BASIC_METRIC_CACHE.get(cache_key)
+    if cached_metrics is not None:
+        _FGF1V1_BASIC_METRIC_CACHE.move_to_end(cache_key)
+        return FGF1V1BasicMetricBundle.from_mapping(cached_metrics)
+    return None
+
+
+def _store_cached_fgf1v1_basic_metrics(
+    cache_key: tuple[object, ...] | None,
+    metrics: FGF1V1BasicMetricBundle,
+) -> None:
+    """Store one FGF1V1 exact-input derived-metric bundle with a small LRU-style eviction policy."""
+    if cache_key is None:
+        return
+
+    _FGF1V1_BASIC_METRIC_CACHE[cache_key] = FGF1V1BasicMetricBundle.from_mapping(metrics)
+    _FGF1V1_BASIC_METRIC_CACHE.move_to_end(cache_key)
+    if len(_FGF1V1_BASIC_METRIC_CACHE) > _FGF1V1_BASIC_METRIC_CACHE_MAXSIZE:
+        _FGF1V1_BASIC_METRIC_CACHE.popitem(last=False)
+
+
+def _clear_fgf1v1_basic_metric_cache() -> None:
+    """Clear the FGF1V1 exact-input metric bundle cache used by repeated replay refreshes."""
+    _FGF1V1_BASIC_METRIC_CACHE.clear()
+
+
+def _get_cached_fgf1v1_metric_state_indices(
+    exact_solve_cache_key: tuple[object, ...] | None,
+) -> tuple[int, ...] | None:
+    """Return cached FGF1V1 metric-state indices for one exact solved eigensystem."""
+    if exact_solve_cache_key is None:
+        return None
+
+    cached_indices = _FGF1V1_METRIC_STATE_INDEX_CACHE.get(exact_solve_cache_key)
+    if cached_indices is not None:
+        _FGF1V1_METRIC_STATE_INDEX_CACHE.move_to_end(exact_solve_cache_key)
+    return cached_indices
+
+
+def _store_cached_fgf1v1_metric_state_indices(
+    exact_solve_cache_key: tuple[object, ...] | None,
+    state_indices,
+) -> None:
+    """Store one exact-input FGF1V1 metric-state index bundle with LRU-style eviction."""
+    if exact_solve_cache_key is None:
+        return
+
+    _FGF1V1_METRIC_STATE_INDEX_CACHE[exact_solve_cache_key] = tuple(
+        int(index) for index in state_indices
+    )
+    _FGF1V1_METRIC_STATE_INDEX_CACHE.move_to_end(exact_solve_cache_key)
+    if len(_FGF1V1_METRIC_STATE_INDEX_CACHE) > _FGF1V1_METRIC_STATE_INDEX_CACHE_MAXSIZE:
+        _FGF1V1_METRIC_STATE_INDEX_CACHE.popitem(last=False)
+
+
+def _clear_fgf1v1_metric_state_index_cache() -> None:
+    """Clear the exact-input FGF1V1 metric-state index cache."""
+    _FGF1V1_METRIC_STATE_INDEX_CACHE.clear()
+
+
+def _get_instance_fgf1v1_basic_metric_cache(model) -> OrderedDict:
+    """Return the per-instance FGF1V1 metric cache used by same-instance replay restores."""
+    cache = getattr(model, '_fgf1v1_instance_basic_metric_cache', None)
+    if cache is None:
+        cache = OrderedDict()
+        model._fgf1v1_instance_basic_metric_cache = cache
+    return cache
+
+
+def _get_cached_instance_fgf1v1_basic_metrics(
+    model,
+    exact_solve_cache_key: tuple[object, ...] | None,
+) -> FGF1V1BasicMetricBundle | None:
+    """Return one same-instance FGF1V1 metric bundle for the current exact replay key."""
+    if exact_solve_cache_key is None:
+        return None
+
+    cache = getattr(model, '_fgf1v1_instance_basic_metric_cache', None)
+    if cache is None:
+        return None
+
+    cached_metrics = cache.get(exact_solve_cache_key)
+    if cached_metrics is not None:
+        cache.move_to_end(exact_solve_cache_key)
+        return FGF1V1BasicMetricBundle.from_mapping(cached_metrics)
+    return None
+
+
+def _store_instance_fgf1v1_basic_metrics(
+    model,
+    exact_solve_cache_key: tuple[object, ...] | None,
+    metrics: FGF1V1BasicMetricBundle,
+) -> None:
+    """Store one per-instance FGF1V1 metric bundle keyed by the exact replay state."""
+    if exact_solve_cache_key is None:
+        return
+
+    cache = _get_instance_fgf1v1_basic_metric_cache(model)
+    cache[exact_solve_cache_key] = FGF1V1BasicMetricBundle.from_mapping(metrics)
+    cache.move_to_end(exact_solve_cache_key)
+    if len(cache) > _FGF1V1_INSTANCE_BASIC_METRIC_CACHE_MAXSIZE:
+        cache.popitem(last=False)
+
+
+def _capture_fgf1v1_basic_metrics(model) -> FGF1V1BasicMetricBundle:
+    """Capture the current FGF1V1 derived metric bundle for exact-input replay reuse."""
+    return FGF1V1BasicMetricBundle.capture(model)
+
+
+def _restore_fgf1v1_basic_metrics(model, metrics) -> None:
+    """Restore one cached FGF1V1 derived metric bundle onto the live model instance."""
+    FGF1V1BasicMetricBundle.from_mapping(metrics).restore_onto(model)
+
+
+def _build_fgf1v1_uncached_basic_metric_bundle(model) -> FGF1V1BasicMetricBundle:
+    """Compute one fresh FGF1V1 metric bundle without round-tripping through slower public helpers."""
+    nlevel_key = _normalize_nlevel_cache_key(model._Nlevel)
+    metric_states, _, _ = _get_cached_fgf1v1_metric_state_sets(nlevel_key)
+    qc_overlap_indices, qq_overlap_indices = _get_cached_fgf1v1_overlap_basis_indices(nlevel_key)
+    exact_solve_cache_key = getattr(model, '_exact_solve_template_cache_key', None)
+    state_index = _get_cached_fgf1v1_metric_state_indices(exact_solve_cache_key)
+    if state_index is None:
+        state_index = tuple(model.find_state_list(metric_states, state_space=model._eigenstates))
+        _store_cached_fgf1v1_metric_state_indices(exact_solve_cache_key, state_index)
+    relative_levels = model._energylevels - model._energylevels[0]
+
+    qubit1_f01 = float(relative_levels[state_index[1]] / 2 / pi)
+    qubit2_f01 = float(relative_levels[state_index[2]] / 2 / pi)
+    coupler_f01 = float(relative_levels[state_index[3]] / 2 / pi)
+    qubit1_anharm = float(relative_levels[state_index[5]] / 2 / pi - 2 * qubit1_f01)
+    qubit2_anharm = float(relative_levels[state_index[6]] / 2 / pi - 2 * qubit2_f01)
+
+    omega_qubit = qubit1_f01 * 1e9 * 2 * pi
+    readout_freq = 6.5e9
+    omega_res = readout_freq * 2 * pi
+    capacitance_matrix = model.Maxwellmat['capac']
+    c_q = e**2 / 2 / model.Ec[0, 0] / 1e9 / hbar
+    c_r = 1 / 8 / readout_freq / RLINE
+    c_qr1, c_qr2 = model._qrcouple_term
+    c_q1 = capacitance_matrix[0, 0] - model._capac[0, 1] - c_qr1
+    c_q2 = capacitance_matrix[1, 1] - model._capac[1, 0] - c_qr2
+    c_eff = abs(c_qr1 * c_q1 - c_qr2 * c_q2) / (c_q1 + c_q2)
+    qr_g = float(c_eff * np.sqrt(omega_res * omega_qubit / (c_r * c_q)) / 2)
+
+    hamiltonian = model._Hamiltonian
+    q1c_g = abs(hamiltonian[qc_overlap_indices[1], qc_overlap_indices[0]]) / 2 / pi
+    q2c_g = abs(hamiltonian[qc_overlap_indices[1], qc_overlap_indices[2]]) / 2 / pi
+    qc_g = float((q1c_g + q2c_g) / 2)
+    qq_g = float(abs(hamiltonian[qq_overlap_indices[1], qq_overlap_indices[0]]) / 2 / pi)
+
+    delta1 = qubit1_f01 - coupler_f01
+    delta2 = qubit2_f01 - coupler_f01
+    sum1 = qubit1_f01 + coupler_f01
+    sum2 = qubit2_f01 + coupler_f01
+    qq_geff = float(qc_g * qc_g * (1 / delta1 + 1 / delta2 - 1 / sum1 - 1 / sum2) / 2 + qq_g)
+
+    return FGF1V1BasicMetricBundle(
+        qubit1_f01=qubit1_f01,
+        qubit2_f01=qubit2_f01,
+        qubit_f01=float((qubit1_f01 + qubit2_f01) / 2),
+        coupler_f01=coupler_f01,
+        qubit1_anharm=qubit1_anharm,
+        qubit2_anharm=qubit2_anharm,
+        qubit_anharm=float((qubit1_anharm + qubit2_anharm) / 2),
+        qr_g=qr_g,
+        qq_g=qq_g,
+        qc_g=qc_g,
+        qq_geff=qq_geff,
+    )
 
 
 def _calculate_qcrfgr_overlap_coupling(model, overlap_states) -> float:
@@ -305,22 +637,24 @@ class FGF1V1Coupling(ParameterizedQubit):
         self.print_basic_info(is_print=is_print)
 
     def _refresh_basic_metrics(self):
-        stateNumList = [[0,0,0],[0,0,1],[1,0,0],[0,1,0],[1,0,1],[0,0,2],[2,0,0]]
-        standard_state = cal_product_state_list(stateNumList, self._Nlevel)
-        state_index = [self.find_state(state) for state in standard_state]
+        exact_solve_cache_key = getattr(self, '_exact_solve_template_cache_key', None)
+        if getattr(self, '_active_exact_solve_template', None) is not None:
+            cached_metrics = _get_cached_instance_fgf1v1_basic_metrics(self, exact_solve_cache_key)
+            if cached_metrics is not None:
+                _restore_fgf1v1_basic_metrics(self, cached_metrics)
+                return
 
-        self.qubit1_f01 = self.get_energylevel(state_index[1])/2/pi
-        self.qubit2_f01 = self.get_energylevel(state_index[2])/2/pi
-        self.qubit_f01 = (self.qubit1_f01+self.qubit2_f01)/2
-        self.coupler_f01 = self.get_energylevel(state_index[3])/2/pi
-        self.qubit1_anharm = self.get_energylevel(state_index[5])/2/pi-2*self.qubit1_f01
-        self.qubit2_anharm = self.get_energylevel(state_index[6])/2/pi-2*self.qubit2_f01
-        self.qubit_anharm = (self.qubit1_anharm+self.qubit2_anharm)/2
+        cache_key = _make_fgf1v1_basic_metric_cache_key(self)
+        cached_metrics = _get_cached_fgf1v1_basic_metrics(cache_key)
+        if cached_metrics is not None:
+            _restore_fgf1v1_basic_metrics(self, cached_metrics)
+            _store_instance_fgf1v1_basic_metrics(self, exact_solve_cache_key, cached_metrics)
+            return
 
-        self.qr_g = self.get_readout_couple(readout_freq=6.5e9, couple_mode='capac', is_print=False)
-        self.qq_g = self.get_qq_dcouple(is_print=False)
-        self.qc_g = self.get_qc_couple(is_print=False)
-        self.qq_geff = self.get_qq_ecouple(is_print=False)
+        metrics = _build_fgf1v1_uncached_basic_metric_bundle(self)
+        _restore_fgf1v1_basic_metrics(self, metrics)
+        _store_cached_fgf1v1_basic_metrics(cache_key, metrics)
+        _store_instance_fgf1v1_basic_metrics(self, exact_solve_cache_key, metrics)
 
     def change_hamiltonian(self, new_hamiltonian):
         updated = super().change_hamiltonian(new_hamiltonian)
@@ -387,8 +721,9 @@ class FGF1V1Coupling(ParameterizedQubit):
             eta = self._capac[1,1]/(self._capac[0,0]+self._capac[1,1])
             self.qc_g = np.sqrt(self.qubit1_f01*self.coupler_f01*Cqsum*Ccsum)/2/Cqc
         elif mode=='overlap':
-            statelist = [[0,0,1],[0,1,0],[1,0,0]]
-            standard_state = cal_product_state_list(statelist, self._Nlevel)
+            _, standard_state, _ = _get_cached_fgf1v1_metric_state_sets(
+                _normalize_nlevel_cache_key(self._Nlevel)
+            )
             hamil = self.get_hamiltonian()
             self.q1c_g = abs(standard_state[1].dag()*hamil*standard_state[0])/2/pi
             self.q2c_g = abs(standard_state[1].dag()*hamil*standard_state[2])/2/pi
@@ -419,8 +754,9 @@ class FGF1V1Coupling(ParameterizedQubit):
             # eta = Cqc1*Cqc2/Cqq/Ccsum+1
             self.qq_g = np.sqrt(self.qubit1_f01*self.qubit2_f01*Cq1sum*Cq2sum)/2/Cqq
         elif mode=='overlap':
-            statelist = [[0,0,1],[1,0,0]]
-            standard_state = cal_product_state_list(statelist, self._Nlevel)
+            _, _, standard_state = _get_cached_fgf1v1_metric_state_sets(
+                _normalize_nlevel_cache_key(self._Nlevel)
+            )
             hamil = self.get_hamiltonian()
             self.qq_g = abs(standard_state[1].dag()*hamil*standard_state[0])/2/pi
         else:

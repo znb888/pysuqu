@@ -7,13 +7,14 @@ from tests.support import install_test_stubs
 
 install_test_stubs()
 
-from qutip import basis, tensor
+from qutip import Qobj, basis, tensor
 
 from pysuqu.qubit import base as base_module
 from pysuqu.qubit import multi as multi_module
 from pysuqu.qubit.analysis import get_multi_qubit_frequency_at_coupler_flux
 from pysuqu.qubit.base import ParameterizedQubit, QubitBase
 from pysuqu.qubit.multi import FGF1V1Coupling, QCRFGRModel
+from pysuqu.qubit.sweeps import sweep_multi_qubit_coupling_strength_vs_flux_result
 from pysuqu.qubit.solver import HamiltonianEvo
 from pysuqu.qubit.types import SpectrumResult
 
@@ -213,6 +214,113 @@ class MultiQubitRuntimeBaselineTests(unittest.TestCase):
 
         self.assertEqual(cal_product_state_list.call_count, 2)
 
+    def test_fgf1v1_runtime_sweep_reuses_cached_metric_state_products(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_metric_state_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_metric_state_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+
+        with mock.patch.object(
+            multi_module,
+            'cal_product_state_list',
+            wraps=multi_module.cal_product_state_list,
+        ) as cal_product_state_list, mock.patch('builtins.print'):
+            model = self._construct_fgf1v1_model()
+            sweep_multi_qubit_coupling_strength_vs_flux_result(
+                model,
+                [0.095, 0.11, 0.125, 0.14],
+                method='ES',
+                is_plot=False,
+            )
+
+        self.assertEqual(cal_product_state_list.call_count, 3)
+
+    def test_fgf1v1_runtime_constructor_reuses_exact_metric_state_indices(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        multi_module._clear_fgf1v1_metric_state_index_cache()
+        HamiltonianEvo._clear_hamiltonian_eigensystem_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_metric_state_index_cache)
+        self.addCleanup(HamiltonianEvo._clear_hamiltonian_eigensystem_cache)
+
+        with mock.patch.object(
+            HamiltonianEvo,
+            'find_state_list',
+            autospec=True,
+            wraps=HamiltonianEvo.find_state_list,
+        ) as find_state_list, mock.patch('builtins.print'):
+            first = self._construct_fgf1v1_model()
+            first_metrics = {
+                'qubit1_f01': first.qubit1_f01,
+                'qubit2_f01': first.qubit2_f01,
+                'coupler_f01': first.coupler_f01,
+                'qr_g': first.qr_g,
+                'qq_g': first.qq_g,
+                'qc_g': first.qc_g,
+                'qq_geff': first.qq_geff,
+            }
+
+            self.assertEqual(find_state_list.call_count, 1)
+
+            QubitBase._clear_exact_solve_template_cache()
+            multi_module._clear_fgf1v1_basic_metric_cache()
+
+            second = self._construct_fgf1v1_model()
+
+        self.assertEqual(find_state_list.call_count, 1)
+        for metric_name, baseline_value in first_metrics.items():
+            self.assertAlmostEqual(getattr(second, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_constructor_reuses_cached_solver_eigensystem_after_exact_template_clear(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        multi_module._clear_fgf1v1_metric_state_index_cache()
+        HamiltonianEvo._clear_hamiltonian_eigensystem_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_metric_state_index_cache)
+        self.addCleanup(HamiltonianEvo._clear_hamiltonian_eigensystem_cache)
+
+        with mock.patch.object(
+            HamiltonianEvo,
+            '_solve_hamiltonian_eigensystem',
+            autospec=True,
+            wraps=HamiltonianEvo._solve_hamiltonian_eigensystem,
+        ) as solve_hamiltonian_eigensystem, mock.patch('builtins.print'):
+            first = self._construct_fgf1v1_model()
+            first_metrics = {
+                'qubit1_f01': first.qubit1_f01,
+                'qubit2_f01': first.qubit2_f01,
+                'coupler_f01': first.coupler_f01,
+                'qr_g': first.qr_g,
+                'qq_g': first.qq_g,
+                'qc_g': first.qc_g,
+                'qq_geff': first.qq_geff,
+            }
+
+            QubitBase._clear_exact_solve_template_cache()
+            multi_module._clear_fgf1v1_basic_metric_cache()
+            multi_module._clear_fgf1v1_metric_state_index_cache()
+
+            second = self._construct_fgf1v1_model()
+
+        self.assertEqual(solve_hamiltonian_eigensystem.call_count, 1)
+        for metric_name, baseline_value in first_metrics.items():
+            self.assertAlmostEqual(getattr(second, metric_name), baseline_value, places=12)
+        self.assertIsNot(first._eigenstates[0], second._eigenstates[0])
+        second._energylevels[0] = 123.0
+        self.assertNotEqual(first._energylevels[0], second._energylevels[0])
+
     @staticmethod
     def _probe_qcrfgr_frequency_reference(model, coupler_flux: float) -> float:
         original_flux = model.get_element_matrices('flux').copy()
@@ -336,6 +444,759 @@ class MultiQubitRuntimeBaselineTests(unittest.TestCase):
                 ]
             ),
         )
+
+    def test_fgf1v1_overlap_basis_indices_match_overlap_state_matrix_elements(self):
+        model = self._construct_fgf1v1_model()
+        nlevel_key = multi_module._normalize_nlevel_cache_key(model._Nlevel)
+        _, qc_overlap_states, qq_overlap_states = multi_module._get_cached_fgf1v1_metric_state_sets(
+            nlevel_key
+        )
+        qc_overlap_indices, qq_overlap_indices = multi_module._get_cached_fgf1v1_overlap_basis_indices(
+            nlevel_key
+        )
+        hamiltonian = model._Hamiltonian
+
+        self.assertAlmostEqual(
+            abs(hamiltonian[qc_overlap_indices[1], qc_overlap_indices[0]]) / 2 / np.pi,
+            abs(qc_overlap_states[1].dag() * hamiltonian * qc_overlap_states[0]) / 2 / np.pi,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            abs(hamiltonian[qc_overlap_indices[1], qc_overlap_indices[2]]) / 2 / np.pi,
+            abs(qc_overlap_states[1].dag() * hamiltonian * qc_overlap_states[2]) / 2 / np.pi,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            abs(hamiltonian[qq_overlap_indices[1], qq_overlap_indices[0]]) / 2 / np.pi,
+            abs(qq_overlap_states[1].dag() * hamiltonian * qq_overlap_states[0]) / 2 / np.pi,
+            places=12,
+        )
+
+    def test_fgf1v1_runtime_sweep_restores_derived_metrics_after_flux_round_trip(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+
+        model = self._construct_fgf1v1_model()
+        original_flux = model.get_element_matrices('flux').copy()
+        baseline_metrics = {
+            'qubit1_f01': model.qubit1_f01,
+            'qubit2_f01': model.qubit2_f01,
+            'coupler_f01': model.coupler_f01,
+            'qr_g': model.qr_g,
+            'qq_g': model.qq_g,
+            'qc_g': model.qc_g,
+            'qq_geff': model.qq_geff,
+        }
+
+        sweep_result = sweep_multi_qubit_coupling_strength_vs_flux_result(
+            model,
+            [0.095, 0.11, 0.125, 0.14],
+            method='ES',
+            is_plot=False,
+        )
+
+        self.assertEqual(len(sweep_result.coupling_values), 4)
+        self.assertGreater(np.max(np.abs(np.diff(sweep_result.coupling_values))), 0.0)
+        np.testing.assert_allclose(model.get_element_matrices('flux'), original_flux)
+        for metric_name, baseline_value in baseline_metrics.items():
+            self.assertAlmostEqual(getattr(model, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_cold_flux_change_builds_scaled_phase_views_once(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        QubitBase._build_cached_truncated_operator_views.cache_clear()
+        QubitBase._build_cached_scaled_phase_terms.cache_clear()
+        QubitBase._build_cached_scaled_phase_power_terms.cache_clear()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+        self.addCleanup(QubitBase._build_cached_truncated_operator_views.cache_clear)
+        self.addCleanup(QubitBase._build_cached_scaled_phase_terms.cache_clear)
+        self.addCleanup(QubitBase._build_cached_scaled_phase_power_terms.cache_clear)
+
+        model = self._construct_fgf1v1_model()
+        replay_flux = model.get_element_matrices('flux').copy()
+        replay_flux[2, 2] = 0.095
+
+        with mock.patch.object(
+            QubitBase,
+            '_build_cached_scaled_phase_terms',
+            wraps=QubitBase._build_cached_scaled_phase_terms,
+        ) as scaled_phase_terms:
+            model.change_para(flux=replay_flux)
+
+        self.assertEqual(scaled_phase_terms.call_count, 1)
+        np.testing.assert_allclose(model.get_element_matrices('flux'), replay_flux)
+
+    def test_fgf1v1_runtime_diagonal_hamiltonian_terms_cache_reuses_exact_inputs_across_cold_rebuilds(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        QubitBase._build_cached_charge_only_hamiltonian_terms.cache_clear()
+        QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_clear()
+        QubitBase._build_cached_diagonal_hamiltonian_terms.cache_clear()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+        self.addCleanup(QubitBase._build_cached_charge_only_hamiltonian_terms.cache_clear)
+        self.addCleanup(QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_clear)
+        self.addCleanup(QubitBase._build_cached_diagonal_hamiltonian_terms.cache_clear)
+
+        first = self._construct_fgf1v1_model()
+        replay_flux = first.get_element_matrices('flux').copy()
+        replay_flux[2, 2] = 0.095
+        first.change_para(flux=replay_flux)
+        replay_metrics = {
+            'qubit1_f01': first.qubit1_f01,
+            'qubit2_f01': first.qubit2_f01,
+            'coupler_f01': first.coupler_f01,
+            'qr_g': first.qr_g,
+            'qq_g': first.qq_g,
+            'qc_g': first.qc_g,
+            'qq_geff': first.qq_geff,
+        }
+
+        QubitBase._clear_exact_solve_template_cache()
+        QubitBase._build_cached_charge_only_hamiltonian_terms.cache_clear()
+
+        second = self._construct_fgf1v1_model()
+        second.change_para(flux=replay_flux)
+
+        cache_info = QubitBase._build_cached_diagonal_hamiltonian_terms.cache_info()
+        self.assertEqual(cache_info.misses, 2)
+        self.assertEqual(cache_info.hits, 2)
+        np.testing.assert_allclose(second.get_element_matrices('flux'), replay_flux)
+        for metric_name, baseline_value in replay_metrics.items():
+            self.assertAlmostEqual(getattr(second, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_pair_charge_bundle_cache_reuses_exact_inputs_across_cold_rebuilds(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        QubitBase._build_cached_charge_only_hamiltonian_terms.cache_clear()
+        QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_clear()
+        QubitBase._build_cached_pair_number_bundle.cache_clear()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+        self.addCleanup(QubitBase._build_cached_charge_only_hamiltonian_terms.cache_clear)
+        self.addCleanup(QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_clear)
+        self.addCleanup(QubitBase._build_cached_pair_number_bundle.cache_clear)
+
+        first = self._construct_fgf1v1_model()
+        replay_flux = first.get_element_matrices('flux').copy()
+        replay_flux[2, 2] = 0.095
+        first.change_para(flux=replay_flux)
+        replay_metrics = {
+            'qubit1_f01': first.qubit1_f01,
+            'qubit2_f01': first.qubit2_f01,
+            'coupler_f01': first.coupler_f01,
+            'qr_g': first.qr_g,
+            'qq_g': first.qq_g,
+            'qc_g': first.qc_g,
+            'qq_geff': first.qq_geff,
+        }
+
+        QubitBase._clear_exact_solve_template_cache()
+        QubitBase._build_cached_charge_only_hamiltonian_terms.cache_clear()
+
+        second = self._construct_fgf1v1_model()
+        second.change_para(flux=replay_flux)
+
+        cache_info = QubitBase._build_cached_pair_number_bundle.cache_info()
+        self.assertEqual(cache_info.misses, 2)
+        self.assertEqual(cache_info.hits, 2)
+        np.testing.assert_allclose(second.get_element_matrices('flux'), replay_flux)
+        for metric_name, baseline_value in replay_metrics.items():
+            self.assertAlmostEqual(getattr(second, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_charge_only_hamiltonian_bundle_cache_reuses_exact_inputs_across_cold_rebuilds(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        QubitBase._build_cached_charge_only_hamiltonian_terms.cache_clear()
+        QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_clear()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+        self.addCleanup(QubitBase._build_cached_charge_only_hamiltonian_terms.cache_clear)
+        self.addCleanup(QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_clear)
+
+        first = self._construct_fgf1v1_model()
+        replay_flux = first.get_element_matrices('flux').copy()
+        replay_flux[2, 2] = 0.095
+        first.change_para(flux=replay_flux)
+        replay_metrics = {
+            'qubit1_f01': first.qubit1_f01,
+            'qubit2_f01': first.qubit2_f01,
+            'coupler_f01': first.coupler_f01,
+            'qr_g': first.qr_g,
+            'qq_g': first.qq_g,
+            'qc_g': first.qc_g,
+            'qq_geff': first.qq_geff,
+        }
+
+        QubitBase._clear_exact_solve_template_cache()
+
+        second = self._construct_fgf1v1_model()
+        second.change_para(flux=replay_flux)
+
+        cache_info = QubitBase._build_cached_charge_only_hamiltonian_terms.cache_info()
+        self.assertEqual(cache_info.misses, 2)
+        self.assertEqual(cache_info.hits, 4)
+        np.testing.assert_allclose(second.get_element_matrices('flux'), replay_flux)
+        for metric_name, baseline_value in replay_metrics.items():
+            self.assertAlmostEqual(getattr(second, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_truncated_charge_only_hamiltonian_cache_reuses_exact_inputs_across_cold_rebuilds(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_clear()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+        self.addCleanup(QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_clear)
+
+        first = self._construct_fgf1v1_model()
+        replay_flux = first.get_element_matrices('flux').copy()
+        replay_flux[2, 2] = 0.095
+        first.change_para(flux=replay_flux)
+        replay_metrics = {
+            'qubit1_f01': first.qubit1_f01,
+            'qubit2_f01': first.qubit2_f01,
+            'coupler_f01': first.coupler_f01,
+            'qr_g': first.qr_g,
+            'qq_g': first.qq_g,
+            'qc_g': first.qc_g,
+            'qq_geff': first.qq_geff,
+        }
+
+        QubitBase._clear_exact_solve_template_cache()
+
+        second = self._construct_fgf1v1_model()
+        second.change_para(flux=replay_flux)
+
+        cache_info = QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_info()
+        self.assertEqual(cache_info.misses, 2)
+        self.assertEqual(cache_info.hits, 2)
+        np.testing.assert_allclose(second.get_element_matrices('flux'), replay_flux)
+        for metric_name, baseline_value in replay_metrics.items():
+            self.assertAlmostEqual(getattr(second, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_warmed_charge_only_hamiltonian_bundle_avoids_live_qobj_add(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        QubitBase._build_cached_charge_only_hamiltonian_terms.cache_clear()
+        QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_clear()
+        QubitBase._build_cached_pair_number_bundle.cache_clear()
+        QubitBase._build_cached_pair_number_contribution.cache_clear()
+        QubitBase._build_cached_pair_number_term.cache_clear()
+        QubitBase._build_cached_pair_operator_products.cache_clear()
+        QubitBase._build_cached_diagonal_hamiltonian_terms.cache_clear()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+        self.addCleanup(QubitBase._build_cached_charge_only_hamiltonian_terms.cache_clear)
+        self.addCleanup(QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_clear)
+        self.addCleanup(QubitBase._build_cached_pair_number_bundle.cache_clear)
+        self.addCleanup(QubitBase._build_cached_pair_number_contribution.cache_clear)
+        self.addCleanup(QubitBase._build_cached_pair_number_term.cache_clear)
+        self.addCleanup(QubitBase._build_cached_pair_operator_products.cache_clear)
+        self.addCleanup(QubitBase._build_cached_diagonal_hamiltonian_terms.cache_clear)
+
+        seeded_model = self._construct_fgf1v1_model()
+        replay_flux = seeded_model.get_element_matrices('flux').copy()
+        replay_flux[2, 2] = 0.095
+        seeded_model.change_para(flux=replay_flux)
+        replay_metrics = {
+            'qubit1_f01': seeded_model.qubit1_f01,
+            'qubit2_f01': seeded_model.qubit2_f01,
+            'coupler_f01': seeded_model.coupler_f01,
+            'qr_g': seeded_model.qr_g,
+            'qq_g': seeded_model.qq_g,
+            'qc_g': seeded_model.qc_g,
+            'qq_geff': seeded_model.qq_geff,
+        }
+
+        QubitBase._clear_exact_solve_template_cache()
+
+        model = self._construct_fgf1v1_model()
+        with mock.patch.object(Qobj, '__add__', autospec=True, wraps=Qobj.__add__) as qobj_add:
+            model.change_para(flux=replay_flux)
+
+        self.assertEqual(qobj_add.call_count, 0)
+        np.testing.assert_allclose(model.get_element_matrices('flux'), replay_flux)
+        for metric_name, baseline_value in replay_metrics.items():
+            self.assertAlmostEqual(getattr(model, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_warmed_truncated_charge_only_hamiltonian_cache_avoids_live_truncation(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_clear()
+        QubitBase._build_cached_truncated_operator_views.cache_clear()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+        self.addCleanup(QubitBase._build_cached_truncated_charge_only_hamiltonian.cache_clear)
+        self.addCleanup(QubitBase._build_cached_truncated_operator_views.cache_clear)
+
+        seeded_model = self._construct_fgf1v1_model()
+        replay_flux = seeded_model.get_element_matrices('flux').copy()
+        replay_flux[2, 2] = 0.095
+        seeded_model.change_para(flux=replay_flux)
+        replay_metrics = {
+            'qubit1_f01': seeded_model.qubit1_f01,
+            'qubit2_f01': seeded_model.qubit2_f01,
+            'coupler_f01': seeded_model.coupler_f01,
+            'qr_g': seeded_model.qr_g,
+            'qq_g': seeded_model.qq_g,
+            'qc_g': seeded_model.qc_g,
+            'qq_geff': seeded_model.qq_geff,
+        }
+
+        QubitBase._clear_exact_solve_template_cache()
+
+        model = self._construct_fgf1v1_model()
+        with mock.patch.object(base_module, 'truncate_hilbert_space', wraps=base_module.truncate_hilbert_space) as truncate:
+            model.change_para(flux=replay_flux)
+
+        self.assertEqual(truncate.call_count, 0)
+        np.testing.assert_allclose(model.get_element_matrices('flux'), replay_flux)
+        for metric_name, baseline_value in replay_metrics.items():
+            self.assertAlmostEqual(getattr(model, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_cold_metric_refresh_avoids_public_helper_roundtrips(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+
+        reference_model = self._construct_fgf1v1_model()
+        replay_flux = reference_model.get_element_matrices('flux').copy()
+        replay_flux[2, 2] = 0.095
+        reference_model.change_para(flux=replay_flux)
+        replay_metrics = {
+            'qubit1_f01': reference_model.qubit1_f01,
+            'qubit2_f01': reference_model.qubit2_f01,
+            'coupler_f01': reference_model.coupler_f01,
+            'qr_g': reference_model.qr_g,
+            'qq_g': reference_model.qq_g,
+            'qc_g': reference_model.qc_g,
+            'qq_geff': reference_model.qq_geff,
+        }
+
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+
+        model = self._construct_fgf1v1_model()
+        with mock.patch.object(
+            model,
+            'find_state',
+            side_effect=AssertionError('cold metric refresh should batch lookup without per-state find_state calls'),
+        ), mock.patch.object(
+            model,
+            'get_readout_couple',
+            side_effect=AssertionError('cold metric refresh should skip public readout helper round-trips'),
+        ), mock.patch.object(
+            model,
+            'get_qq_dcouple',
+            side_effect=AssertionError('cold metric refresh should skip public qq helper round-trips'),
+        ), mock.patch.object(
+            model,
+            'get_qc_couple',
+            side_effect=AssertionError('cold metric refresh should skip public qc helper round-trips'),
+        ), mock.patch.object(
+            model,
+            'get_qq_ecouple',
+            side_effect=AssertionError('cold metric refresh should skip public qq-eff helper round-trips'),
+        ):
+            model.change_para(flux=replay_flux)
+
+        np.testing.assert_allclose(model.get_element_matrices('flux'), replay_flux)
+        for metric_name, baseline_value in replay_metrics.items():
+            self.assertAlmostEqual(getattr(model, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_exact_input_replay_reuses_cached_metric_bundle(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+
+        model = self._construct_fgf1v1_model()
+        replay_flux = model.get_element_matrices('flux').copy()
+        replay_flux[2, 2] = 0.095
+
+        model.change_para(flux=replay_flux)
+        baseline_metrics = {
+            'qubit1_f01': model.qubit1_f01,
+            'qubit2_f01': model.qubit2_f01,
+            'coupler_f01': model.coupler_f01,
+            'qr_g': model.qr_g,
+            'qq_g': model.qq_g,
+            'qc_g': model.qc_g,
+            'qq_geff': model.qq_geff,
+        }
+
+        with mock.patch.object(
+            model,
+            '_generate_hamiltonian',
+            side_effect=AssertionError('exact-input replay should reuse the cached solve template'),
+        ), mock.patch.object(
+            model,
+            'find_state',
+            side_effect=AssertionError('cached metric replay should skip state lookup'),
+        ), mock.patch.object(
+            model,
+            'get_readout_couple',
+            side_effect=AssertionError('cached metric replay should skip readout recomputation'),
+        ), mock.patch.object(
+            model,
+            'get_qq_dcouple',
+            side_effect=AssertionError('cached metric replay should skip direct-coupling recomputation'),
+        ), mock.patch.object(
+            model,
+            'get_qc_couple',
+            side_effect=AssertionError('cached metric replay should skip qc overlap recomputation'),
+        ), mock.patch.object(
+            model,
+            'get_qq_ecouple',
+            side_effect=AssertionError('cached metric replay should skip effective-coupling recomputation'),
+        ):
+            model.change_para(flux=replay_flux)
+
+        np.testing.assert_allclose(model.get_element_matrices('flux'), replay_flux)
+        for metric_name, baseline_value in baseline_metrics.items():
+            self.assertAlmostEqual(getattr(model, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_metric_bundle_caches_store_typed_payloads(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+
+        model = self._construct_fgf1v1_model()
+        replay_flux = model.get_element_matrices('flux').copy()
+        replay_flux[2, 2] = 0.095
+
+        model.change_para(flux=replay_flux)
+
+        process_cache_key = multi_module._make_fgf1v1_basic_metric_cache_key(model)
+        self.assertIsNotNone(process_cache_key)
+        process_payload = multi_module._FGF1V1_BASIC_METRIC_CACHE[process_cache_key]
+        self.assertIsInstance(process_payload, multi_module.FGF1V1BasicMetricBundle)
+        self.assertIs(
+            multi_module._get_cached_fgf1v1_basic_metrics(process_cache_key),
+            process_payload,
+        )
+
+        exact_solve_cache_key = getattr(model, '_exact_solve_template_cache_key', None)
+        self.assertIsNotNone(exact_solve_cache_key)
+        instance_cache = getattr(model, '_fgf1v1_instance_basic_metric_cache', None)
+        self.assertIsNotNone(instance_cache)
+        instance_payload = instance_cache[exact_solve_cache_key]
+        self.assertIsInstance(instance_payload, multi_module.FGF1V1BasicMetricBundle)
+        self.assertIs(
+            multi_module._get_cached_instance_fgf1v1_basic_metrics(model, exact_solve_cache_key),
+            instance_payload,
+        )
+        self.assertEqual(instance_payload, process_payload)
+
+    def test_fgf1v1_runtime_same_instance_revisit_uses_owned_exact_template_cache(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+
+        model = self._construct_fgf1v1_model()
+        original_flux = model.get_element_matrices('flux').copy()
+        original_metrics = {
+            'qubit1_f01': model.qubit1_f01,
+            'qubit2_f01': model.qubit2_f01,
+            'coupler_f01': model.coupler_f01,
+            'qr_g': model.qr_g,
+            'qq_g': model.qq_g,
+            'qc_g': model.qc_g,
+            'qq_geff': model.qq_geff,
+        }
+        replay_flux = original_flux.copy()
+        replay_flux[2, 2] = 0.095
+
+        model.change_para(flux=replay_flux)
+
+        with mock.patch.object(
+            QubitBase,
+            '_get_cached_exact_solve_template',
+            side_effect=AssertionError('same-instance baseline revisit should bypass the process cache'),
+        ), mock.patch.object(
+            QubitBase,
+            '_restore_exact_solve_template',
+            side_effect=AssertionError('same-instance baseline revisit should reuse the owned template'),
+        ):
+            model.change_para(flux=original_flux)
+
+        np.testing.assert_allclose(model.get_element_matrices('flux'), original_flux)
+        for metric_name, baseline_value in original_metrics.items():
+            self.assertAlmostEqual(getattr(model, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_process_replay_restore_materializes_auxiliary_state_on_demand(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+
+        seeded_model = self._construct_fgf1v1_model()
+        replay_flux = seeded_model.get_element_matrices('flux').copy()
+        replay_flux[2, 2] = 0.095
+        seeded_model.change_para(flux=replay_flux)
+        seeded_destroyor = seeded_model.destroyors[0]
+
+        model = self._construct_fgf1v1_model()
+        model.change_para(flux=replay_flux)
+        replay_metrics = {
+            'qubit1_f01': model.qubit1_f01,
+            'qubit2_f01': model.qubit2_f01,
+            'coupler_f01': model.coupler_f01,
+            'qr_g': model.qr_g,
+            'qq_g': model.qq_g,
+            'qc_g': model.qc_g,
+            'qq_geff': model.qq_geff,
+        }
+
+        self.assertIsNone(model._Hamiltonian)
+        self.assertIsNotNone(model._pending_exact_core_template)
+        self.assertIsNone(model._solver_result)
+        self.assertIsNotNone(model._pending_exact_auxiliary_template)
+
+        replay_levels = np.array(model.get_energylevel(), copy=True)
+
+        self.assertGreaterEqual(len(replay_levels), 2)
+        self.assertIsNotNone(model._Hamiltonian)
+        self.assertIsNone(model._pending_exact_core_template)
+        self.assertIsNone(model._solver_result)
+        self.assertIsNotNone(model._pending_exact_auxiliary_template)
+        self.assertIsNot(model._Hamiltonian, seeded_model._Hamiltonian)
+        self.assertIsNot(model._eigenstates[0], seeded_model._eigenstates[0])
+
+        solver_result = model.solver_result
+
+        self.assertIsInstance(solver_result, SpectrumResult)
+        self.assertIsNone(model._pending_exact_auxiliary_template)
+        self.assertIsNotNone(model.destroyors)
+        self.assertIsNot(model.destroyors[0], seeded_destroyor)
+        np.testing.assert_allclose(model.get_element_matrices('flux'), replay_flux)
+        for metric_name, baseline_value in replay_metrics.items():
+            self.assertAlmostEqual(getattr(model, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_same_instance_revisit_reuses_exact_key_prefix(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+
+        model = self._construct_fgf1v1_model()
+        original_flux = model.get_element_matrices('flux').copy()
+        original_metrics = {
+            'qubit1_f01': model.qubit1_f01,
+            'qubit2_f01': model.qubit2_f01,
+            'coupler_f01': model.coupler_f01,
+            'qr_g': model.qr_g,
+            'qq_g': model.qq_g,
+            'qc_g': model.qc_g,
+            'qq_geff': model.qq_geff,
+        }
+        replay_flux = original_flux.copy()
+        replay_flux[2, 2] = 0.095
+
+        model.change_para(flux=replay_flux)
+
+        observed_labels = []
+        original_get_array_cache_key = QubitBase._get_array_cache_key
+
+        def wrapped(values, *, as_int=False):
+            if values is model.Ej:
+                observed_labels.append('Ej')
+            elif values is model.Ec:
+                observed_labels.append('Ec')
+            elif values is model.El:
+                observed_labels.append('El')
+            elif values is model._charges:
+                observed_labels.append('charges')
+            elif values is model._Nlevel:
+                observed_labels.append('Nlevel')
+            else:
+                observed_labels.append('other')
+            return original_get_array_cache_key(values, as_int=as_int)
+
+        with mock.patch.object(QubitBase, '_get_array_cache_key', new=staticmethod(wrapped)):
+            model.change_para(flux=original_flux)
+
+        self.assertEqual(observed_labels, ['Ej'])
+        np.testing.assert_allclose(model.get_element_matrices('flux'), original_flux)
+        for metric_name, baseline_value in original_metrics.items():
+            self.assertAlmostEqual(getattr(model, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_same_instance_revisit_reuses_flux_only_replay_preparation(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+
+        model = self._construct_fgf1v1_model()
+        original_flux = model.get_element_matrices('flux').copy()
+        replay_flux = original_flux.copy()
+        replay_flux[2, 2] = 0.095
+
+        model.change_para(flux=replay_flux)
+        replay_metrics = {
+            'qubit1_f01': model.qubit1_f01,
+            'qubit2_f01': model.qubit2_f01,
+            'coupler_f01': model.coupler_f01,
+            'qr_g': model.qr_g,
+            'qq_g': model.qq_g,
+            'qc_g': model.qc_g,
+            'qq_geff': model.qq_geff,
+        }
+        model.change_para(flux=original_flux)
+
+        with mock.patch.object(
+            base_module,
+            'project_transformed_flux',
+            side_effect=AssertionError('same-instance revisit should reuse cached transformed flux'),
+        ), mock.patch.object(
+            model,
+            '_Ejphi',
+            side_effect=AssertionError('same-instance revisit should reuse cached Ej preparation'),
+        ):
+            model.change_para(flux=replay_flux)
+
+        np.testing.assert_allclose(model.get_element_matrices('flux'), replay_flux)
+        for metric_name, baseline_value in replay_metrics.items():
+            self.assertAlmostEqual(getattr(model, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_same_instance_revisit_reuses_instance_metric_bundle_cache(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+
+        model = self._construct_fgf1v1_model()
+        original_flux = model.get_element_matrices('flux').copy()
+        replay_flux = original_flux.copy()
+        replay_flux[2, 2] = 0.095
+
+        model.change_para(flux=replay_flux)
+        replay_metrics = {
+            'qubit1_f01': model.qubit1_f01,
+            'qubit2_f01': model.qubit2_f01,
+            'coupler_f01': model.coupler_f01,
+            'qr_g': model.qr_g,
+            'qq_g': model.qq_g,
+            'qc_g': model.qc_g,
+            'qq_geff': model.qq_geff,
+        }
+        model.change_para(flux=original_flux)
+
+        with mock.patch.object(
+            multi_module,
+            '_make_fgf1v1_basic_metric_cache_key',
+            side_effect=AssertionError('same-instance revisit should reuse the direct metric bundle cache'),
+        ):
+            model.change_para(flux=replay_flux)
+
+        np.testing.assert_allclose(model.get_element_matrices('flux'), replay_flux)
+        for metric_name, baseline_value in replay_metrics.items():
+            self.assertAlmostEqual(getattr(model, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_same_instance_revisit_reuses_prepared_exact_template(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+
+        model = self._construct_fgf1v1_model()
+        original_flux = model.get_element_matrices('flux').copy()
+        replay_flux = original_flux.copy()
+        replay_flux[2, 2] = 0.095
+
+        model.change_para(flux=replay_flux)
+        replay_metrics = {
+            'qubit1_f01': model.qubit1_f01,
+            'qubit2_f01': model.qubit2_f01,
+            'coupler_f01': model.coupler_f01,
+            'qr_g': model.qr_g,
+            'qq_g': model.qq_g,
+            'qc_g': model.qc_g,
+            'qq_geff': model.qq_geff,
+        }
+        model.change_para(flux=original_flux)
+
+        with mock.patch.object(
+            QubitBase,
+            '_get_exact_solve_template_cache_key',
+            side_effect=AssertionError('same-instance revisit should reuse the prepared exact replay key'),
+        ), mock.patch.object(
+            QubitBase,
+            '_get_instance_exact_solve_template',
+            side_effect=AssertionError('same-instance revisit should reuse the prepared exact template directly'),
+        ):
+            model.change_para(flux=replay_flux)
+
+        np.testing.assert_allclose(model.get_element_matrices('flux'), replay_flux)
+        for metric_name, baseline_value in replay_metrics.items():
+            self.assertAlmostEqual(getattr(model, metric_name), baseline_value, places=12)
+
+    def test_fgf1v1_runtime_warmed_constructor_reuse_preserves_public_sweep_trace(self):
+        QubitBase._clear_exact_solve_template_cache()
+        ParameterizedQubit._clear_ematrix_template_cache()
+        multi_module._clear_fgf1v1_basic_metric_cache()
+        self.addCleanup(QubitBase._clear_exact_solve_template_cache)
+        self.addCleanup(ParameterizedQubit._clear_ematrix_template_cache)
+        self.addCleanup(multi_module._clear_fgf1v1_basic_metric_cache)
+
+        cold_model = self._construct_fgf1v1_model()
+        expected = sweep_multi_qubit_coupling_strength_vs_flux_result(
+            cold_model,
+            [0.095, 0.11, 0.125, 0.14],
+            method='ES',
+            is_plot=False,
+        )
+
+        warmed_model = self._construct_fgf1v1_model()
+        observed = sweep_multi_qubit_coupling_strength_vs_flux_result(
+            warmed_model,
+            [0.095, 0.11, 0.125, 0.14],
+            method='ES',
+            is_plot=False,
+        )
+
+        np.testing.assert_allclose(observed.coupling_values, expected.coupling_values)
 
 
 if __name__ == '__main__':
