@@ -1,5 +1,6 @@
 import unittest
 from unittest import mock
+from pathlib import Path
 
 import numpy as np
 
@@ -15,7 +16,10 @@ from pysuqu.qubit.types import CouplingResult, SweepResult
 class MultiQubitPlottingTests(unittest.TestCase):
     def test_plotting_module_is_canonical_owner_boundary(self):
         self.assertEqual(plotting_module.__name__, 'pysuqu.qubit.plotting')
-        self.assertTrue(plotting_module.__file__.endswith('pysuqu\\qubit\\plotting.py'))
+        self.assertEqual(
+            Path(plotting_module.__file__).as_posix().split('/')[-3:],
+            ['pysuqu', 'qubit', 'plotting.py'],
+        )
         self.assertEqual(plot_multi_qubit_energy_vs_flux.__module__, 'pysuqu.qubit.plotting')
         self.assertEqual(
             plotting_module.plot_multi_qubit_coupling_strength_vs_flux.__module__,
