@@ -28,6 +28,7 @@ setup(
         "plotly>=5.0.0",
         "qutip>=4.7.0",
         "scipy>=1.7.0",
+        "tqdm>=4.0.0",
     ],
     project_urls={
         "Source": "https://github.com/znb888/pysuqu",

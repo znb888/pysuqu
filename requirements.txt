@@ -6,4 +6,5 @@ scipy>=1.7.0
 qutip>=4.7.0
 matplotlib>=3.4.0
 plotly>=5.0.0
+tqdm>=4.0.0
 
