@@ -51,6 +51,15 @@ from pysuqu.decoherence import (
 )
 ```
 
+## Experimental / Compatibility Boundary
+
+- Prefer the stable package exports under `pysuqu.qubit` for normal work.
+- Exploratory placeholder surfaces live under `pysuqu.qubit.experimental`.
+- Retained legacy placeholders now raise `QubitFeatureBoundaryError` so the
+  boundary fails explicitly instead of looking like a partial implementation.
+- Standard single-qubit, multi-qubit, and decoherence workflows should not
+  need anything from the experimental module.
+
 ## Minimal Example
 
 ```python

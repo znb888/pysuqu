@@ -1,60 +1,65 @@
-﻿<div align="center">
-  <img src="docs/assets/pysuqu-logo.svg" alt="pysuqu logo" width="820" />
-
-  <h1>pysuqu</h1>
-  <p><strong>Python toolkit for superconducting qubit simulation.</strong></p>
-  <p>
-    <a href="#english">English</a> |
-    <a href="#zh-cn">简体中文</a>
-  </p>
-  <p>
-    <img alt="version" src="https://img.shields.io/badge/version-2.0.1-0f766e" />
-    <img alt="python" src="https://img.shields.io/badge/python-%3E%3D3.8-2563eb" />
-    <img alt="license" src="https://img.shields.io/badge/license-AGPLv3%2B-f59e0b" />
-    <img alt="focus" src="https://img.shields.io/badge/focus-superconducting%20qubits-14b8a6" />
-  </p>
+<div align="center">
+  <img
+    src="https://raw.githubusercontent.com/znb888/pysuqu/main/docs/assets/pysuqu-logo.svg"
+    alt="pysuqu logo"
+    width="760"
+  />
 </div>
+
+# pysuqu
+
+[![PyPI version](https://img.shields.io/pypi/v/pysuqu?style=flat-square&label=PyPI&color=0f766e&logo=pypi&logoColor=white)](https://pypi.org/project/pysuqu/)
+[![Python versions](https://img.shields.io/pypi/pyversions/pysuqu?style=flat-square&label=Python&color=2563eb&logo=python&logoColor=white)](https://pypi.org/project/pysuqu/)
+[![License](https://img.shields.io/badge/License-AGPLv3%2B-f59e0b?style=flat-square&logo=gnu&logoColor=white)](https://github.com/znb888/pysuqu/blob/main/LICENSE)
+
+Python toolkit for superconducting qubit simulation.
+
+`pysuqu` provides qubit modeling, multi-qubit and coupler workflows, and
+decoherence/noise analysis in one package.
+
+[English](#english) | [简体中文](#zh-cn)
 
 <a id="english"></a>
 
 ## English
 
-`pysuqu` is the public package-first distribution of the `pysuqu` 2.0 codebase.
-This repository starts directly at version `2.0.0` and intentionally publishes
-the reusable library, public documentation, public tests, and public-safe demo
-notebooks only.
+`pysuqu` is a public Python package for superconducting qubit simulation. This
+repository contains the library, documentation, tests, and demo notebooks with
+synthetic or public-safe data.
 
-| Public package | Reproducible demos | Public-safe scope |
-| --- | --- | --- |
-| `pysuqu/` exports the main simulation toolkit | `demo/` contains fresh notebooks with synthetic data only | private legacy notebooks and exploratory materials stay out of this repo |
+### Install
 
-### Highlights
-
-- Superconducting qubit modeling utilities under `pysuqu.qubit`
-- Decoherence and noise-analysis workflows under `pysuqu.decoherence`
-- Public demo notebooks covering qubits, decoherence, waveforms, and coupler workflows
-- Public tests, benchmark harnesses, and packaging metadata prepared for the public `2.0.1` release
-
-### Installation
+For most users, install from PyPI:
 
 ```bash
+pip install pysuqu
+```
+
+`pysuqu` supports Python `3.8+`.
+
+If you want the latest repository version for development:
+
+```bash
+git clone https://github.com/znb888/pysuqu.git
+cd pysuqu
 pip install -r requirements.txt
 pip install -e .
 ```
 
-To build distributable artifacts locally:
+### What It Covers
 
-```bash
-python -m build
-```
+- `pysuqu.qubit` for single-qubit and multi-qubit superconducting circuit
+  modeling
+- `pysuqu.decoherence` for decoherence and noise-analysis workflows
+- `demo/` for end-to-end notebook examples
 
 ### Quick Start
 
-```python
-import numpy as np
+This example builds a simple transmon-like qubit model and prints the first
+three energy levels:
 
+```python
 from pysuqu.qubit import AbstractQubit
-from pysuqu.decoherence import ZNoiseDecoherence
 
 qubit = AbstractQubit(
     frequency=5e9,
@@ -62,103 +67,67 @@ qubit = AbstractQubit(
     frequency_max=6e9,
     qubit_type="Transmon",
     energy_trunc_level=12,
+    is_print=False,
 )
 
-energies = qubit.get_energylevel()
-print(f"f01 = {energies[1] / 2 / np.pi:.3e} Hz")
-
-psd_freq = np.logspace(4, 8, 4000)
-psd_s = 5e-16 / psd_freq + 4e-21
-
-result = ZNoiseDecoherence(
-    psd_freq=psd_freq,
-    psd_S=psd_s,
-    qubit_freq=5e9,
-    qubit_anharm=-250e6,
-).cal_tphi2(method="cal", idle_freq=5e9, is_print=False)
-
-print(result.value, result.unit)
+print(qubit.get_energylevel()[:3])
 ```
 
-### Documentation
+For decoherence and coupler workflows, the notebook examples in `demo/` are the
+best next stop.
 
-- [docs/README.md](docs/README.md)
-- [docs/guides/getting-started.md](docs/guides/getting-started.md)
-- [docs/architecture/module-map.md](docs/architecture/module-map.md)
-- [docs/architecture/refactor-status.md](docs/architecture/refactor-status.md)
-- [docs/guides/code-style.md](docs/guides/code-style.md)
-- [demo/README.md](demo/README.md)
+### Where To Start
 
-### Public Demo Notebooks
+- [Getting started guide](https://github.com/znb888/pysuqu/blob/main/docs/guides/getting-started.md)
+- [Documentation index](https://github.com/znb888/pysuqu/blob/main/docs/README.md)
+- [Demo notebooks](https://github.com/znb888/pysuqu/blob/main/demo/README.md)
+- [Module map](https://github.com/znb888/pysuqu/blob/main/docs/architecture/module-map.md)
 
-- [demo/demo_01_single_qubit_basics.ipynb](demo/demo_01_single_qubit_basics.ipynb)
-- [demo/demo_02_decoherence_with_synthetic_noise.ipynb](demo/demo_02_decoherence_with_synthetic_noise.ipynb)
-- [demo/demo_03_waveform_and_gate_basics.ipynb](demo/demo_03_waveform_and_gate_basics.ipynb)
-- [demo/demo_04_multiqubit_coupler_workflow.ipynb](demo/demo_04_multiqubit_coupler_workflow.ipynb)
+### Public API Notes
 
-### Repository Layout
-
-```text
-pysuqu/
-  pysuqu/        package source
-  tests/          public test suite
-  docs/           public documentation
-  demo/           public tutorial notebooks and synthetic demo data
-  benchmarks/     local performance benchmark harnesses
-  requirements.txt
-  setup.py
-  pyproject.toml
-  LICENSE
-```
-
-### License
-
-This repository is licensed under the
-[GNU Affero General Public License v3.0 or later](LICENSE).
-
-If `pysuqu` is helpful to your work, you are very welcome to watch the
-repository, fork it, and contribute improvements.
-
+- For normal usage, start from `pysuqu.qubit` and `pysuqu.decoherence`.
+- `pysuqu.qubit.experimental` contains exploratory placeholders and is not part
+  of the usual workflow.
+- Demo notebooks in this public repository use synthetic or public-safe data.
 
 <a id="zh-cn"></a>
 
 ## 简体中文
 
-`pysuqu` 是 `pysuqu` 2.0 的公开、以 Python 包为中心的发布仓库。这个仓库从
-`2.0.0` 版本直接开始，对外只公开可复用的库代码、公开文档、公开测试，以及
-使用公开安全合成数据重写后的 demo notebook。
-
-| 公开包主体 | 可复现实例 | 公开范围控制 |
-| --- | --- | --- |
-| `pysuqu/` 提供核心模拟能力 | `demo/` 提供新的公开 notebook 与合成数据 | 旧私有 notebook 与探索性材料不会进入本仓库 |
-
-### 主要内容
-
-- `pysuqu.qubit` 中的超导量子比特建模能力
-- `pysuqu.decoherence` 中的退相干与噪声分析工作流
-- 覆盖单比特、退相干、波形门操作、多比特 coupler 工作流的公开 demo
-- 为公开 `2.0.1` 版本整理好的测试、benchmark harness 与发布元数据
+`pysuqu` 是一个面向超导量子比特仿真的 Python 包。这个公开仓库包含库代码、
+文档、测试，以及使用合成数据或公开安全数据整理出的 demo notebook。
 
 ### 安装
 
+普通用户直接从 PyPI 安装：
+
 ```bash
+pip install pysuqu
+```
+
+`pysuqu` 支持 Python `3.8+`。
+
+如果你想基于仓库开发，安装方式如下：
+
+```bash
+git clone https://github.com/znb888/pysuqu.git
+cd pysuqu
 pip install -r requirements.txt
 pip install -e .
 ```
 
-如需本地验证构建产物：
+### 主要内容
 
-```bash
-python -m build
-```
+- `pysuqu.qubit`：单比特、多比特和耦合器相关的建模能力
+- `pysuqu.decoherence`：退相干与噪声分析工作流
+- `demo/`：端到端 notebook 示例
 
 ### 快速开始
 
-```python
-import numpy as np
+下面这个例子会构建一个简化的 transmon 模型，并输出前三个能级：
 
+```python
 from pysuqu.qubit import AbstractQubit
-from pysuqu.decoherence import ZNoiseDecoherence
 
 qubit = AbstractQubit(
     frequency=5e9,
@@ -166,57 +135,30 @@ qubit = AbstractQubit(
     frequency_max=6e9,
     qubit_type="Transmon",
     energy_trunc_level=12,
+    is_print=False,
 )
 
-energies = qubit.get_energylevel()
-print(f"f01 = {energies[1] / 2 / np.pi:.3e} Hz")
-
-psd_freq = np.logspace(4, 8, 4000)
-psd_s = 5e-16 / psd_freq + 4e-21
-
-result = ZNoiseDecoherence(
-    psd_freq=psd_freq,
-    psd_S=psd_s,
-    qubit_freq=5e9,
-    qubit_anharm=-250e6,
-).cal_tphi2(method="cal", idle_freq=5e9, is_print=False)
-
-print(result.value, result.unit)
+print(qubit.get_energylevel()[:3])
 ```
 
-### 文档入口
+如果你要看退相干分析或 coupler 工作流，最直接的入口是 `demo/` 里的 notebook。
 
-- [docs/README.md](docs/README.md)
-- [docs/guides/getting-started.md](docs/guides/getting-started.md)
-- [docs/architecture/module-map.md](docs/architecture/module-map.md)
-- [docs/architecture/refactor-status.md](docs/architecture/refactor-status.md)
-- [docs/guides/code-style.md](docs/guides/code-style.md)
-- [demo/README.md](demo/README.md)
+### 从哪里开始
 
-### 公开 Demo
+- [入门指南](https://github.com/znb888/pysuqu/blob/main/docs/guides/getting-started.md)
+- [文档索引](https://github.com/znb888/pysuqu/blob/main/docs/README.md)
+- [Demo 说明](https://github.com/znb888/pysuqu/blob/main/demo/README.md)
+- [模块地图](https://github.com/znb888/pysuqu/blob/main/docs/architecture/module-map.md)
 
-- [demo/demo_01_single_qubit_basics.ipynb](demo/demo_01_single_qubit_basics.ipynb)
-- [demo/demo_02_decoherence_with_synthetic_noise.ipynb](demo/demo_02_decoherence_with_synthetic_noise.ipynb)
-- [demo/demo_03_waveform_and_gate_basics.ipynb](demo/demo_03_waveform_and_gate_basics.ipynb)
-- [demo/demo_04_multiqubit_coupler_workflow.ipynb](demo/demo_04_multiqubit_coupler_workflow.ipynb)
+### 公共 API 说明
 
-### 仓库结构
+- 正常使用时，优先从 `pysuqu.qubit` 和 `pysuqu.decoherence` 开始。
+- `pysuqu.qubit.experimental` 里是探索性占位入口，不属于常规工作流。
+- 本公开仓库中的 demo notebook 只使用合成数据或公开安全数据。
 
-```text
-pysuqu/
-  pysuqu/        包源码
-  tests/          公开测试
-  docs/           公开文档
-  demo/           公开 notebook 与合成 demo 数据
-  requirements.txt
-  setup.py
-  pyproject.toml
-  LICENSE
-```
+## License / 许可证
 
-### 许可证
+`pysuqu` is licensed under the
+[GNU Affero General Public License v3.0 or later](https://github.com/znb888/pysuqu/blob/main/LICENSE).
 
-本仓库采用 [GNU Affero General Public License v3.0 或更高版本](LICENSE)。
-
-如果 `pysuqu` 对你的工作有帮助，也非常欢迎你关注仓库、fork 项目并提交贡献。
-
+欢迎通过 issue 和 pull request 提出改进。
