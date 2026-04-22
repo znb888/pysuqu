@@ -8,6 +8,10 @@ import numpy as np
 from qutip import Qobj, expect, ket2dm
 
 from ..funclib import cal_product_state, truncate_precision
+from .compatibility import (
+    _hamiltonian_evo_hamiltonian_evolution,
+    _hamiltonian_evo_set_inistate,
+)
 from .types import SpectrumResult
 
 
@@ -217,15 +221,11 @@ class HamiltonianEvo:
             return [truncate_precision(state) for state in self._eigenstates]
         return truncate_precision(self._eigenstates[label])
 
-    @staticmethod
-    def _raise_placeholder(method_name: str):
-        raise NotImplementedError(f"HamiltonianEvo.{method_name}() is not implemented yet.")
-
     def set_inistate(self, initial_state: Qobj):
-        self._raise_placeholder('set_inistate')
+        return _hamiltonian_evo_set_inistate(self, initial_state)
 
     def hamiltonian_evolution(self, *args, **kwargs):
-        self._raise_placeholder('hamiltonian_evolution')
+        return _hamiltonian_evo_hamiltonian_evolution(self, *args, **kwargs)
 
     def find_state(
         self,

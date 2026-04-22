@@ -12,6 +12,13 @@ from typing import Optional
 # local lib
 from .analysis import analyze_single_qubit_spectrum
 from .base import ParameterizedQubit, Phi0, e, h, hbar, pi
+from .compatibility import (
+    _raise_single_qubit_readout_inductive_boundary,
+    _single_qubit_base_envs_capa,
+    _single_qubit_base_envs_induc,
+    _single_qubit_base_envs_junc_resis,
+    _single_qubit_base_envs_readout_photon,
+)
 
 RNAN = 1e20
 RLINE = 50
@@ -105,10 +112,6 @@ class SingleQubitBase(ParameterizedQubit):
         self._refresh_basic_state()
         return updated
 
-    @staticmethod
-    def _raise_placeholder(method_name: str):
-        raise NotImplementedError(f"SingleQubitBase.{method_name}() is not implemented yet.")
-    
     def print_basic_info(self, is_print: bool = True):
         if is_print:
             print(f'Qubit frequency: {self.f01:.3f} GHz')
@@ -211,7 +214,7 @@ class SingleQubitBase(ParameterizedQubit):
         The relationship between qubit frequency and photon number in readout cavity. 
         Can be used to calculate the kappa of readout cavity. 
         '''
-        self._raise_placeholder("EnvsReadoutphoton")
+        return _single_qubit_base_envs_readout_photon(self)
     
     def get_Readout_parameter(
         self, 
@@ -247,10 +250,7 @@ class SingleQubitBase(ParameterizedQubit):
             Ccc = (Cq*Cr+Cq*rq_coupleterm+Cr*rq_coupleterm)/(rq_coupleterm)
             g = np.sqrt(freq*readout_freq)*np.sqrt(Cqq*Crr)/2/Ccc
         elif coupling_mode['rq'] == 'induc':
-            raise NotImplementedError(
-                "SingleQubitBase.get_Readout_parameter() does not implement "
-                "coupling_mode['rq'] == 'induc' yet."
-            )
+            _raise_single_qubit_readout_inductive_boundary()
         else:
             raise ValueError("please choose coupling_mode in ['capac','induc']")
         print(f'Frequencies of Qubit and Readout: {freq/1e9:.4f} GHz, {readout_freq/1e9:.4f} GHz')
@@ -289,13 +289,13 @@ class SingleQubitBase(ParameterizedQubit):
         
     
     def EnvsCapa(self):
-        self._raise_placeholder('EnvsCapa')
+        return _single_qubit_base_envs_capa(self)
     
     def EnvsInduc(self):
-        self._raise_placeholder('EnvsInduc')
+        return _single_qubit_base_envs_induc(self)
     
     def EnvsJuncResis(self):
-        self._raise_placeholder('EnvsJuncResis')
+        return _single_qubit_base_envs_junc_resis(self)
 
     def get_readout_couple(
         self,

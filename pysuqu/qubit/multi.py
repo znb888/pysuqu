@@ -24,6 +24,11 @@ from .analysis import (
     plot_multi_qubit_sensitivity_curve,
 )
 from .base import ParameterizedQubit, e, hbar, pi
+from .compatibility import (
+    _fgf1v1_qubit_dephasing_by_coupler_thermal,
+    _fgfgg1v1v3_coupling_init,
+    _grounded_transmon_list_init,
+)
 from .solver import HamiltonianEvo
 from .single import GroundedTransmon, RLINE
 
@@ -462,10 +467,6 @@ def _validate_readout_couple_mode(couple_mode: str) -> None:
         raise ValueError(f'Unsupported couple_mode: {couple_mode}')
 
 
-def _raise_multiqubit_placeholder(owner: str, method_name: str) -> None:
-    raise NotImplementedError(f'{owner}.{method_name}() is not implemented yet.')
-
-
 class GroundedTransmonList(GroundedTransmon):
     
     """
@@ -476,7 +477,7 @@ class GroundedTransmonList(GroundedTransmon):
         self,
         *args, **kwargs
     ):
-        _raise_multiqubit_placeholder('GroundedTransmonList', '__init__')
+        _grounded_transmon_list_init(self, *args, **kwargs)
     
 
 class QCRFGRModel(ParameterizedQubit):
@@ -684,7 +685,7 @@ class FGF1V1Coupling(ParameterizedQubit):
         return 0
     
     def QubitDephasingbyCouplerThermal(self, coupler_flux):
-        _raise_multiqubit_placeholder('FGF1V1Coupling', 'QubitDephasingbyCouplerThermal')
+        return _fgf1v1_qubit_dephasing_by_coupler_thermal(self, coupler_flux)
     
     def get_readout_couple(
         self, 
@@ -935,7 +936,7 @@ class FGFGG1V1V3Coupling(ParameterizedQubit):
         *args,
         **kwargs,
     ):
-        _raise_multiqubit_placeholder('FGFGG1V1V3Coupling', '__init__')
+        _fgfgg1v1v3_coupling_init(self, *args, **kwargs)
 
 
 def _qcrfgr_cal_coupler_sensitivity(
