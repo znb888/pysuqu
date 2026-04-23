@@ -1912,7 +1912,7 @@ class RealQutipGateSmokeTests(unittest.TestCase):
         self.assertAlmostEqual(payload['phase_error_deg'], 0.0, places=6)
         self.assertTrue(payload['final_state_rot_is_qobj'])
         self.assertTrue(payload['final_state_rot_is_density_matrix'])
-        self.assertEqual(payload['final_state_rot_shape'], [3, 3])
+        self.assertEqual(payload['final_state_rot_shape'], [2, 2])
         self.assertAlmostEqual(payload['final_state_rot_trace_real'], 1.0, places=6)
 
     def test_single_qubit_gate_plot_bloch_evolution_uses_real_qutip_when_available(self):

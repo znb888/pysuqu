@@ -10,8 +10,8 @@ This directory contains public tutorial notebooks for `pysuqu`.
   - electronic-noise pipeline and dephasing analysis using synthetic PSD data
 - `demo_03_waveform_and_gate_basics.ipynb`
   - waveform generation, schedule import, and a minimal gate simulation path
-- `demo_04_multiqubit_coupler_workflow.ipynb`
-  - coupler-bias probing and multi-qubit sensitivity analysis
+- `demo_04_dynamic_simulation.ipynb`
+  - single-qubit gate dynamics, fidelity diagnostics, and local calibration checks
 
 ## Data Policy
 

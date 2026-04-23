@@ -12,9 +12,7 @@ energy is in gigahertz (GHz).
 # import
 import numpy as np
 import qutip as qt
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from typing import Union, List, Tuple, Dict, Optional, Literal
+from typing import Any, Union, List, Tuple, Dict, Optional, Literal
 from dataclasses import replace
 from tqdm import tqdm
 from copy import copy
@@ -22,6 +20,24 @@ from copy import copy
 # local lib
 from .base import AbstractQubit, Phi0, e, pi
 from ..funclib.awgenerator import *
+from ..funclib import truncate_hilbert_space
+
+
+def _load_plotly_helpers():
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "plotly is required for gate plotting helpers"
+        ) from exc
+    return go, make_subplots
+
+
+def _as_complex_scalar(value) -> complex:
+    if isinstance(value, qt.Qobj):
+        return complex(value[0, 0])
+    return complex(value)
 
 # --- Base Class ---
 class GateBase:
@@ -62,6 +78,27 @@ class GateBase:
             anharmonicity=self.qubit.qubit_anharm
         )
         print('AWG initialized. ')
+
+    @staticmethod
+    def _default_solver_options(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Shared QuTiP solver defaults used by gate-level simulation helpers."""
+        options = {
+            "nsteps": 5000,
+            "atol": 1e-8,
+            "rtol": 1e-6,
+            "store_states": True,
+        }
+        if overrides:
+            options.update(overrides)
+        return options
+
+    def _default_solver_args(self, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Merge explicit solver args with gate-owned decoherence kwargs when available."""
+        solver_args = dict(args or {})
+        decoherence_params = getattr(self, 'decoherence_params', None)
+        if decoherence_params and decoherence_params.get("Tphi2") is not None:
+            solver_args.setdefault('Tphi2', decoherence_params["Tphi2"])
+        return solver_args
 
 class SingleQubitGate(GateBase):
     def __init__(
@@ -195,17 +232,64 @@ class SingleQubitGate(GateBase):
         delattr(self, 'decoherence_params')
         print(f"Decoherence cleaned. ")
 
-    def get_drive_hamiltonian(self, couple_term: float, couple_type: Literal['induc', 'capac'] = 'induc', R_line: float = 50.0) -> qt.Qobj:
+    def _get_inductive_drive_operator(
+        self,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
+    ) -> qt.Qobj:
+        """Return the cached inductive-drive operator in the truncated Hilbert space."""
+        cache = getattr(self, '_inductive_drive_operator_cache', None)
+        if cache is None:
+            cache = {}
+            self._inductive_drive_operator_cache = cache
+
+        if induc_phi_model in cache:
+            return cache[induc_phi_model]
+
+        phi_op = self.qubit.phi_operators[0]
+        if induc_phi_model == 'linear':
+            drive_op = phi_op
+        elif induc_phi_model == 'exact':
+            operator_cache_key = self.qubit._get_hamiltonian_operator_cache_key()
+            phi_scales = [
+                (2 * self.qubit.Ec[ii, ii] / (self.qubit.Ej[ii, ii] + self.qubit.El[ii, ii])) ** 0.25
+                for ii in range(self.qubit._numQubits)
+            ]
+            phi_scale_key = self.qubit._get_phi_scale_cache_key(phi_scales)
+            phis_big, _ = type(self.qubit)._build_cached_scaled_phase_terms(
+                *operator_cache_key,
+                phi_scale_key,
+            )
+            drive_big = ((1j * phis_big[0]).expm() - (-1j * phis_big[0]).expm()) / (2j)
+            drive_op = truncate_hilbert_space(drive_big, list(self.qubit._Nlevel))
+            drive_op = 0.5 * (drive_op + drive_op.dag())
+        else:
+            raise ValueError(
+                f"Unsupported induc_phi_model '{induc_phi_model}'. "
+                "Choose from 'exact' or 'linear'."
+            )
+
+        cache[induc_phi_model] = drive_op
+        return drive_op
+
+    def get_drive_hamiltonian(
+        self,
+        couple_term: float,
+        couple_type: Literal['induc', 'capac'] = 'induc',
+        R_line: float = 50.0,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
+    ) -> qt.Qobj:
         """
-        Construct drive hamiltonian (e.g., a + a.dag()).
+        Construct the drive Hamiltonian for one control line.
         
         Args:
             couple_term(float): Couple strength of control line, H if couple_type is 'induc', F if couple_type is 'capac'.
-            couple_type(str): Couple type of control line. 
+            couple_type(str): Couple type of control line.
+            induc_phi_model(str): Inductive drive operator model, 'exact' for sin(phi)
+                as a matrix function or 'linear' for the small-angle phi approximation.
         """
         if couple_type == 'induc':
-            phi_op = self.qubit.phi_operators[0]
-            return self.qubit.Ej[0][0]*2*pi*couple_term*(phi_op-phi_op**3/6)/Phi0/R_line
+            drive_op = self._get_inductive_drive_operator(induc_phi_model=induc_phi_model)
+            return self.qubit.Ej[0][0] * 2 * pi * couple_term * drive_op / Phi0 / R_line
         elif couple_type == 'capac':
             n_op = self.qubit.n_operators[0]
             return couple_term*n_op/(e**2/2/self.qubit.Ec[0][0]+couple_term)
@@ -290,22 +374,20 @@ class SingleQubitGate(GateBase):
         psi0 = self._parse_initial_state(initial_state_input)
         c_term = kwargs.get('couple_term', 0.5e-12)
         c_type = kwargs.get('couple_type', 'induc')
+        induc_phi_model = kwargs.get('induc_phi_model', 'exact')
         
         H_static = self.qubit.get_hamiltonian()
-        H_drive = self.get_drive_hamiltonian(couple_term=c_term, couple_type=c_type)
+        H_drive = self.get_drive_hamiltonian(
+            couple_term=c_term,
+            couple_type=c_type,
+            induc_phi_model=induc_phi_model,
+        )
         drive_func = self.awg.get_qutip_func(channel)
         c_ops = self._get_c_ops()
         
         H_total = [H_static, [H_drive, drive_func]]
-        opts = {
-            "nsteps": 5000,
-            "atol": 1e-8, 
-            "rtol": 1e-6,
-            "store_states": True
-        }
-        solver_args = {}
-        if hasattr(self, 'decoherence_params') and self.decoherence_params.get("Tphi2"):
-            solver_args['Tphi2'] = self.decoherence_params["Tphi2"]
+        opts = self._default_solver_options()
+        solver_args = self._default_solver_args()
         
         result = qt.mesolve(
             H_total, psi0, self.awg.t_axis, 
@@ -353,6 +435,128 @@ class SingleQubitGate(GateBase):
         
         return (x, y, z)
 
+    def _summarize_fidelity_metrics(
+        self,
+        *,
+        result: qt.Result,
+        target_state: Union[qt.Qobj, List[complex]],
+        is_print: bool = True,
+    ) -> Dict[str, float]:
+        """Project the final state into the qubit eigenbasis before evaluating fidelity."""
+        final_state = result.states[-1]
+        t_final = result.times[-1]
+
+        if final_state.isket:
+            rho = final_state * final_state.dag()
+        else:
+            rho = final_state
+
+        eig0 = self.qubit.get_eigenstate(0)
+        eig1 = self.qubit.get_eigenstate(1)
+        pop0 = _as_complex_scalar(eig0.dag() * rho * eig0)
+        pop1 = _as_complex_scalar(eig1.dag() * rho * eig1)
+        rho01 = _as_complex_scalar(eig0.dag() * rho * eig1)
+
+        phase_factor = 2 * pi * self.qubit.qubit_f01 * t_final
+        rho_qubit_rot = qt.Qobj(
+            [
+                [pop0, rho01 * np.exp(-1j * phase_factor)],
+                [np.conj(rho01) * np.exp(1j * phase_factor), pop1],
+            ]
+        )
+        leakage = 1.0 - np.real(pop0 + pop1)
+
+        rho_target = self._resolve_target_qubit_density(target_state)
+        fid_val = qt.fidelity(rho_qubit_rot, rho_target)**2
+
+        actual_rho01 = complex(rho_qubit_rot[0, 1])
+        target_rho01 = complex(rho_target[0, 1])
+        if abs(actual_rho01) <= 1e-12 or abs(target_rho01) <= 1e-12:
+            phase_err = 0.0
+        else:
+            actual_rho01_phase = np.angle(actual_rho01)
+            target_rho01_phase = np.angle(target_rho01)
+            phase_err = np.degrees(actual_rho01_phase - target_rho01_phase)
+            phase_err = (phase_err + 180) % 360 - 180
+
+        if fid_val > 1.0:
+            fid_val = 1.0
+
+        if is_print:
+            print(f"Fid: {fid_val*100:.5f}%, Leak: {leakage:.5e}, PhaseErr: {phase_err:.2f}")
+
+        return {
+            "fidelity": fid_val,
+            "leakage": leakage,
+            "phase_error_deg": phase_err,
+            "final_state_rot": rho_qubit_rot
+        }
+
+    def _resolve_target_qubit_density(
+        self,
+        target_state: Union[qt.Qobj, List[complex]],
+    ) -> qt.Qobj:
+        """Resolve target states in the 2D computational eigenbasis."""
+        if isinstance(target_state, list):
+            coeffs = np.asarray(target_state, dtype=complex).reshape(-1)
+            if coeffs.size < 2:
+                raise ValueError("target_state coefficient lists must provide at least two entries.")
+            coeffs = coeffs[:2]
+            norm = np.linalg.norm(coeffs)
+            if norm <= 0:
+                raise ValueError("target_state coefficient list must not be all zeros.")
+            coeffs = coeffs / norm
+            ket = coeffs[0] * qt.basis(2, 0) + coeffs[1] * qt.basis(2, 1)
+            return ket * ket.dag()
+
+        if not isinstance(target_state, qt.Qobj):
+            raise TypeError("target_state must be either a qutip.Qobj or a coefficient list.")
+
+        if target_state.isket:
+            if target_state.shape == (2, 1):
+                ket = target_state.unit()
+                return ket * ket.dag()
+
+            eig0 = self.qubit.get_eigenstate(0)
+            eig1 = self.qubit.get_eigenstate(1)
+            coeffs = np.asarray(
+                [
+                    _as_complex_scalar(eig0.dag() * target_state),
+                    _as_complex_scalar(eig1.dag() * target_state),
+                ],
+                dtype=complex,
+            )
+            norm = np.linalg.norm(coeffs)
+            if norm <= 0:
+                raise ValueError("target_state has no support in the computational eigenstate subspace.")
+            coeffs = coeffs / norm
+            ket = coeffs[0] * qt.basis(2, 0) + coeffs[1] * qt.basis(2, 1)
+            return ket * ket.dag()
+
+        if target_state.isoper:
+            if target_state.shape == (2, 2):
+                trace_val = np.trace(target_state.full())
+                if abs(trace_val) <= 0:
+                    raise ValueError("target_state density matrix must have non-zero trace.")
+                return qt.Qobj(target_state.full() / trace_val)
+
+            eig0 = self.qubit.get_eigenstate(0)
+            eig1 = self.qubit.get_eigenstate(1)
+            basis_states = (eig0, eig1)
+            projected = np.asarray(
+                [
+                    [_as_complex_scalar(left.dag() * target_state * right) for right in basis_states]
+                    for left in basis_states
+                ],
+                dtype=complex,
+            )
+            trace_val = np.trace(projected)
+            if abs(trace_val) <= 0:
+                raise ValueError("target_state density has no support in the computational eigenstate subspace.")
+            return qt.Qobj(projected / trace_val)
+
+        raise TypeError("target_state must be a ket/density qutip.Qobj or a coefficient list.")
+
     def calculate_fidelity(
         self, 
         channel: ChannelSchedule = None, 
@@ -362,6 +566,7 @@ class SingleQubitGate(GateBase):
         initial_state_input: Union[int, List[complex]] = 0,
         result: qt.Result = None,
         is_print: bool = True,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
     ) -> Dict[str, float]:
         """
         Compute State Fidelity (prob), Leakage, and Phase Error.
@@ -376,52 +581,20 @@ class SingleQubitGate(GateBase):
                 raise ValueError("No channel loaded! Please call .load_channel() first or pass 'channel' argument.")
             channel = self.pulse_channel
         if result is None:
-            res = self.run_simulation(channel=channel, initial_state_input=initial_state_input, couple_term=couple_term, couple_type=couple_type)
+            res = self.run_simulation(
+                channel=channel,
+                initial_state_input=initial_state_input,
+                couple_term=couple_term,
+                couple_type=couple_type,
+                induc_phi_model=induc_phi_model,
+            )
         else:
             res = result
-        
-        final_state = res.states[-1]
-        t_final = res.times[-1]
-        phase_factor = 2 * pi * self.qubit.qubit_f01 * t_final
-        
-        if final_state.isket:
-            rho = final_state * final_state.dag()
-        else:
-            rho = final_state
-        
-        N = rho.shape[0]
-        U = qt.qdiags(np.exp(-1j * phase_factor * np.arange(N)), 0)
-        rho_rot = U * rho * U.dag()
-        
-        r00 = rho_rot[0, 0]
-        r11 = rho_rot[1, 1]
-        leakage = 1.0 - np.real(r00 + r11)
-        
-        if isinstance(target_state, list):
-            coefs = np.array(target_state)
-        elif isinstance(target_state, qt.Qobj):
-            coefs = target_state.full().flatten().tolist()
-        t_state = self._parse_initial_state(coefs)
-        rho_target = t_state * t_state.dag()
-        fid_val = qt.fidelity(rho_rot, rho_target)**2
-        
-        actual_rho01_phase = np.angle(rho_rot[0, 1])
-        target_rho01_phase = np.angle(rho_target[0, 1])
-            
-        phase_err = np.degrees(actual_rho01_phase - target_rho01_phase)
-        phase_err = (phase_err + 180) % 360 - 180
-        
-        if fid_val > 1.0: fid_val = 1.0
-
-        if is_print:
-            print(f"Fid: {fid_val*100:.5f}%, Leak: {leakage:.5e}, PhaseErr: {phase_err:.2f}")
-            
-        return {
-            "fidelity": fid_val,
-            "leakage": leakage,
-            "phase_error_deg": phase_err,
-            "final_state_rot": rho_rot
-        }
+        return self._summarize_fidelity_metrics(
+            result=res,
+            target_state=target_state,
+            is_print=is_print,
+        )
 
     def scan_parameter_by_fidelity(
         self, 
@@ -502,6 +675,7 @@ class SingleQubitGate(GateBase):
             self.pulse_channel.events[pulse_index] = curr_event
         
         if is_plot:
+            go, make_subplots = _load_plotly_helpers()
             fig = make_subplots(specs=[[{"secondary_y": True}]])
 
             fig.add_trace(
