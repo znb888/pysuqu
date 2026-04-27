@@ -144,6 +144,49 @@ def format_z_tphi1_report(
     )
 
 
+def format_coupler_tphi1_report(
+    *,
+    coupler_flux_point: float | None,
+    qubit_idx: int | None,
+    qubit_fluxes,
+    sensitivity_ghz_per_phi0: float,
+    sensitivity_rad_per_wb: float,
+    couple_term: float,
+    noise_output,
+    tphi1: float,
+) -> tuple[str, ...]:
+    """Build the coupler-flux-noise Tphi1 summary report."""
+    flux_label = (
+        'provided sensitivity'
+        if coupler_flux_point is None
+        else f'{float(coupler_flux_point):.6f} Phi0'
+    )
+    target_label = (
+        'average qubit frequency'
+        if qubit_idx is None
+        else f'Qubit{int(qubit_idx) + 1}'
+    )
+    lines = [
+        '--- Coupler Flux Noise Tphi1 ---',
+        f'Coupler flux: {flux_label}',
+        f'Target qubit: {target_label}',
+    ]
+    if qubit_fluxes is not None:
+        flux_values = ', '.join(f'{float(value):.6f}' for value in qubit_fluxes)
+        lines.append(f'Qubit flux overrides: [{flux_values}] Phi0')
+
+    lines.extend(
+        [
+            f'Output white noise PSD: {_format_summary(noise_output.white_noise, lambda x: f"{x:.3e} A^2/Hz")} @ {_format_summary(noise_output.white_ref_freq, _format_frequency_hz)}',
+            f'Output white noise temperature: {_format_summary(noise_output.white_noise_temperature, _format_temperature_k)}',
+            f'Frequency sensitivity: {sensitivity_ghz_per_phi0:.6f} GHz/Phi0 = {sensitivity_ghz_per_phi0 * 1e3:.3f} MHz/Phi0',
+            f'Angular flux sensitivity: {sensitivity_rad_per_wb:.3e} rad/s/Wb, mutual inductance: {couple_term:.3e} H',
+            f'Tphi1: {_format_time_seconds(tphi1)}',
+        ]
+    )
+    return tuple(lines)
+
+
 def format_z_tphi2_report(
     *,
     method: str,
@@ -311,7 +354,7 @@ def format_bias_current_voltage_report(
     phi_bias = results['phi_bias']
     return (
         f'------- Bias Current/Voltage Calculation (phi_fraction={phi_fraction}) -------',
-        f'Bias flux: {phi_bias / Phi0:.3f} Phi0 = {phi_bias*1e3:.3f} mPhi0',
+        f'Bias flux: {phi_bias / Phi0:.3f} Phi0 = {phi_bias / Phi0 * 1e3:.3f} mPhi0',
         f'Chip end: {results["chip_current_uA"]:.3f} uA, {results["chip_voltage_mV"]:.3f} mV',
         f'Total attenuation: {results["total_attenuation_dB"]:.2f} dB',
         f'Room end: {results["room_current_mA"]:.3f} mA, {results["room_voltage_mV"]:.3f} mV, {results["room_power_dBm"]:.2f} dBm',
@@ -327,7 +370,7 @@ def format_xy_current_voltage_report(
     phi_bias = results['phi_bias']
     return (
         f'--- XY Control Line Current/Voltage Calculation (phi_fraction={phi_fraction:.6f}) ---',
-        f'Bias flux: {phi_bias / Phi0:.6f} Phi0 = {phi_bias*1e3:.6f} mPhi0',
+        f'Bias flux: {phi_bias / Phi0:.6f} Phi0 = {phi_bias / Phi0 * 1e3:.6f} mPhi0',
         f'Chip end: {results["chip_current_uA"]:.3f} uA, {results["chip_voltage_uV"]:.3f} uV, {results["chip_power_dBm"]:.2f} dBm',
         f'Total attenuation: {results["total_attenuation_dB"]:.2f} dB',
         f'Room end: {results["room_current_mA"]:.6f} mA, {results["room_voltage_mV"]:.3f} mV, {results["room_power_dBm"]:.2f} dBm',

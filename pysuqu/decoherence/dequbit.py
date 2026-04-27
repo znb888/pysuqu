@@ -17,6 +17,7 @@ from ..qubit.base import AbstractQubit, Phi0
 from .analysis import ReadoutCavityAnalyzer, XYRelaxationAnalyzer, ZDephasingAnalyzer
 from .electronics import ElectronicNoise
 from .formatting import (
+    format_coupler_tphi1_report,
     format_bias_current_voltage_report,
     format_readout_nbar_report,
     format_readout_tphi_report,
@@ -352,13 +353,54 @@ class ZNoiseDecoherence(Decoherence):
             sense, _ = self.qubit.calculate_sensitivity_at_detuning((self.qubit_freq - idle_freq) / 1e9, mode='brief')
             return sense * 2e9 * pi / Phi0
 
-    def cal_tphi1(self, idle_freq: float = None, sensitivity: float = None, is_print: bool = True) -> float:
+    @staticmethod
+    def _extract_frequency_sensitivity_ghz_per_phi0(sensitivity) -> float:
+        if hasattr(sensitivity, 'sensitivity_value'):
+            sensitivity = sensitivity.sensitivity_value
+        return float(sensitivity)
+
+    @staticmethod
+    def _frequency_sensitivity_to_rad_per_wb(
+        sensitivity,
+        *,
+        unit: str = 'GHz/Phi0',
+    ) -> float:
+        value = ZNoiseDecoherence._extract_frequency_sensitivity_ghz_per_phi0(
+            sensitivity
+        )
+        unit_key = unit.lower().replace(' ', '').replace('_', '')
+        if unit_key in {'ghz/phi0', 'ghzperphi0'}:
+            return value * 2e9 * pi / Phi0
+        if unit_key in {'hz/phi0', 'hzperphi0'}:
+            return value * 2 * pi / Phi0
+        if unit_key in {'rad/s/wb', 'rads/wb', 'radpersecondperwb'}:
+            return value
+
+        raise ValueError(
+            "sensitivity_unit must be 'GHz/Phi0', 'Hz/Phi0', or 'rad/s/Wb'."
+        )
+
+    @staticmethod
+    def _rad_per_wb_to_ghz_per_phi0(sensitivity_rad_per_wb: float) -> float:
+        return float(sensitivity_rad_per_wb) * Phi0 / (2e9 * pi)
+
+    def cal_tphi1(
+        self,
+        idle_freq: float = None,
+        sensitivity: float = None,
+        *,
+        sensitivity_unit: str = 'GHz/Phi0',
+        is_print: bool = True,
+    ) -> float:
         """Calculate pure dephasing Tphi1 (White noise limit)."""
         noise_output = self.noise.output_stage
         if sensitivity is None:
             sens = self.get_sensitivity_at_idle(idle_freq)
         else:
-            sens = sensitivity * 2e9 * pi / Phi0
+            sens = self._frequency_sensitivity_to_rad_per_wb(
+                sensitivity,
+                unit=sensitivity_unit,
+            )
 
         self.tphi1 = self.z_analyzer.calculate_tphi1(
             noise_output=noise_output,
@@ -376,6 +418,103 @@ class ZNoiseDecoherence(Decoherence):
                 is_print=True,
             )
         return self.tphi1
+
+    def cal_coupler_tphi1(
+        self,
+        coupler_model=None,
+        *,
+        coupler_flux_point: Optional[float] = None,
+        sensitivity=None,
+        sensitivity_unit: str = 'GHz/Phi0',
+        method: str = 'numerical',
+        flux_step: float = 1e-4,
+        qubit_idx: Optional[int] = None,
+        qubit_fluxes: Optional[list[float]] = None,
+        is_print: bool = True,
+        is_plot: bool = False,
+    ) -> float:
+        """Calculate qubit Tphi1 limited by coupler-flux-line current noise.
+
+        `self.couple_term` is interpreted as the mutual inductance between the
+        coupler flux line and the coupler loop. When `sensitivity` is omitted,
+        `coupler_model` must provide `cal_coupler_sensitivity(...)`, such as an
+        `FGF1V1Coupling` instance. The public multi-qubit sensitivity is
+        expected in GHz/Phi0 and converted internally to rad/s/Wb.
+        """
+        sensitivity_result = sensitivity
+        if sensitivity_result is None:
+            if coupler_model is None:
+                raise ValueError(
+                    'coupler_model is required when sensitivity is not provided.'
+                )
+            if coupler_flux_point is None:
+                raise ValueError(
+                    'coupler_flux_point is required when sensitivity is not provided.'
+                )
+            if not hasattr(coupler_model, 'cal_coupler_sensitivity'):
+                raise TypeError(
+                    'coupler_model must provide cal_coupler_sensitivity(...).'
+                )
+
+            sensitivity_result = coupler_model.cal_coupler_sensitivity(
+                coupler_flux_point=coupler_flux_point,
+                method=method,
+                flux_step=flux_step,
+                qubit_idx=qubit_idx,
+                qubit_fluxes=qubit_fluxes,
+                is_print=False,
+                is_plot=is_plot,
+            )
+
+        sensitivity_rad_per_wb = self._frequency_sensitivity_to_rad_per_wb(
+            sensitivity_result,
+            unit=sensitivity_unit,
+        )
+        sensitivity_ghz_per_phi0 = (
+            self._extract_frequency_sensitivity_ghz_per_phi0(sensitivity_result)
+            if sensitivity_unit.lower().replace(' ', '').replace('_', '')
+            in {'ghz/phi0', 'ghzperphi0'}
+            else self._rad_per_wb_to_ghz_per_phi0(sensitivity_rad_per_wb)
+        )
+
+        self.coupler_tphi1 = self.z_analyzer.calculate_tphi1(
+            noise_output=self.noise.output_stage,
+            sensitivity=sensitivity_rad_per_wb,
+        )
+        self.coupler_sensitivity_result = sensitivity_result
+        self.coupler_sensitivity_ghz_per_phi0 = sensitivity_ghz_per_phi0
+        self.coupler_sensitivity_rad_per_wb = sensitivity_rad_per_wb
+        self.coupler_tphi1_result = TphiResult(
+            value=self.coupler_tphi1,
+            metadata={
+                'method': method,
+                'source': 'coupler-flux',
+                'coupler_flux_point': coupler_flux_point,
+                'flux_step': flux_step,
+                'qubit_idx': qubit_idx,
+                'qubit_fluxes': None if qubit_fluxes is None else list(qubit_fluxes),
+                'sensitivity_ghz_per_phi0': sensitivity_ghz_per_phi0,
+                'sensitivity_rad_per_wb': sensitivity_rad_per_wb,
+                'mutual_inductance': self.couple_term,
+            },
+        )
+
+        if is_print:
+            self._emit_report(
+                format_coupler_tphi1_report(
+                    coupler_flux_point=coupler_flux_point,
+                    qubit_idx=qubit_idx,
+                    qubit_fluxes=qubit_fluxes,
+                    sensitivity_ghz_per_phi0=sensitivity_ghz_per_phi0,
+                    sensitivity_rad_per_wb=sensitivity_rad_per_wb,
+                    couple_term=self.couple_term,
+                    noise_output=self.noise.output_stage,
+                    tphi1=self.coupler_tphi1,
+                ),
+                is_print=True,
+            )
+
+        return self.coupler_tphi1
 
     def cal_bias_current_voltage(
         self,
@@ -406,6 +545,22 @@ class ZNoiseDecoherence(Decoherence):
         )
 
         return results
+
+    def cal_coupler_bias_current_voltage(
+        self,
+        coupler_flux_point: float = 0.5,
+        is_print: bool = True,
+    ) -> BiasCurrentVoltageResult:
+        """Calculate coupler Z-bias current/voltage for a coupler flux point.
+
+        This is a named wrapper around `cal_bias_current_voltage()`. Build this
+        `ZNoiseDecoherence` instance with the coupler-line mutual inductance as
+        `couple_term`.
+        """
+        return self.cal_bias_current_voltage(
+            phi_fraction=coupler_flux_point,
+            is_print=is_print,
+        )
 
     def _build_tphi2_result(
         self,

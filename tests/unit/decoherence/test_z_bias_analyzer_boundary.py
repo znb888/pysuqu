@@ -52,6 +52,18 @@ class ZNoiseDecoherenceBiasAnalyzerBoundaryTests(unittest.TestCase):
         self.assertAlmostEqual(actual['room_voltage_mV'], room_voltage_mV)
         self.assertAlmostEqual(actual['room_power_dBm'], room_power_dBm)
 
+    def test_cal_coupler_bias_current_voltage_wraps_z_bias_mapping(self):
+        z_noise = self._construct()
+
+        actual = z_noise.cal_coupler_bias_current_voltage(
+            coupler_flux_point=0.5,
+            is_print=False,
+        )
+        expected = z_noise.cal_bias_current_voltage(phi_fraction=0.5, is_print=False)
+
+        self.assertEqual(set(actual), set(BiasCurrentVoltageResult.__annotations__))
+        self.assertEqual(actual, expected)
+
     def test_cal_bias_current_voltage_can_delegate_through_explicit_z_analyzer_builder(self):
         builder_calls = []
         analyzer_calls = []
