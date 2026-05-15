@@ -5,7 +5,17 @@ and run a minimal simulation example.
 
 ## Install
 
+For most users, install the published package from PyPI:
+
 ```bash
+pip install pysuqu
+```
+
+If you want the latest repository version for development:
+
+```bash
+git clone https://github.com/znb888/pysuqu.git
+cd pysuqu
 pip install -r requirements.txt
 pip install -e .
 ```
@@ -101,16 +111,16 @@ print(result)
 
 ## Repository Policy
 
-This public repository ships a fresh `demo/` directory with public tutorial
-notebooks and synthetic data only. The old private notebook set is still
-excluded.
+This public repository ships `demo/` notebooks and synthetic data only. The
+old private notebook set is still excluded.
 
 ## Public Demo Notebooks
 
+- [../../demo/README.md](../../demo/README.md) for the public notebook index
 - [../../demo/demo_01_single_qubit_basics.ipynb](../../demo/demo_01_single_qubit_basics.ipynb)
 - [../../demo/demo_02_decoherence_with_synthetic_noise.ipynb](../../demo/demo_02_decoherence_with_synthetic_noise.ipynb)
 - [../../demo/demo_03_waveform_and_gate_basics.ipynb](../../demo/demo_03_waveform_and_gate_basics.ipynb)
-- [../../demo/demo_04_multiqubit_coupler_workflow.ipynb](../../demo/demo_04_multiqubit_coupler_workflow.ipynb)
+- [../../demo/demo_04_dynamic_simulation.ipynb](../../demo/demo_04_dynamic_simulation.ipynb)
 
 ## Next References
 
