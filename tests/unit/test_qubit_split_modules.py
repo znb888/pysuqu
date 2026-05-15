@@ -113,13 +113,19 @@ class QubitSplitModuleTests(unittest.TestCase):
     def test_set_inistate_placeholder_fails_explicitly(self):
         evo = self._make_hamiltonian_evo()
 
-        with self.assertRaisesRegex(NotImplementedError, r"HamiltonianEvo\.set_inistate\(\)"):
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            r"Prefer HamiltonianEvo\.solve_time_dependent_hamiltonian\(\.\.\.\) for supported workflows\.",
+        ):
             evo.set_inistate(object())
 
     def test_hamiltonian_evolution_placeholder_fails_explicitly(self):
         evo = self._make_hamiltonian_evo()
 
-        with self.assertRaisesRegex(NotImplementedError, r"HamiltonianEvo\.hamiltonian_evolution\(\)"):
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            r"Prefer HamiltonianEvo\.solve_time_dependent_hamiltonian\(\.\.\.\) for supported workflows\.",
+        ):
             evo.hamiltonian_evolution()
 
     def test_single_qubit_environment_placeholders_fail_explicitly(self):

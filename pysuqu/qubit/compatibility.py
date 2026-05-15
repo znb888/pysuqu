@@ -13,7 +13,7 @@ def _hamiltonian_evo_set_inistate(self, initial_state):
         "HamiltonianEvo",
         "set_inistate",
         boundary="compatibility",
-        replacement="passing the initial state directly into your QuTiP solve flow",
+        replacement="HamiltonianEvo.solve_time_dependent_hamiltonian(...)",
         details="The old state-setting hook is retained only as a clear failure boundary.",
     )
 
@@ -23,7 +23,7 @@ def _hamiltonian_evo_hamiltonian_evolution(self, *args, **kwargs):
         "HamiltonianEvo",
         "hamiltonian_evolution",
         boundary="compatibility",
-        replacement="an explicit QuTiP solve flow built from HamiltonianEvo.get_hamiltonian()",
+        replacement="HamiltonianEvo.solve_time_dependent_hamiltonian(...)",
         details="The old monolithic evolution hook is retained only as a clear failure boundary.",
     )
 
