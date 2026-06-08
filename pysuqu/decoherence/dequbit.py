@@ -237,7 +237,7 @@ class Decoherence:
         else:
             raise ValueError(f"Unknown experiment type: {experiment}")
 
-    def cal_dephase(self, psd: np.ndarray, sensitivity_factor: float, noise_freq: np.ndarray = None, experiment: str = 'Ramsey', delay_list: np.ndarray = np.linspace(10, 10e3, 100)*1e-9, *, N: int = 100, len_pi: float = 100e-9) -> np.ndarray:
+    def cal_dephase(self, psd: np.ndarray, sensitivity_factor: float, noise_freq: np.ndarray = None, experiment: str = 'Ramsey', delay_list: np.ndarray = np.linspace(10, 10e3, 100)*1e-9, *, N: int = 100, len_pi: float = 100e-9, integration_method: str = "continuous") -> np.ndarray:
         """
         Generic calculation for dephasing probability decay P(t).
         
@@ -246,6 +246,8 @@ class Decoherence:
             sensitivity_factor: The pre-factor determining coupling strength (e.g. dOmega/dPhi * M or chi).
                                 This should be the FULL coefficient entering the integral, excluding the factor of 2 if applicable.
                                 Formula used: decay = exp( - integral( S(w) * |F(w)|^2 ) * (2 * factor)^2 / 2 )
+            integration_method: 'continuous' uses log-log PSD interpolation and adaptive quadrature.
+                                'discrete' preserves the legacy sparse-grid integration.
         """
         p1_list = []
         if noise_freq is None:
@@ -253,7 +255,12 @@ class Decoherence:
         
         for tau in delay_list:
             trans_func = self._generate_transfunc(experiment, tau, N, len_pi)
-            dfactor = integrate_square_large_span(noise_freq, psd, trans_func, method='log')
+            if integration_method == "continuous":
+                dfactor = integrate_filtered_psd_continuous(noise_freq, psd, trans_func)
+            elif integration_method == "discrete":
+                dfactor = integrate_square_large_span(noise_freq, psd, trans_func, method='log')
+            else:
+                raise ValueError("integration_method must be 'continuous' or 'discrete'.")
             exponent = -dfactor * (sensitivity_factor * 2)**2 / 2
             p1_list.append(np.exp(exponent))
             
@@ -597,7 +604,8 @@ class ZNoiseDecoherence(Decoherence):
               bounds: Tuple = ([0, 0, 0, -1], [np.inf, np.inf, 2, 1]), 
               cut_point: List[float] = [],
               is_print: bool = True, 
-              is_plot: bool = True) -> TphiResult:
+              is_plot: bool = True,
+              integration_method: str = "continuous") -> TphiResult:
         """
         Calculate Tphi2 (pure dephasing time), typically dominated by 1/f noise.
 
@@ -618,6 +626,8 @@ class ZNoiseDecoherence(Decoherence):
                                     If empty, uses full spectrum.
             is_print (bool): Whether to print the result.
             is_plot (bool): Whether to plot the decay curve (only for 'fit' method).
+            integration_method (str): PSD integration method for fit mode.
+                                    'continuous' is the default; 'discrete' preserves legacy behavior.
 
         Returns:
             TphiResult: The calculated or fitted Tphi2 value in seconds.
@@ -654,6 +664,7 @@ class ZNoiseDecoherence(Decoherence):
                     delay_list=delay_list,
                     N=N,
                     len_pi=len_pi,
+                    integration_method=integration_method,
                 )
 
                 try:

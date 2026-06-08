@@ -94,7 +94,7 @@ class DecoherenceDephaseKernelBoundaryTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unknown experiment type"):
             model._generate_transfunc("Unknown")
 
-    def test_cal_dephase_uses_output_stage_frequency_and_applies_shared_exponent_formula(self):
+    def test_cal_dephase_defaults_to_continuous_integrator_and_applies_shared_exponent_formula(self):
         noise_frequency = np.array([11.0, 22.0, 33.0])
         psd = np.array([1.0e-18, 1.5e-18, 2.0e-18])
         delay_list = np.array([1.0e-6, 2.0e-6, 3.0e-6])
@@ -121,7 +121,7 @@ class DecoherenceDephaseKernelBoundaryTests(unittest.TestCase):
         with (
             patch.object(model, "_generate_transfunc", side_effect=fake_generate_transfunc),
             patch(
-                "pysuqu.decoherence.dequbit.integrate_square_large_span",
+                "pysuqu.decoherence.dequbit.integrate_filtered_psd_continuous",
                 side_effect=integrated_weights,
             ) as integrate_mock,
         ):
@@ -154,7 +154,58 @@ class DecoherenceDephaseKernelBoundaryTests(unittest.TestCase):
             np.testing.assert_allclose(call.args[0], noise_frequency)
             np.testing.assert_allclose(call.args[1], psd)
             self.assertIs(call.args[2], generated_filters[index]["transfer"])
+
+    def test_cal_dephase_discrete_mode_preserves_legacy_log_integrator(self):
+        noise_frequency = np.array([11.0, 22.0, 33.0])
+        psd = np.array([1.0e-18, 1.5e-18, 2.0e-18])
+        delay_list = np.array([1.0e-6, 2.0e-6])
+        integrated_weights = [0.125, 0.25]
+        generated_filters = []
+
+        model = self._construct(noise_frequency=noise_frequency)
+
+        def fake_generate_transfunc(experiment, tau, N, len_pi):
+            def transfer(freq):
+                return freq + tau
+
+            generated_filters.append(transfer)
+            return transfer
+
+        with (
+            patch.object(model, "_generate_transfunc", side_effect=fake_generate_transfunc),
+            patch(
+                "pysuqu.decoherence.dequbit.integrate_square_large_span",
+                side_effect=integrated_weights,
+            ) as integrate_mock,
+        ):
+            actual = model.cal_dephase(
+                psd=psd,
+                sensitivity_factor=0.75,
+                experiment="Ramsey",
+                delay_list=delay_list,
+                integration_method="discrete",
+            )
+
+        expected = np.exp(-np.array(integrated_weights) * (0.75 * 2) ** 2 / 2)
+        np.testing.assert_allclose(actual, expected)
+        self.assertEqual(len(integrate_mock.call_args_list), 2)
+
+        for index, call in enumerate(integrate_mock.call_args_list):
+            np.testing.assert_allclose(call.args[0], noise_frequency)
+            np.testing.assert_allclose(call.args[1], psd)
+            self.assertIs(call.args[2], generated_filters[index])
             self.assertEqual(call.kwargs["method"], "log")
+
+    def test_cal_dephase_rejects_unknown_integration_method(self):
+        model = self._construct()
+
+        with self.assertRaisesRegex(ValueError, "integration_method"):
+            model.cal_dephase(
+                psd=np.array([1.0, 1.0, 1.0]),
+                sensitivity_factor=1.0,
+                delay_list=np.array([1.0e-6]),
+                integration_method="unknown",
+            )
 
 
 if __name__ == "__main__":

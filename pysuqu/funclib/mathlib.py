@@ -13,8 +13,8 @@ from scipy.constants import hbar, pi, Boltzmann
 from scipy.optimize import curve_fit
 from scipy.signal import savgol_filter
 from scipy.ndimage import uniform_filter1d, gaussian_filter1d
-from scipy.integrate import simpson
-from scipy.interpolate import CubicSpline
+from scipy.integrate import quad, simpson
+from scipy.interpolate import CubicSpline, UnivariateSpline
 from typing import Callable, Optional, Tuple
 
 kb = Boltzmann
@@ -282,13 +282,13 @@ def ramsey_transfunc(freq: np.ndarray, tau: float) -> np.ndarray:
     """
     Calculate transfer function of Ramsey experiment.
     """
-    return tau*np.sinc(2*pi*freq*tau/2)
+    return tau*np.sinc(freq*tau)
 
 def echo_transfunc(freq: np.ndarray, tau: float) -> np.ndarray:
     """
     Calculate transfer function of SpinEcho experiment.
     """
-    return tau*np.sin(2*pi*freq*tau/4)*np.sinc(2*pi*freq*tau/4)
+    return tau*np.sin(pi*freq*tau/2)*np.sinc(freq*tau/2)
 
 def cpmg_transfunc(freq: np.ndarray, tau: float, N: int, len_pi: float = 30e-9) -> np.ndarray:
     """
@@ -350,6 +350,100 @@ def integrate_square_large_span(x_arr: np.ndarray, y_arr: np.ndarray, z_func: Ca
         return spline.integrate(x_sorted[0], x_sorted[-1])
     else:
         raise ValueError(f"Method {method} not supported. Choose in ['simpson', 'log', 'spline'].")
+
+def integrate_filtered_psd_continuous(
+    x_arr: np.ndarray,
+    y_arr: np.ndarray,
+    z_func: Callable,
+    *,
+    grid_per_decade: int = 4,
+    spline_order: int = 3,
+    epsrel: float = 1e-5,
+    epsabs: float = 0.0,
+    limit: int = 500,
+) -> float:
+    """
+    Integrate y(x) * z_func(x)**2 dx using log-log interpolation of positive PSD data.
+
+    Intended for oscillatory filter functions such as Ramsey sinc filters, where
+    evaluating the filter only on sparse measured PSD points can undersample the
+    filter and produce non-physical non-monotonic dephasing curves.
+    """
+    x_arr = np.asarray(x_arr, dtype=float)
+    y_arr = np.asarray(y_arr, dtype=float)
+
+    if x_arr.shape != y_arr.shape:
+        raise ValueError("x_arr and y_arr must have the same shape.")
+
+    valid_mask = np.isfinite(x_arr) & np.isfinite(y_arr) & (x_arr > 0.0) & (y_arr > 0.0)
+    x_valid = x_arr[valid_mask]
+    y_valid = y_arr[valid_mask]
+
+    if len(x_valid) < 3:
+        raise ValueError("integrate_filtered_psd_continuous requires at least 3 positive finite points.")
+
+    sort_idx = np.argsort(x_valid)
+    x_sorted = x_valid[sort_idx]
+    y_sorted = y_valid[sort_idx]
+    x_unique, unique_idx = np.unique(x_sorted, return_index=True)
+    y_unique = y_sorted[unique_idx]
+
+    if len(x_unique) < 3:
+        raise ValueError("integrate_filtered_psd_continuous requires at least 3 unique positive x points.")
+
+    log_x = np.log(x_unique)
+    log_y = np.log(y_unique)
+    order = min(int(spline_order), len(x_unique) - 1)
+    if order < 1:
+        raise ValueError("spline_order must be at least 1 after filtering.")
+
+    log_spline = UnivariateSpline(log_x, log_y, s=0, k=order)
+    x_min = float(x_unique[0])
+    x_max = float(x_unique[-1])
+    if x_min == x_max:
+        return 0.0
+
+    if grid_per_decade <= 0:
+        raise ValueError("grid_per_decade must be positive.")
+
+    step = 1.0 / float(grid_per_decade)
+    log10_min = np.log10(x_min)
+    log10_max = np.log10(x_max)
+    decade_nodes = 10.0 ** np.arange(
+        np.floor(log10_min),
+        np.ceil(log10_max) + step,
+        step,
+    )
+    nodes = np.unique(
+        np.concatenate(
+            (
+                np.array([x_min, x_max]),
+                decade_nodes[(decade_nodes > x_min) & (decade_nodes < x_max)],
+            )
+        )
+    )
+    nodes.sort()
+
+    def integrand(x):
+        psd_value = np.exp(log_spline(np.log(x)))
+        filter_value = z_func(x)
+        return float(np.real(psd_value * filter_value**2))
+
+    integral = 0.0
+    for left, right in zip(nodes[:-1], nodes[1:]):
+        if right <= left:
+            continue
+        segment_integral, _ = quad(
+            integrand,
+            float(left),
+            float(right),
+            epsrel=epsrel,
+            epsabs=epsabs,
+            limit=limit,
+        )
+        integral += segment_integral
+
+    return float(max(integral, 0.0))
 
 def exp_decay(t: np.ndarray, tau: float, A: float = 1, B: float = 0) -> np.ndarray:
     """
