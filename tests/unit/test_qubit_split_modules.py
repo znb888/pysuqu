@@ -8,6 +8,8 @@ from tests.support import install_test_stubs
 
 install_test_stubs()
 
+import qutip as qt
+
 from pysuqu import qubit
 from pysuqu.qubit.base import AbstractQubit, ParameterizedQubit, QubitBase
 from pysuqu.qubit.gate import GateBase, SingleQubitGate
@@ -27,6 +29,9 @@ class FakeHamiltonian:
 
     def eigenstates(self):
         return np.array([0.0]), ['g']
+
+    def full(self):
+        return np.array([[0.0]], dtype=complex)
 
 
 class DummyQubit(QubitBase):
@@ -128,6 +133,79 @@ class QubitSplitModuleTests(unittest.TestCase):
         ):
             evo.hamiltonian_evolution()
 
+    def test_build_time_dependent_hamiltonian_accepts_mapping_channels(self):
+        static_hamiltonian = qt.qeye(2)
+        evo = HamiltonianEvo(static_hamiltonian)
+        drive_ops = {'q0_x': qt.sigmax(), 'q0_z': qt.sigmaz()}
+        drive_funcs = {
+            'q0_x': lambda t, args: args['amp_x'],
+            'q0_z': lambda t, args: args['amp_z'],
+        }
+
+        h_total = evo.build_time_dependent_hamiltonian(
+            drive_operators=drive_ops,
+            drive_funcs=drive_funcs,
+            channel_order=('q0_z', 'q0_x'),
+        )
+
+        np.testing.assert_array_equal(h_total[0].full(), static_hamiltonian.full())
+        self.assertEqual(h_total[1], [drive_ops['q0_z'], drive_funcs['q0_z']])
+        self.assertEqual(h_total[2], [drive_ops['q0_x'], drive_funcs['q0_x']])
+
+    def test_build_time_dependent_hamiltonian_accepts_ordered_sequences(self):
+        evo = HamiltonianEvo(qt.qeye(2))
+        drive_ops = [qt.sigmax(), qt.sigmaz()]
+        drive_funcs = [lambda t, args: 1.0, lambda t, args: -1.0]
+
+        h_total = evo.build_time_dependent_hamiltonian(
+            drive_operators=drive_ops,
+            drive_funcs=drive_funcs,
+        )
+
+        self.assertEqual(h_total[1], [drive_ops[0], drive_funcs[0]])
+        self.assertEqual(h_total[2], [drive_ops[1], drive_funcs[1]])
+
+    def test_build_time_dependent_hamiltonian_rejects_mismatched_channels(self):
+        evo = HamiltonianEvo(qt.qeye(2))
+
+        with self.assertRaisesRegex(ValueError, "same channel names"):
+            evo.build_time_dependent_hamiltonian(
+                drive_operators={'q0_x': qt.sigmax()},
+                drive_funcs={'q0_z': lambda t, args: 0.0},
+            )
+
+        with self.assertRaisesRegex(TypeError, "must both be mappings"):
+            evo.build_time_dependent_hamiltonian(
+                drive_operators={'q0_x': qt.sigmax()},
+                drive_funcs=[lambda t, args: 0.0],
+            )
+
+    def test_solve_time_dependent_hamiltonian_delegates_to_mesolve(self):
+        evo = HamiltonianEvo(qt.qeye(2))
+        initial_state = qt.basis(2, 0)
+        drive_op = qt.sigmax()
+        drive_func = lambda t, args: args['amp']
+        tlist = [0.0, 0.5, 1.0]
+
+        result = evo.solve_time_dependent_hamiltonian(
+            initial_state=initial_state,
+            tlist=tlist,
+            drive_operators=[drive_op],
+            drive_funcs=[drive_func],
+            c_ops=[qt.sigmaz()],
+            e_ops=[qt.sigmax()],
+            options={'store_states': True},
+            args={'amp': 0.25},
+        )
+
+        self.assertEqual(result.times, tlist)
+        self.assertEqual(len(result.states), len(tlist))
+        self.assertEqual(qt._last_mesolve_call['H'][1], [drive_op, drive_func])
+        self.assertIs(qt._last_mesolve_call['rho0'], initial_state)
+        self.assertEqual(qt._last_mesolve_call['tlist'], tlist)
+        self.assertEqual(qt._last_mesolve_call['options'], {'store_states': True})
+        self.assertEqual(qt._last_mesolve_call['args'], {'amp': 0.25})
+
     def test_single_qubit_environment_placeholders_fail_explicitly(self):
         qubit = self._make_single_qubit_base_placeholder()
 
@@ -154,7 +232,8 @@ class QubitSplitModuleTests(unittest.TestCase):
 
         with self.assertRaisesRegex(
             NotImplementedError,
-            r"SingleQubitBase\.get_Readout_parameter\(\) does not implement coupling_mode\['rq'\] == 'induc' yet\.",
+            r"SingleQubitBase\.get_Readout_parameter\(\).*experimental-only qubit surface.*"
+            r"inductive readout-coupling branch is intentionally not advertised as stable\.",
         ):
             qubit.get_Readout_parameter(
                 rq_coupleterm=1e-15,

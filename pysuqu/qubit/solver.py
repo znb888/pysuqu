@@ -1,10 +1,12 @@
 """Solver primitives extracted from the legacy qubit monolith."""
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from copy import copy
-from typing import List, Union
+from typing import Any, Iterable, List, Tuple, Union
 
 import numpy as np
+import qutip as qt
 from qutip import Qobj, expect, ket2dm
 
 from ..funclib import cal_product_state, truncate_precision
@@ -226,6 +228,109 @@ class HamiltonianEvo:
 
     def hamiltonian_evolution(self, *args, **kwargs):
         return _hamiltonian_evo_hamiltonian_evolution(self, *args, **kwargs)
+
+    @staticmethod
+    def _normalize_drive_terms(
+        drive_operators,
+        drive_funcs,
+        channel_order: Union[Iterable[Any], None] = None,
+    ) -> List[Tuple[Any, Qobj, Any]]:
+        """Normalize mapping/list drive payloads into one ordered list of drive terms."""
+        operators_is_mapping = isinstance(drive_operators, Mapping)
+        funcs_is_mapping = isinstance(drive_funcs, Mapping)
+
+        if operators_is_mapping != funcs_is_mapping:
+            raise TypeError(
+                "drive_operators and drive_funcs must both be mappings or both be ordered sequences."
+            )
+
+        if operators_is_mapping:
+            operator_keys = tuple(drive_operators.keys())
+            func_keys = tuple(drive_funcs.keys())
+            resolved_order = tuple(channel_order) if channel_order is not None else func_keys
+
+            if set(operator_keys) != set(func_keys):
+                raise ValueError("drive_operators and drive_funcs must reference the same channel names.")
+            if set(resolved_order) != set(func_keys):
+                raise ValueError("channel_order must contain each drive channel exactly once.")
+
+            return [
+                (channel_name, drive_operators[channel_name], drive_funcs[channel_name])
+                for channel_name in resolved_order
+            ]
+
+        operator_list = list(drive_operators)
+        func_list = list(drive_funcs)
+        if len(operator_list) != len(func_list):
+            raise ValueError("drive_operators and drive_funcs must contain the same number of terms.")
+
+        resolved_order = tuple(channel_order) if channel_order is not None else tuple(range(len(operator_list)))
+        if len(resolved_order) != len(operator_list):
+            raise ValueError("channel_order length must match the number of drive terms.")
+
+        return [
+            (channel_name, operator, func)
+            for channel_name, operator, func in zip(resolved_order, operator_list, func_list)
+        ]
+
+    def build_time_dependent_hamiltonian(
+        self,
+        drive_operators,
+        drive_funcs,
+        channel_order: Union[Iterable[Any], None] = None,
+        static_hamiltonian: Union[Qobj, None] = None,
+    ) -> list:
+        """
+        Assemble a QuTiP time-dependent Hamiltonian payload from multiple drive terms.
+
+        Both mapping-style inputs (``{'q0_x': Hx0, ...}``) and ordered sequences are supported.
+        """
+        base_hamiltonian = self.get_hamiltonian() if static_hamiltonian is None else static_hamiltonian
+        if not isinstance(base_hamiltonian, Qobj):
+            raise TypeError("static_hamiltonian must be a qutip.Qobj instance.")
+
+        h_total = [base_hamiltonian]
+        for channel_name, operator, func in self._normalize_drive_terms(
+            drive_operators,
+            drive_funcs,
+            channel_order=channel_order,
+        ):
+            if not isinstance(operator, Qobj):
+                raise TypeError(f"drive operator {channel_name!r} must be a qutip.Qobj instance.")
+            if not callable(func):
+                raise TypeError(f"drive function {channel_name!r} must be callable.")
+            h_total.append([operator, func])
+        return h_total
+
+    def solve_time_dependent_hamiltonian(
+        self,
+        initial_state: Qobj,
+        tlist,
+        drive_operators,
+        drive_funcs,
+        channel_order: Union[Iterable[Any], None] = None,
+        c_ops: Union[List[Any], None] = None,
+        e_ops: Union[List[Any], None] = None,
+        options: Union[dict, None] = None,
+        args: Union[dict, None] = None,
+        static_hamiltonian: Union[Qobj, None] = None,
+    ):
+        """Convenience wrapper around ``qutip.mesolve`` for multi-drive Hamiltonians."""
+        h_total = self.build_time_dependent_hamiltonian(
+            drive_operators=drive_operators,
+            drive_funcs=drive_funcs,
+            channel_order=channel_order,
+            static_hamiltonian=static_hamiltonian,
+        )
+        return qt.mesolve(
+            h_total,
+            initial_state,
+            tlist,
+            c_ops=c_ops or [],
+            e_ops=e_ops or [],
+            options=options or {},
+            args=args or {},
+        )
 
     def find_state(
         self,
