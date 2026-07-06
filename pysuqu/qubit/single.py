@@ -130,7 +130,8 @@ class SingleQubitBase(ParameterizedQubit):
         coupl_capac: the coupling capacitance between qubit and drive line. 
         '''
         C_strength = coupl_capac*drive_voltage*(8*self.Ej[0,0]*self.Ec[0,0]**3)**(1/4)/e
-        T1_c = self._capac/((self.f01*1e9*2*pi)**2*coupl_capac**2*RLINE)
+        freq = self.f01*1e9*2*pi
+        T1_c = self._capacitive_drive_t1(freq, self._effective_mode_capacitance(), coupl_capac)
         
         print(f'Qubit freq: {self.f01} GHz')
         print(f'Capac_coupling drive_strength: {C_strength*1e3} MHz')
@@ -150,7 +151,8 @@ class SingleQubitBase(ParameterizedQubit):
         '''
         current = drive_voltage/RLINE
         I_strength = 2*pi*coupl_induc*current*(2*self.Ec[0,0]*self.Ej[0,0]**3)**(1/4)/Phi0
-        T1_i = RLINE/((self.f01*1e9*2*pi)**4*coupl_induc**2*self._capac)
+        freq = self.f01*1e9*2*pi
+        T1_i = self._inductive_drive_t1(freq, self._effective_mode_capacitance(), coupl_induc)
         
         print(f'Qubit freq: {self.f01} GHz')
         print(f'Induc_coupling drive_strength: {I_strength*1e3} MHz')
@@ -193,17 +195,46 @@ class SingleQubitBase(ParameterizedQubit):
             C_strength = coupl_term[0]*voltage_amp*(8*self.Ej[0,0]*self.Ec[0,0]**3)**(1/4)/e*1e3
             print(f'Capac_coupling drive_strength: {C_strength} MHz\nInduc_coupling drive_strength: {I_strength} MHz')
             return [C_strength, I_strength]
+
+    def _effective_mode_capacitance(self) -> float:
+        """Return the scalar mode capacitance implied by the current Ec value."""
+        ec = float(np.asarray(self.Ec)[0, 0])
+        if not np.isfinite(ec) or ec <= 0:
+            raise ValueError("Ec[0, 0] must be a positive finite value to calculate drive-line T1.")
+        return e**2 / (2 * hbar * 1e9 * ec)
+
+    @staticmethod
+    def _capacitive_drive_t1(freq: float, mode_capacitance: float, coupl_capac: Optional[float]) -> float:
+        if coupl_capac is None or coupl_capac == 0:
+            return np.inf
+        correction = 1 + (freq * coupl_capac * RLINE) ** 2
+        return mode_capacitance * correction / (freq**2 * coupl_capac**2 * RLINE)
+
+    @staticmethod
+    def _inductive_drive_t1(freq: float, mode_capacitance: float, coupl_induc: Optional[float]) -> float:
+        if coupl_induc is None or coupl_induc == 0:
+            return np.inf
+        return RLINE / (freq**4 * coupl_induc**2 * mode_capacitance)
     
     def drive_loss(
         self, 
-        capa_drive: float, 
-        indu_drive:float
+        capa_drive: Optional[float],
+        indu_drive: Optional[float]
     ):
+        '''
+        Estimate drive-line-limited T1 using a weakly loaded LC-mode model.
+
+        Input unit: SI, output T1 values are seconds. 0 or None disables a
+        channel. The capacitive branch keeps the exact real admittance of a
+        series coupling capacitance followed by a 50 Ohm line.
+        '''
         freq = self.f01*1e9*2*pi
-        T1_c = self._capac/(freq**2*capa_drive**2*RLINE)
-        T1_i = RLINE/(freq**4*indu_drive**2*self._capac)
+        mode_capacitance = self._effective_mode_capacitance()
+        T1_c = self._capacitive_drive_t1(freq, mode_capacitance, capa_drive)
+        T1_i = self._inductive_drive_t1(freq, mode_capacitance, indu_drive)
         
-        T1_drive = 1/(1/T1_i+1/T1_c)
+        rate_drive = 1/T1_i+1/T1_c
+        T1_drive = 1/rate_drive if rate_drive > 0 else np.inf
         
         print(f'Qubit freq: {freq/1e9/2/pi} GHz\nT1 suppressed by drive_induc_coupling: {T1_i*1e6} us\nT1 suppressed by drive_capac_coupling: {T1_c*1e6} us\nT1 induced by drive_line: {T1_drive*1e6} us')
         

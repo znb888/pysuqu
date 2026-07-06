@@ -489,6 +489,30 @@ class SingleQubitGate(GateBase):
         left, _, right_dag = np.linalg.svd(matrix)
         return left @ right_dag
 
+    @staticmethod
+    def _clip_fidelity_value(value: float, atol: float = 1e-12) -> Tuple[float, bool]:
+        """Clip a fidelity-like scalar to [0, 1] and report nontrivial clipping."""
+        raw_value = float(np.real(value))
+        clipped_value = min(max(raw_value, 0.0), 1.0)
+        was_clipped = raw_value < -atol or raw_value > 1.0 + atol
+        return clipped_value, was_clipped
+
+    @staticmethod
+    def _ensure_target_has_no_noncomputational_support(
+        total_probability: float,
+        projected_probability: float,
+        *,
+        atol: float = 1e-10,
+    ) -> None:
+        """Reject target states that carry intended population outside |0>, |1>."""
+        outside_probability = float(np.real(total_probability - projected_probability))
+        if outside_probability > atol:
+            raise ValueError(
+                "target_state contains non-computational population "
+                f"({outside_probability:.3e}). The fidelity target must live entirely "
+                "inside the |0>, |1> computational subspace."
+            )
+
     def _summarize_fidelity_metrics(
         self,
         *,
@@ -578,6 +602,12 @@ class SingleQubitGate(GateBase):
                 ],
                 dtype=complex,
             )
+            total_probability = float(np.real(_as_complex_scalar(target_state.dag() * target_state)))
+            projected_probability = float(np.real(np.vdot(coeffs, coeffs)))
+            self._ensure_target_has_no_noncomputational_support(
+                total_probability,
+                projected_probability,
+            )
             norm = np.linalg.norm(coeffs)
             if norm <= 0:
                 raise ValueError("target_state has no support in the computational eigenstate subspace.")
@@ -597,6 +627,8 @@ class SingleQubitGate(GateBase):
                 self._computational_basis_states(),
             )
             trace_val = np.trace(projected)
+            full_trace = np.trace(target_state.full())
+            self._ensure_target_has_no_noncomputational_support(full_trace, trace_val)
             if abs(trace_val) <= 0:
                 raise ValueError("target_state density has no support in the computational eigenstate subspace.")
             return qt.Qobj(projected / trace_val)

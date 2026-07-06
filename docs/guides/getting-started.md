@@ -118,7 +118,7 @@ old private notebook set is still excluded.
 
 - [../../demo/README.md](../../demo/README.md) for the public notebook index
 - [../../demo/demo_01_single_qubit_basics.ipynb](../../demo/demo_01_single_qubit_basics.ipynb)
-- [../../demo/demo_02_decoherence_with_synthetic_noise.ipynb](../../demo/demo_02_decoherence_with_synthetic_noise.ipynb)
+- [../../demo/demo_02_decoherence.ipynb](../../demo/demo_02_decoherence.ipynb)
 - [../../demo/demo_03_waveform_and_gate_basics.ipynb](../../demo/demo_03_waveform_and_gate_basics.ipynb)
 - [../../demo/demo_04_dynamic_simulation.ipynb](../../demo/demo_04_dynamic_simulation.ipynb)
 
