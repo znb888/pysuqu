@@ -2,7 +2,6 @@
 
 from .analysis import SingleQubitSpectrum, analyze_single_qubit_spectrum
 from .base import AbstractQubit, ParameterizedQubit, Phi0, pi
-from .experimental import QubitFeatureBoundaryError
 from .gate import (
     ChannelSchedule,
     EnvelopeParams,
@@ -32,7 +31,6 @@ __all__ = [
     'ParameterizedQubit',
     'Phi0',
     'PulseEvent',
-    'QubitFeatureBoundaryError',
     'QCRFGRModel',
     'SingleQubitGate',
     'SingleQubitBase',
