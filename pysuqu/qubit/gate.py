@@ -398,6 +398,56 @@ class SingleQubitGate(GateBase):
         )
         return result
 
+    def run_trace_simulation(
+        self,
+        trace,
+        initial_state_input: Union[int, List[complex]] = 0,
+        *,
+        couple_term: float = 0.5e-12,
+        couple_type: Literal['induc', 'capac'] = 'induc',
+        options: Optional[Dict[str, Any]] = None,
+        args: Optional[Dict[str, Any]] = None,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
+    ) -> qt.Result:
+        """
+        Evolve the qubit directly under one solver-facing waveform trace.
+
+        ``trace`` is duck-typed and must provide ``t_axis``, ``values``, and
+        ``domain``. ``rf_real`` traces are interpolated directly; ``iq_complex``
+        traces are analytically mixed to RF using ``trace.lo_freq``.
+        """
+        trace_domain = getattr(trace, 'domain', None)
+        if trace_domain not in {'rf_real', 'iq_complex'}:
+            raise ValueError(
+                "run_trace_simulation expects an rf_real or iq_complex trace. "
+                "Use a trace with t_axis, values, domain, and optional lo_freq first."
+            )
+
+        psi0 = self._parse_initial_state(initial_state_input)
+        H_static = self.qubit.get_hamiltonian()
+        H_drive = self.get_drive_hamiltonian(
+            couple_term=couple_term,
+            couple_type=couple_type,
+            induc_phi_model=induc_phi_model,
+        )
+        if trace_domain == 'iq_complex':
+            drive_func = self.awg.trace_to_qutip_rf_func(trace)
+        else:
+            drive_func = self.awg.trace_to_qutip_func(trace)
+        c_ops = self._get_c_ops()
+        resolved_options = self._default_solver_options(options)
+        resolved_args = self._default_solver_args(args)
+
+        return qt.mesolve(
+            [H_static, [H_drive, drive_func]],
+            psi0,
+            np.asarray(trace.t_axis, dtype=np.float64),
+            c_ops=c_ops,
+            e_ops=[],
+            options=resolved_options,
+            args=resolved_args,
+        )
+
     def plot_bloch_evolution(self, result: qt.Result, rotation_omega: float) -> None:
         """
         Plot state evolution on Bloch sphere in Rotating Frame.
@@ -751,6 +801,149 @@ class SingleQubitGate(GateBase):
             "basis_results": results,
         }
 
+    def _extract_trace_unitary_payload(
+        self,
+        trace,
+        *,
+        couple_term: float = 0.5e-12,
+        couple_type: Literal['induc', 'capac'] = 'induc',
+        frame: Literal['rotating', 'lab'] = 'rotating',
+        options: Optional[Dict[str, Any]] = None,
+        args: Optional[Dict[str, Any]] = None,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
+        unitarize: bool = False,
+        make_su2: bool = False,
+    ) -> Dict[str, Any]:
+        """Extract a projected 2x2 process matrix from one solver-facing waveform trace."""
+        if frame not in {'rotating', 'lab'}:
+            raise ValueError("frame must be either 'rotating' or 'lab'.")
+
+        basis_inputs = ([1.0, 0.0], [0.0, 1.0])
+        basis_states = self._computational_basis_states()
+        columns = []
+        leakages = []
+        results = []
+
+        for initial_state_input in basis_inputs:
+            result = self.run_trace_simulation(
+                trace,
+                initial_state_input=initial_state_input,
+                couple_term=couple_term,
+                couple_type=couple_type,
+                options=options,
+                args=args,
+                induc_phi_model=induc_phi_model,
+            )
+            results.append(result)
+            coeffs = self._project_ket_to_qubit_coefficients(result.states[-1], basis_states)
+            columns.append(coeffs)
+            subspace_probability = float(np.real(np.vdot(coeffs, coeffs)))
+            leakages.append(max(0.0, 1.0 - subspace_probability))
+
+        raw_matrix = np.column_stack(columns)
+        t_final = results[0].times[-1] if results else np.asarray(trace.t_axis, dtype=np.float64)[-1]
+        if frame == 'rotating':
+            phase_factor = 2 * pi * self.qubit.qubit_f01 * t_final
+            raw_matrix = np.diag([1.0, np.exp(1j * phase_factor)]) @ raw_matrix
+
+        unitary_matrix = raw_matrix
+        if unitarize:
+            unitary_matrix = self._nearest_unitary(unitary_matrix)
+        if make_su2:
+            unitary_matrix = self._strip_global_phase(unitary_matrix)
+
+        raw_unitary = qt.Qobj(raw_matrix, dims=[[2], [2]])
+        unitary = qt.Qobj(unitary_matrix, dims=[[2], [2]])
+        identity = np.eye(2, dtype=complex)
+        gram = raw_matrix.conj().T @ raw_matrix
+        survival_probability = float(np.real(np.trace(gram)) / 2.0)
+        unitarity_error = float(np.linalg.norm(gram - identity))
+
+        return {
+            "unitary": unitary,
+            "raw_unitary": raw_unitary,
+            "leakage_by_basis": leakages,
+            "average_leakage": float(np.mean(leakages)),
+            "survival_probability": survival_probability,
+            "unitarity_error": unitarity_error,
+            "frame": frame,
+            "basis_results": results,
+        }
+
+    def _score_unitary_fidelity(
+        self,
+        *,
+        actual_unitary: qt.Qobj,
+        raw_unitary: qt.Qobj,
+        target_unitary: Union[qt.Qobj, np.ndarray, List[List[complex]], None],
+        payload: Optional[Dict[str, Any]],
+        frame: Literal['rotating', 'lab'],
+        make_su2: bool,
+        is_print: bool,
+    ) -> Dict[str, Any]:
+        """Score one effective 2x2 process matrix against a target unitary."""
+        target = self._resolve_target_qubit_unitary(target_unitary, make_su2=make_su2)
+        actual_matrix = np.asarray(actual_unitary.full(), dtype=complex)
+        target_matrix = np.asarray(target.full(), dtype=complex)
+
+        d = target_matrix.shape[0]
+        overlap_operator = target_matrix.conj().T @ actual_matrix
+        trace_overlap = np.trace(overlap_operator)
+        trace_norm = float(np.real(np.trace(overlap_operator.conj().T @ overlap_operator)))
+        raw_process_fidelity = float(abs(trace_overlap) ** 2 / (d ** 2))
+        raw_average_gate_fidelity = float(
+            (trace_norm + abs(trace_overlap) ** 2) / (d * (d + 1))
+        )
+
+        process_fidelity, process_fidelity_clipped = self._clip_fidelity_value(raw_process_fidelity)
+        average_gate_fidelity, average_gate_fidelity_clipped = self._clip_fidelity_value(
+            raw_average_gate_fidelity
+        )
+
+        raw_matrix = np.asarray(raw_unitary.full(), dtype=complex)
+        gram = raw_matrix.conj().T @ raw_matrix
+        average_leakage = (
+            payload["average_leakage"]
+            if payload is not None
+            else max(0.0, 1.0 - float(np.real(np.trace(gram)) / d))
+        )
+        unitarity_error = (
+            payload["unitarity_error"]
+            if payload is not None
+            else float(np.linalg.norm(gram - np.eye(d, dtype=complex)))
+        )
+
+        if is_print:
+            clip_note = (
+                ", clipped"
+                if process_fidelity_clipped or average_gate_fidelity_clipped
+                else ""
+            )
+            print(
+                f"Favg: {average_gate_fidelity*100:.5f}%, "
+                f"Fpro: {process_fidelity*100:.5f}%, "
+                f"Leak: {average_leakage:.5e}, "
+                f"UnitaryErr: {unitarity_error:.5e}"
+                f"{clip_note}"
+            )
+
+        return {
+            "fidelity": average_gate_fidelity,
+            "average_gate_fidelity": average_gate_fidelity,
+            "process_fidelity": process_fidelity,
+            "raw_average_gate_fidelity": raw_average_gate_fidelity,
+            "raw_process_fidelity": raw_process_fidelity,
+            "average_gate_fidelity_clipped": average_gate_fidelity_clipped,
+            "process_fidelity_clipped": process_fidelity_clipped,
+            "trace_overlap": trace_overlap,
+            "average_leakage": average_leakage,
+            "unitarity_error": unitarity_error,
+            "unitary": actual_unitary,
+            "raw_unitary": raw_unitary,
+            "target_unitary": target,
+            "frame": frame,
+        }
+
     def extract_evolution_unitary(
         self,
         channel: ChannelSchedule = None,
@@ -785,6 +978,39 @@ class SingleQubitGate(GateBase):
         )
         return payload["unitary"]
 
+    def extract_trace_unitary(
+        self,
+        trace,
+        *,
+        couple_term: float = 0.5e-12,
+        couple_type: Literal['induc', 'capac'] = 'induc',
+        frame: Literal['rotating', 'lab'] = 'rotating',
+        options: Optional[Dict[str, Any]] = None,
+        args: Optional[Dict[str, Any]] = None,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
+        unitarize: bool = False,
+        make_su2: bool = False,
+    ) -> qt.Qobj:
+        """
+        Extract the 2x2 computational-subspace process matrix from a drive trace.
+
+        ``trace`` is a sampled solver-facing waveform, not a matrix trace. This is the trace
+        analogue of ``extract_evolution_unitary(...)`` for workflows that already synthesized
+        the qubit-plane drive outside ``ChannelSchedule``.
+        """
+        payload = self._extract_trace_unitary_payload(
+            trace,
+            couple_term=couple_term,
+            couple_type=couple_type,
+            frame=frame,
+            options=options,
+            args=args,
+            induc_phi_model=induc_phi_model,
+            unitarize=unitarize,
+            make_su2=make_su2,
+        )
+        return payload["unitary"]
+
     def calculate_unitary_fidelity(
         self,
         target_unitary: Union[qt.Qobj, np.ndarray, List[List[complex]], None] = None,
@@ -802,11 +1028,31 @@ class SingleQubitGate(GateBase):
         is_print: bool = True,
     ) -> Dict[str, Any]:
         """
-        Compare the extracted computational-subspace U matrix with a target unitary.
+        Compute gate-level fidelity against a target unitary in the 2D computational subspace.
 
-        Returns both the process overlap ``|Tr(U_target^dag U_actual)|^2 / d^2`` and the
-        average gate fidelity. When ``unitarize=False`` the projected matrix keeps leakage loss,
-        so the reported average gate fidelity is leakage-aware through ``Tr(A^dag A)``.
+        If ``process_unitary`` is not supplied, the method propagates the computational basis
+        states ``|0>`` and ``|1>`` without collapse operators, projects both final kets back
+        onto the computational eigenstate subspace, and assembles the resulting columns into
+        an effective 2x2 process matrix ``A``. The default ``frame='rotating'`` removes the
+        idle ``|1>`` precession before comparison.
+
+        The reported ``process_fidelity`` is ``|Tr(U_target^dag A)|^2 / d^2`` and
+        ``average_gate_fidelity`` is ``(Tr(A^dag A) + |Tr(U_target^dag A)|^2) / (d(d+1))``.
+        With the default ``unitarize=False``, leakage remains as loss of norm in ``A`` and
+        lowers the fidelity. Setting ``unitarize=True`` replaces ``A`` by its nearest unitary,
+        which is useful for coherent-error diagnostics but no longer includes amplitude loss
+        in the fidelity value.
+
+        If ``process_unitary`` is supplied by the caller, it is assumed to already be the
+        intended 2x2 effective process matrix. In that path ``average_leakage`` is inferred
+        from ``Tr(A^dag A)`` only, so externally computed leakage should be tracked by the
+        caller if the supplied matrix has already been normalized or unitarized.
+
+        The compatibility fields ``process_fidelity`` and ``average_gate_fidelity`` are clipped
+        into ``[0, 1]``. The unclipped values are also returned as
+        ``raw_process_fidelity`` and ``raw_average_gate_fidelity``; clipping usually indicates
+        a non-physical effective matrix, gain in the supplied process matrix, or numerical
+        error that should be checked together with ``unitarity_error``.
         """
         payload = None
         if process_unitary is None:
@@ -837,53 +1083,80 @@ class SingleQubitGate(GateBase):
             actual_unitary = qt.Qobj(actual_matrix, dims=[[2], [2]])
             raw_unitary = actual_unitary
 
-        target = self._resolve_target_qubit_unitary(target_unitary, make_su2=make_su2)
-        actual_matrix = np.asarray(actual_unitary.full(), dtype=complex)
-        target_matrix = np.asarray(target.full(), dtype=complex)
-
-        d = target_matrix.shape[0]
-        overlap_operator = target_matrix.conj().T @ actual_matrix
-        trace_overlap = np.trace(overlap_operator)
-        trace_norm = float(np.real(np.trace(overlap_operator.conj().T @ overlap_operator)))
-        process_fidelity = float(abs(trace_overlap) ** 2 / (d ** 2))
-        average_gate_fidelity = float((trace_norm + abs(trace_overlap) ** 2) / (d * (d + 1)))
-
-        process_fidelity = min(max(process_fidelity, 0.0), 1.0)
-        average_gate_fidelity = min(max(average_gate_fidelity, 0.0), 1.0)
-
-        raw_matrix = np.asarray(raw_unitary.full(), dtype=complex)
-        gram = raw_matrix.conj().T @ raw_matrix
-        average_leakage = (
-            payload["average_leakage"]
-            if payload is not None
-            else max(0.0, 1.0 - float(np.real(np.trace(gram)) / d))
-        )
-        unitarity_error = (
-            payload["unitarity_error"]
-            if payload is not None
-            else float(np.linalg.norm(gram - np.eye(d, dtype=complex)))
+        return self._score_unitary_fidelity(
+            actual_unitary=actual_unitary,
+            raw_unitary=raw_unitary,
+            target_unitary=target_unitary,
+            payload=payload,
+            frame=frame,
+            make_su2=make_su2,
+            is_print=is_print,
         )
 
-        if is_print:
-            print(
-                f"Favg: {average_gate_fidelity*100:.5f}%, "
-                f"Fpro: {process_fidelity*100:.5f}%, "
-                f"Leak: {average_leakage:.5e}, "
-                f"UnitaryErr: {unitarity_error:.5e}"
+    def calculate_trace_unitary_fidelity(
+        self,
+        trace,
+        target_unitary: Union[qt.Qobj, np.ndarray, List[List[complex]], None] = None,
+        *,
+        process_unitary: Union[qt.Qobj, np.ndarray, List[List[complex]], None] = None,
+        couple_term: float = 0.5e-12,
+        couple_type: Literal['induc', 'capac'] = 'induc',
+        frame: Literal['rotating', 'lab'] = 'rotating',
+        options: Optional[Dict[str, Any]] = None,
+        args: Optional[Dict[str, Any]] = None,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
+        unitarize: bool = False,
+        make_su2: bool = False,
+        is_print: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Compute gate-level unitary fidelity for one already-synthesized drive trace.
+
+        ``trace`` is a sampled waveform time trace, not a matrix trace. When
+        ``process_unitary`` is not supplied, the method propagates ``|0>`` and ``|1>`` through
+        ``run_trace_simulation(...)``, projects both final kets into the computational
+        subspace, and compares the resulting effective 2x2 process matrix with
+        ``target_unitary``. Like ``calculate_unitary_fidelity(...)``, this path is coherent
+        and does not include collapse operators in the extracted process matrix.
+        """
+        payload = None
+        if process_unitary is None:
+            payload = self._extract_trace_unitary_payload(
+                trace,
+                couple_term=couple_term,
+                couple_type=couple_type,
+                frame=frame,
+                options=options,
+                args=args,
+                induc_phi_model=induc_phi_model,
+                unitarize=unitarize,
+                make_su2=make_su2,
             )
+            actual_unitary = payload["unitary"]
+            raw_unitary = payload["raw_unitary"]
+        else:
+            actual_matrix = np.asarray(
+                process_unitary.full() if isinstance(process_unitary, qt.Qobj) else process_unitary,
+                dtype=complex,
+            )
+            if actual_matrix.shape != (2, 2):
+                raise ValueError("process_unitary must have shape (2, 2).")
+            if unitarize:
+                actual_matrix = self._nearest_unitary(actual_matrix)
+            if make_su2:
+                actual_matrix = self._strip_global_phase(actual_matrix)
+            actual_unitary = qt.Qobj(actual_matrix, dims=[[2], [2]])
+            raw_unitary = actual_unitary
 
-        return {
-            "fidelity": average_gate_fidelity,
-            "average_gate_fidelity": average_gate_fidelity,
-            "process_fidelity": process_fidelity,
-            "trace_overlap": trace_overlap,
-            "average_leakage": average_leakage,
-            "unitarity_error": unitarity_error,
-            "unitary": actual_unitary,
-            "raw_unitary": raw_unitary,
-            "target_unitary": target,
-            "frame": frame,
-        }
+        return self._score_unitary_fidelity(
+            actual_unitary=actual_unitary,
+            raw_unitary=raw_unitary,
+            target_unitary=target_unitary,
+            payload=payload,
+            frame=frame,
+            make_su2=make_su2,
+            is_print=is_print,
+        )
 
     def calculate_fidelity(
         self, 
@@ -897,12 +1170,20 @@ class SingleQubitGate(GateBase):
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
     ) -> Dict[str, float]:
         """
-        Compute State Fidelity (prob), Leakage, and Phase Error.
-        
-        Args:
-            target_state: Ideal 2D qubit state (e.g., basis(2,1)).
-        Returns:
-            Dictionary containing metrics.
+        Compute single-input-state fidelity, leakage, and phase error for one schedule.
+
+        This is a state-transfer metric, not a full gate fidelity. The method evolves one
+        ``initial_state_input`` through ``run_simulation(...)`` using the provided
+        ``ChannelSchedule`` and any decoherence previously loaded through
+        ``load_decoherence(...)``. The final state is projected onto the computational
+        eigenstate subspace, rotated into the default qubit rotating frame, and compared with
+        ``target_state``.
+
+        The projected final state is not renormalized by ``pop0 + pop1``. Therefore leakage
+        out of the computational subspace lowers the returned ``fidelity`` and is also
+        reported separately as ``leakage``. A full-space ``target_state`` is accepted only
+        when it has no population outside the computational subspace; otherwise a
+        ``ValueError`` is raised instead of silently discarding target leakage.
         """
         if channel is None:
             if self.pulse_channel is None:

@@ -846,6 +846,60 @@ class WaveformGenerator:
 
         return qutip_drive_func
 
+    @staticmethod
+    def _trace_to_qutip_func(trace) -> Callable:
+        """Convert one sampled trace into a QuTiP-compatible interpolation function."""
+        t_axis = np.asarray(trace.t_axis, dtype=np.float64)
+        values = np.asarray(trace.values)
+
+        if np.iscomplexobj(values):
+            real_values = np.asarray(np.real(values), dtype=np.float64)
+            imag_values = np.asarray(np.imag(values), dtype=np.float64)
+
+            def qutip_drive_func(t: float, args=None):
+                i_val = np.interp(t, t_axis, real_values, left=0.0, right=0.0)
+                q_val = np.interp(t, t_axis, imag_values, left=0.0, right=0.0)
+                return i_val + 1j * q_val
+
+            return qutip_drive_func
+
+        real_values = np.asarray(values, dtype=np.float64)
+
+        def qutip_drive_func(t: float, args=None):
+            return np.interp(t, t_axis, real_values, left=0.0, right=0.0)
+
+        return qutip_drive_func
+
+    def trace_to_qutip_func(self, trace) -> Callable:
+        """Public wrapper for converting one sampled trace into a QuTiP drive callable."""
+        return self._trace_to_qutip_func(trace)
+
+    def trace_to_qutip_rf_func(self, trace) -> Callable:
+        """
+        Convert a qubit/AWG trace into a real RF QuTiP callback.
+
+        ``rf_real`` traces are interpolated directly. ``iq_complex`` traces are
+        interpolated as envelopes and multiplied by the LO carrier at the solver
+        query time, which keeps the carrier continuous even when the AWG grid is
+        below the RF Nyquist rate.
+        """
+        if getattr(trace, 'domain', None) != 'iq_complex':
+            return self._trace_to_qutip_func(trace)
+
+        t_axis = np.asarray(trace.t_axis, dtype=np.float64)
+        values = np.asarray(trace.values, dtype=np.complex128)
+        real_values = np.asarray(np.real(values), dtype=np.float64)
+        imag_values = np.asarray(np.imag(values), dtype=np.float64)
+        lo_freq = float(getattr(trace, 'lo_freq', 0.0))
+
+        def qutip_drive_func(t: float, args=None):
+            i_val = np.interp(t, t_axis, real_values, left=0.0, right=0.0)
+            q_val = np.interp(t, t_axis, imag_values, left=0.0, right=0.0)
+            carrier_phase = 2 * np.pi * lo_freq * t
+            return i_val * np.cos(carrier_phase) - q_val * np.sin(carrier_phase)
+
+        return qutip_drive_func
+
 
 class WaveformDerivatives:
     """

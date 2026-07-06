@@ -8,6 +8,7 @@ install_test_stubs()
 import numpy as np
 import qutip as qt
 
+from pysuqu.funclib.awgenerator import WaveformGenerator
 from pysuqu.qubit.gate import SingleQubitGate
 
 
@@ -35,9 +36,12 @@ class GateFidelityProjectionTests(unittest.TestCase):
         gate = SingleQubitGate.__new__(SingleQubitGate)
         gate.qubit = _FakeQubit()
         gate.pulse_channel = object()
+        trace_awg = WaveformGenerator.__new__(WaveformGenerator)
         gate.awg = SimpleNamespace(
             t_axis=np.array([0.0, 1.0]),
             get_qutip_func=lambda channel: (lambda t, args=None: 0.0),
+            trace_to_qutip_func=trace_awg.trace_to_qutip_func,
+            trace_to_qutip_rf_func=trace_awg.trace_to_qutip_rf_func,
         )
         gate.get_drive_hamiltonian = lambda **kwargs: gate.qubit.drive
         return gate
@@ -56,6 +60,17 @@ class GateFidelityProjectionTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["fidelity"], 1.0, places=9)
         self.assertAlmostEqual(metrics["leakage"], 0.0, places=9)
         self.assertEqual(metrics["final_state_rot"].shape, (2, 2))
+
+    def test_summarize_fidelity_rejects_target_population_outside_computational_space(self):
+        gate = self._make_gate()
+        result = qt.Result(states=[gate.qubit.get_eigenstate(0)], times=[0.0])
+
+        with self.assertRaisesRegex(ValueError, "non-computational population"):
+            gate._summarize_fidelity_metrics(
+                result=result,
+                target_state=qt.basis(3, 2),
+                is_print=False,
+            )
 
     def test_summarize_fidelity_accepts_two_level_target_states(self):
         gate = self._make_gate()
@@ -105,6 +120,23 @@ class GateFidelityProjectionTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["average_leakage"], 0.0, places=9)
         self.assertEqual(metrics["unitary"].shape, (2, 2))
 
+    def test_calculate_unitary_fidelity_reports_raw_clipping_for_gain_matrix(self):
+        gate = self._make_gate()
+        gain_identity = 1.1 * np.eye(2, dtype=complex)
+
+        metrics = gate.calculate_unitary_fidelity(
+            target_unitary=np.eye(2),
+            process_unitary=gain_identity,
+            is_print=False,
+        )
+
+        self.assertAlmostEqual(metrics["process_fidelity"], 1.0, places=9)
+        self.assertAlmostEqual(metrics["average_gate_fidelity"], 1.0, places=9)
+        self.assertGreater(metrics["raw_process_fidelity"], 1.0)
+        self.assertGreater(metrics["raw_average_gate_fidelity"], 1.0)
+        self.assertTrue(metrics["process_fidelity_clipped"])
+        self.assertTrue(metrics["average_gate_fidelity_clipped"])
+
     def test_calculate_unitary_fidelity_reports_projection_loss_for_non_unitary_process(self):
         gate = self._make_gate()
         lossy_identity = np.sqrt(0.75) * np.eye(2, dtype=complex)
@@ -126,6 +158,25 @@ class GateFidelityProjectionTests(unittest.TestCase):
         unitary = gate.extract_evolution_unitary()
 
         np.testing.assert_allclose(unitary.full(), np.eye(2), atol=1e-12)
+
+    def test_calculate_trace_unitary_fidelity_projects_two_basis_trace_evolutions(self):
+        gate = self._make_gate()
+        trace = SimpleNamespace(
+            t_axis=np.array([0.0, 1.0]),
+            values=np.array([0.0, 0.0]),
+            domain="rf_real",
+            lo_freq=0.0,
+        )
+
+        metrics = gate.calculate_trace_unitary_fidelity(
+            trace,
+            target_unitary=np.eye(2),
+            is_print=False,
+        )
+
+        self.assertAlmostEqual(metrics["process_fidelity"], 1.0, places=9)
+        self.assertAlmostEqual(metrics["average_gate_fidelity"], 1.0, places=9)
+        np.testing.assert_allclose(metrics["unitary"].full(), np.eye(2), atol=1e-12)
 
     def test_resolve_target_unitary_rejects_non_unitary_matrix(self):
         gate = self._make_gate()
