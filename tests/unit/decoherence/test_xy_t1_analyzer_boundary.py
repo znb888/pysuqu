@@ -13,7 +13,8 @@ from pysuqu.decoherence.analysis import XYRelaxationAnalyzer
 from pysuqu.decoherence.dequbit import XYNoiseDecoherence
 from pysuqu.decoherence.electronics import T2Sii_Double
 from pysuqu.decoherence.results import XYCurrentVoltageResult
-from pysuqu.qubit.base import Phi0
+from pysuqu.qubit.base import Phi0, e
+from pysuqu.qubit.circuit import estimate_drive_line_t1_ns
 
 
 class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
@@ -47,10 +48,15 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
             qubit_freq=qubit_freq,
             Ej=ej,
             Ec=ec,
+            include_drive_loss=False,
         )
 
         self.assertAlmostEqual(actual['gamma_up'], expected_gamma_up)
+        self.assertAlmostEqual(actual['gamma_down_noise'], expected_gamma_down)
+        self.assertEqual(actual['gamma_drive'], 0.0)
         self.assertAlmostEqual(actual['gamma_down'], expected_gamma_down)
+        self.assertAlmostEqual(actual['t1_noise'], expected_t1)
+        self.assertTrue(np.isinf(actual['t1_drive']))
         self.assertAlmostEqual(actual['t1'], expected_t1)
 
         expected_gamma_down_actual = 1 / (37.0 * 1e-6)
@@ -90,12 +96,101 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
             ),
         )
 
+    def test_xy_relaxation_analyzer_adds_drive_line_loss_by_default(self):
+        analyzer = XYRelaxationAnalyzer(couple_term=0.65e-12)
+        noise_output = SimpleNamespace(white_noise_temperature=0.035)
+        qubit_freq = 5.2e9
+        ej = 13.5
+        ec = 0.28
+
+        expected_sxy_po = T2Sii_Double(noise_output.white_noise_temperature, f=qubit_freq)
+        expected_sxy_ne = T2Sii_Double(noise_output.white_noise_temperature, f=-qubit_freq)
+        expected_b = 2e9 * np.pi * analyzer.couple_term * ej * (2 * ec / ej) ** 0.25 / Phi0
+        expected_gamma_up = expected_sxy_ne * expected_b**2
+        expected_gamma_down_noise = expected_sxy_po * expected_b**2
+        expected_t1_noise = 1 / (expected_gamma_up + expected_gamma_down_noise)
+        expected_t1_drive = (
+            estimate_drive_line_t1_ns(
+                qubit_frequency_ghz=qubit_freq / 1e9,
+                couple_term=analyzer.couple_term,
+                couple_type="induc",
+                ec=ec,
+            )
+            * 1e-9
+        )
+        expected_gamma_drive = 1 / expected_t1_drive
+        expected_gamma_down = expected_gamma_down_noise + expected_gamma_drive
+        expected_t1 = 1 / (expected_gamma_up + expected_gamma_down)
+
+        actual = analyzer.calculate_t1(
+            noise_output=noise_output,
+            qubit_freq=qubit_freq,
+            Ej=ej,
+            Ec=ec,
+        )
+
+        self.assertAlmostEqual(actual['gamma_up'], expected_gamma_up)
+        self.assertAlmostEqual(actual['gamma_down_noise'], expected_gamma_down_noise)
+        self.assertAlmostEqual(actual['gamma_drive'], expected_gamma_drive)
+        self.assertAlmostEqual(actual['gamma_down'], expected_gamma_down)
+        self.assertAlmostEqual(actual['t1_noise'], expected_t1_noise)
+        self.assertAlmostEqual(actual['t1_drive'], expected_t1_drive)
+        self.assertAlmostEqual(actual['t1'], expected_t1)
+
+    def test_xy_relaxation_analyzer_can_interpret_capacitive_xy_coupling(self):
+        coupling_capacitance = 2.5e-15
+        analyzer = XYRelaxationAnalyzer(couple_term=coupling_capacitance)
+        noise_output = SimpleNamespace(white_noise_temperature=0.035)
+        qubit_freq = 5.2e9
+        ej = 13.5
+        ec = 0.28
+        line_impedance = 50.0
+
+        expected_sxy_po = T2Sii_Double(noise_output.white_noise_temperature, f=qubit_freq)
+        expected_sxy_ne = T2Sii_Double(noise_output.white_noise_temperature, f=-qubit_freq)
+        expected_b = (
+            2e9
+            * np.pi
+            * coupling_capacitance
+            * (8 * ej * ec**3) ** 0.25
+            / e
+        )
+        expected_gamma_up = expected_sxy_ne * line_impedance**2 * expected_b**2
+        expected_gamma_down = expected_sxy_po * line_impedance**2 * expected_b**2
+        expected_t1 = 1 / (expected_gamma_up + expected_gamma_down)
+
+        actual = analyzer.calculate_t1(
+            noise_output=noise_output,
+            qubit_freq=qubit_freq,
+            Ej=ej,
+            Ec=ec,
+            drive_couple_type="capac",
+            include_drive_loss=False,
+            line_impedance_ohm=line_impedance,
+        )
+
+        self.assertAlmostEqual(actual['gamma_up'], expected_gamma_up)
+        self.assertAlmostEqual(actual['gamma_down_noise'], expected_gamma_down)
+        self.assertEqual(actual['gamma_drive'], 0.0)
+        self.assertAlmostEqual(actual['gamma_down'], expected_gamma_down)
+        self.assertAlmostEqual(actual['t1'], expected_t1)
+
     def test_xy_facade_can_delegate_through_explicit_xy_analyzer_builder(self):
         builder_calls = []
         analyzer_calls = []
 
         class RecordingAnalyzer:
-            def calculate_t1(self, *, noise_output, qubit_freq, Ej, Ec):
+            def calculate_t1(
+                self,
+                *,
+                noise_output,
+                qubit_freq,
+                Ej,
+                Ec,
+                drive_couple_type,
+                include_drive_loss,
+                line_impedance_ohm,
+            ):
                 analyzer_calls.append(
                     {
                         'method': 'calculate_t1',
@@ -103,11 +198,18 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
                         'qubit_freq': qubit_freq,
                         'Ej': Ej,
                         'Ec': Ec,
+                        'drive_couple_type': drive_couple_type,
+                        'include_drive_loss': include_drive_loss,
+                        'line_impedance_ohm': line_impedance_ohm,
                     }
                 )
                 return {
                     'gamma_up': 1.25,
+                    'gamma_down_noise': 2.75,
+                    'gamma_drive': 1.0,
                     'gamma_down': 3.75,
+                    't1_noise': 0.25,
+                    't1_drive': 1.0,
                     't1': 0.2,
                 }
 
@@ -136,9 +238,15 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
 
         self.assertEqual(t1_result.value, 0.2)
         self.assertEqual(t1_result.fit_diagnostics['gamma_up'], 1.25)
+        self.assertEqual(t1_result.fit_diagnostics['gamma_down_noise'], 2.75)
+        self.assertEqual(t1_result.fit_diagnostics['gamma_drive'], 1.0)
         self.assertEqual(t1_result.fit_diagnostics['gamma_down'], 3.75)
         self.assertEqual(xy_noise.Gamma_up, 1.25)
+        self.assertEqual(xy_noise.Gamma_down_noise, 2.75)
+        self.assertEqual(xy_noise.Gamma_drive, 1.0)
         self.assertEqual(xy_noise.Gamma_down, 3.75)
+        self.assertEqual(xy_noise.T1_noise, 0.25)
+        self.assertEqual(xy_noise.T1_drive, 1.0)
         self.assertEqual(xy_noise.T1, 0.2)
 
         self.assertEqual(thermal_result, (0.11, 0.22))
@@ -154,6 +262,9 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
                     'qubit_freq': xy_noise.qubit_freq,
                     'Ej': xy_noise.qubit.Ej[0, 0],
                     'Ec': xy_noise.qubit.Ec[0, 0],
+                    'drive_couple_type': xy_noise.drive_couple_type,
+                    'include_drive_loss': xy_noise.include_drive_loss,
+                    'line_impedance_ohm': xy_noise.line_impedance_ohm,
                 },
                 {
                     'method': 'calculate_thermal_excitation',
@@ -169,7 +280,17 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
         analyzer_calls = []
 
         class RecordingAnalyzer:
-            def calculate_t1(self, *, noise_output, qubit_freq, Ej, Ec):
+            def calculate_t1(
+                self,
+                *,
+                noise_output,
+                qubit_freq,
+                Ej,
+                Ec,
+                drive_couple_type,
+                include_drive_loss,
+                line_impedance_ohm,
+            ):
                 analyzer_calls.append(
                     {
                         'method': 'calculate_t1',
@@ -177,11 +298,18 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
                         'qubit_freq': qubit_freq,
                         'Ej': Ej,
                         'Ec': Ec,
+                        'drive_couple_type': drive_couple_type,
+                        'include_drive_loss': include_drive_loss,
+                        'line_impedance_ohm': line_impedance_ohm,
                     }
                 )
                 return {
                     'gamma_up': 2.5,
+                    'gamma_down_noise': 6.5,
+                    'gamma_drive': 1.0,
                     'gamma_down': 7.5,
+                    't1_noise': 1 / 9,
+                    't1_drive': 1.0,
                     't1': 0.1,
                 }
 
@@ -208,6 +336,8 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
         self.assertEqual(builder_calls[0]['couple_term'], xy_noise.couple_term)
         self.assertEqual(thermal_result, (0.33, 0.25))
         self.assertEqual(xy_noise.Gamma_up, 2.5)
+        self.assertEqual(xy_noise.Gamma_down_noise, 6.5)
+        self.assertEqual(xy_noise.Gamma_drive, 1.0)
         self.assertEqual(xy_noise.Gamma_down, 7.5)
         self.assertEqual(xy_noise.T1, 0.1)
         self.assertEqual(xy_noise.thermal_exitation, 0.33)
@@ -221,6 +351,9 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
                     'qubit_freq': xy_noise.qubit_freq,
                     'Ej': xy_noise.qubit.Ej[0, 0],
                     'Ec': xy_noise.qubit.Ec[0, 0],
+                    'drive_couple_type': xy_noise.drive_couple_type,
+                    'include_drive_loss': xy_noise.include_drive_loss,
+                    'line_impedance_ohm': xy_noise.line_impedance_ohm,
                 },
                 {
                     'method': 'calculate_thermal_excitation',
@@ -230,6 +363,18 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
                 },
             ],
         )
+
+    def test_xy_facade_can_disable_drive_loss_for_noise_only_t1(self):
+        xy_noise = self._construct(include_drive_loss=False)
+
+        actual = xy_noise.cal_t1(is_print=False)
+
+        self.assertEqual(xy_noise.Gamma_drive, 0.0)
+        self.assertTrue(np.isinf(xy_noise.T1_drive))
+        self.assertEqual(actual.fit_diagnostics['gamma_drive'], 0.0)
+        self.assertTrue(np.isinf(actual.fit_diagnostics['t1_drive']))
+        self.assertEqual(xy_noise.Gamma_down, xy_noise.Gamma_down_noise)
+        self.assertEqual(xy_noise.T1, xy_noise.T1_noise)
 
     def test_xy_current_voltage_keeps_existing_numeric_formula(self):
         phi_fraction = 0.015 / (4 * np.pi)

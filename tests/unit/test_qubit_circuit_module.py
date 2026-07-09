@@ -53,6 +53,59 @@ class QubitCircuitModuleTests(unittest.TestCase):
         np.testing.assert_allclose(el_matrix, expected_el)
         np.testing.assert_allclose(ej0_matrix, expected_ej0)
 
+    def test_transmon_effective_capacitance_helper_matches_legacy_formula(self):
+        ec = 2 * np.pi * 0.25
+        expected = e**2 / (2.0 * ec * 1e9 * hbar)
+
+        actual = circuit.transmon_effective_capacitance_from_ec(ec)
+
+        self.assertAlmostEqual(actual, expected)
+
+    def test_estimate_drive_line_t1_ns_matches_legacy_inductive_formula(self):
+        qubit_frequency_ghz = 5.2
+        ec = 2 * np.pi * 0.22
+        mutual_inductance = 12e-15
+        capacitance = circuit.transmon_effective_capacitance_from_ec(ec)
+        expected = (
+            50.0
+            / ((2 * np.pi * qubit_frequency_ghz * 1e9) ** 4 * mutual_inductance**2 * capacitance)
+            * 1e9
+        )
+
+        actual = circuit.estimate_drive_line_t1_ns(
+            qubit_frequency_ghz=qubit_frequency_ghz,
+            couple_term=mutual_inductance,
+            couple_type="induc",
+            ec=ec,
+        )
+
+        self.assertAlmostEqual(actual, expected)
+
+    def test_estimate_drive_line_t1_ns_matches_finite_rc_capacitive_formula(self):
+        qubit_frequency_ghz = 5.2
+        ec = 2 * np.pi * 0.22
+        coupling_capacitance = 2.5e-15
+        line_impedance = 50.0
+        omega = 2 * np.pi * qubit_frequency_ghz * 1e9
+        capacitance = circuit.transmon_effective_capacitance_from_ec(ec)
+        correction = 1.0 + (omega * coupling_capacitance * line_impedance) ** 2
+        expected = (
+            capacitance
+            * correction
+            / (omega**2 * coupling_capacitance**2 * line_impedance)
+            * 1e9
+        )
+
+        actual = circuit.estimate_drive_line_t1_ns(
+            qubit_frequency_ghz=qubit_frequency_ghz,
+            couple_term=coupling_capacitance,
+            couple_type="capac",
+            ec=ec,
+            line_impedance_ohm=line_impedance,
+        )
+
+        self.assertAlmostEqual(actual, expected)
+
     def test_circuit_module_builds_retain_nodes_and_extracts_reduced_flux(self):
         struct = [1, 2, 1]
         full_flux = np.array(

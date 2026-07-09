@@ -790,8 +790,16 @@ class XYNoiseDecoherence(Decoherence):
     Parameters:
         psd_freq (np.ndarray): Noise frequency array [Hz] (required)
         psd_S (np.ndarray): Noise power spectral density [1/Hz] (required)
-        couple_term (float): Coupling coefficient [H], default 0.8e-12 (required)
-            Physical meaning: Coupling strength between XY control line and qubit
+        couple_term (float): XY drive/control-line coupling coefficient, default 0.65e-12.
+            The default `drive_couple_type='induc'` interprets this as mutual
+            inductance [H] between the XY control line and qubit.
+        drive_couple_type (str): How to interpret `couple_term` for XY coupling,
+            default 'induc'. Supported values follow the drive-line helper:
+            'induc'/'ind', 'capac'/'cap', 'ind+cap', and 'cap+ind'.
+        include_drive_loss (bool): Whether `cal_t1()` includes passive 50 Ohm
+            control-line loss in addition to noise-induced relaxation.
+        line_impedance_ohm (float): Control-line impedance used for drive-line
+            loss and capacitive voltage-noise conversion, default 50 Ohm.
         couple_type (str): Fixed to 'xy' (auto-set, do not provide)
         noise_type (str): Noise type, default '1f' ('1f' | 'white' | 'constant')
         noise_prop (str): Noise propagation mode, default 'single'
@@ -840,10 +848,16 @@ class XYNoiseDecoherence(Decoherence):
         self,
         *args,
         couple_term: float = 0.65e-12,
+        drive_couple_type: str = 'induc',
+        include_drive_loss: bool = True,
+        line_impedance_ohm: float = 50.0,
         xy_analyzer_builder: Optional[Callable[..., object]] = None,
         **kwargs,
     ):
         couple_type='xy'
+        self.drive_couple_type = drive_couple_type
+        self.include_drive_loss = bool(include_drive_loss)
+        self.line_impedance_ohm = line_impedance_ohm
         self._xy_analyzer_builder = xy_analyzer_builder or XYRelaxationAnalyzer
         super().__init__(*args, couple_term=couple_term, couple_type=couple_type, **kwargs)
         self.xy_analyzer = self._build_xy_analyzer()
@@ -887,15 +901,29 @@ class XYNoiseDecoherence(Decoherence):
             qubit_freq=self.qubit_freq,
             Ej=self.qubit.Ej[0,0],
             Ec=self.qubit.Ec[0,0],
+            drive_couple_type=self.drive_couple_type,
+            include_drive_loss=self.include_drive_loss,
+            line_impedance_ohm=self.line_impedance_ohm,
         )
         self.Gamma_up = analysis['gamma_up']
+        self.Gamma_down_noise = analysis.get('gamma_down_noise', analysis['gamma_down'])
+        self.Gamma_drive = analysis.get('gamma_drive', 0.0)
         self.Gamma_down = analysis['gamma_down']
+        self.T1_noise = analysis.get('t1_noise', analysis['t1'])
+        self.T1_drive = analysis.get('t1_drive', np.inf)
         self.T1 = analysis['t1']
         result = self._build_t1_result(
             value=self.T1,
             fit_diagnostics={
                 'gamma_up': float(self.Gamma_up),
+                'gamma_down_noise': float(self.Gamma_down_noise),
+                'gamma_drive': float(self.Gamma_drive),
                 'gamma_down': float(self.Gamma_down),
+                't1_noise': float(self.T1_noise),
+                't1_drive': float(self.T1_drive),
+                't1_total': float(self.T1),
+                'drive_couple_type': self.drive_couple_type,
+                'include_drive_loss': self.include_drive_loss,
             },
         )
         if is_print:
@@ -904,7 +932,11 @@ class XYNoiseDecoherence(Decoherence):
                     qubit_freq=self.qubit_freq,
                     noise_output=self.noise.output_stage,
                     gamma_up=self.Gamma_up,
+                    gamma_down_noise=self.Gamma_down_noise,
+                    gamma_drive=self.Gamma_drive,
                     gamma_down=self.Gamma_down,
+                    t1_noise=self.T1_noise,
+                    t1_drive=self.T1_drive,
                     t1=self.T1,
                 ),
                 is_print=True,

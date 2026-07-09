@@ -36,7 +36,17 @@ class DecoherenceRoundEContractTests(unittest.TestCase):
         self.assertEqual(result.metadata['method'], 'cal')
         self.assertEqual(result.metadata['source'], 'xy-control')
         self.assertEqual(result.fit_diagnostics['gamma_up'], xy_noise.Gamma_up)
+        self.assertEqual(
+            result.fit_diagnostics['gamma_down_noise'],
+            xy_noise.Gamma_down_noise,
+        )
+        self.assertEqual(result.fit_diagnostics['gamma_drive'], xy_noise.Gamma_drive)
         self.assertEqual(result.fit_diagnostics['gamma_down'], xy_noise.Gamma_down)
+        self.assertEqual(result.fit_diagnostics['t1_noise'], xy_noise.T1_noise)
+        self.assertEqual(result.fit_diagnostics['t1_drive'], xy_noise.T1_drive)
+        self.assertEqual(result.fit_diagnostics['t1_total'], xy_noise.T1)
+        self.assertEqual(result.fit_diagnostics['drive_couple_type'], xy_noise.drive_couple_type)
+        self.assertEqual(result.fit_diagnostics['include_drive_loss'], xy_noise.include_drive_loss)
         self.assertGreater(result.value, 0.0)
 
     def test_cal_read_tphi_returns_tphi_result_for_cal_and_fit_paths(self):

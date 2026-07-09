@@ -7,7 +7,8 @@ import numpy as np
 from .electronics import Sii_D2S, T2Sii_Double
 from .results import BiasCurrentVoltageResult, XYCurrentVoltageResult
 from ..funclib.mathlib import temp2nbar
-from ..qubit.base import Phi0
+from ..qubit.base import Phi0, e
+from ..qubit.circuit import _normalize_drive_couplings, estimate_drive_line_t1_ns
 
 EULER_GAMMA = 0.577216
 
@@ -87,9 +88,60 @@ class XYRelaxationAnalyzer:
     def __init__(self, *, couple_term: float):
         self.couple_term = couple_term
 
-    def _calculate_gamma(self, spectral_density: float, *, Ej: float, Ec: float) -> float:
-        coupling = 2e9 * np.pi * self.couple_term * Ej * (2 * Ec / Ej) ** 0.25 / Phi0
+    @staticmethod
+    def _calculate_inductive_gamma(
+        spectral_density: float,
+        *,
+        couple_inductance_h: float,
+        Ej: float,
+        Ec: float,
+    ) -> float:
+        coupling = 2e9 * np.pi * couple_inductance_h * Ej * (2 * Ec / Ej) ** 0.25 / Phi0
         return spectral_density * coupling**2
+
+    @staticmethod
+    def _calculate_capacitive_gamma(
+        spectral_density: float,
+        *,
+        couple_capacitance_f: float,
+        Ej: float,
+        Ec: float,
+        line_impedance_ohm: float,
+    ) -> float:
+        voltage_spectral_density = spectral_density * line_impedance_ohm**2
+        coupling = 2e9 * np.pi * couple_capacitance_f * (8 * Ej * Ec**3) ** 0.25 / e
+        return voltage_spectral_density * coupling**2
+
+    def _calculate_gamma(
+        self,
+        spectral_density: float,
+        *,
+        Ej: float,
+        Ec: float,
+        drive_couple_type: str,
+        line_impedance_ohm: float,
+    ) -> float:
+        induc_drive_h, capac_drive_f = _normalize_drive_couplings(
+            self.couple_term,
+            drive_couple_type,
+        )
+        gamma = 0.0
+        if induc_drive_h > 0:
+            gamma += self._calculate_inductive_gamma(
+                spectral_density,
+                couple_inductance_h=induc_drive_h,
+                Ej=Ej,
+                Ec=Ec,
+            )
+        if capac_drive_f > 0:
+            gamma += self._calculate_capacitive_gamma(
+                spectral_density,
+                couple_capacitance_f=capac_drive_f,
+                Ej=Ej,
+                Ec=Ec,
+                line_impedance_ohm=line_impedance_ohm,
+            )
+        return gamma
 
     def calculate_t1(
         self,
@@ -98,15 +150,51 @@ class XYRelaxationAnalyzer:
         qubit_freq: float,
         Ej: float,
         Ec: float,
+        drive_couple_type: str = "induc",
+        include_drive_loss: bool = True,
+        line_impedance_ohm: float = 50.0,
     ) -> dict[str, float]:
         sxy_positive = T2Sii_Double(noise_output.white_noise_temperature, f=qubit_freq)
         sxy_negative = T2Sii_Double(noise_output.white_noise_temperature, f=-qubit_freq)
-        gamma_up = self._calculate_gamma(sxy_negative, Ej=Ej, Ec=Ec)
-        gamma_down = self._calculate_gamma(sxy_positive, Ej=Ej, Ec=Ec)
+        gamma_up = self._calculate_gamma(
+            sxy_negative,
+            Ej=Ej,
+            Ec=Ec,
+            drive_couple_type=drive_couple_type,
+            line_impedance_ohm=line_impedance_ohm,
+        )
+        gamma_down_noise = self._calculate_gamma(
+            sxy_positive,
+            Ej=Ej,
+            Ec=Ec,
+            drive_couple_type=drive_couple_type,
+            line_impedance_ohm=line_impedance_ohm,
+        )
+        noise_gamma = gamma_up + gamma_down_noise
+        t1_noise = 1 / noise_gamma if noise_gamma > 0 else np.inf
+
+        t1_drive = np.inf
+        gamma_drive = 0.0
+        if include_drive_loss:
+            t1_drive_ns = estimate_drive_line_t1_ns(
+                qubit_frequency_ghz=qubit_freq / 1e9,
+                couple_term=self.couple_term,
+                couple_type=drive_couple_type,
+                ec=Ec,
+                line_impedance_ohm=line_impedance_ohm,
+            )
+            t1_drive = t1_drive_ns * 1e-9
+            gamma_drive = 0.0 if np.isinf(t1_drive) else 1 / t1_drive
+
+        gamma_down = gamma_down_noise + gamma_drive
         total_gamma = gamma_up + gamma_down
         return {
             'gamma_up': gamma_up,
+            'gamma_down_noise': gamma_down_noise,
+            'gamma_drive': gamma_drive,
             'gamma_down': gamma_down,
+            't1_noise': t1_noise,
+            't1_drive': t1_drive,
             't1': 1 / total_gamma if total_gamma > 0 else np.inf,
         }
 

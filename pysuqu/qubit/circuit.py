@@ -1,6 +1,6 @@
 """Circuit-topology helpers extracted from the legacy qubit base layer."""
 
-from typing import Callable, Sequence
+from typing import Callable, Sequence, Union
 
 import numpy as np
 from scipy.constants import e, hbar, pi
@@ -166,3 +166,100 @@ def convert_elements_to_energy_matrices(
         el_matrix_transform,
         ej0_matrix_transform,
     )
+
+
+DriveCoupleType = str
+
+
+def _coupling_value(value) -> float:
+    """Normalize optional drive coupling values; None and 0 disable a channel."""
+    if value is None:
+        return 0.0
+    return float(value)
+
+
+def _normalize_drive_couplings(
+    couple_term: Union[float, Sequence[float], np.ndarray, None],
+    couple_type: DriveCoupleType,
+) -> tuple[float, float]:
+    """Return ``(inductive_H, capacitive_F)`` for supported drive coupling layouts."""
+    normalized_type = couple_type.lower().replace("_", "").replace("-", "").replace("+", "")
+    if normalized_type in {"induc", "ind"}:
+        return _coupling_value(couple_term), 0.0
+    if normalized_type in {"capac", "cap"}:
+        return 0.0, _coupling_value(couple_term)
+
+    pair = np.asarray(couple_term, dtype=object).ravel()
+    if pair.size != 2:
+        raise ValueError(f"Coupling type {couple_type!r} requires a pair of coupling terms.")
+    if normalized_type in {"inducap", "indcap"}:
+        return _coupling_value(pair[0]), _coupling_value(pair[1])
+    if normalized_type in {"capind", "capacinduc", "capacind"}:
+        return _coupling_value(pair[1]), _coupling_value(pair[0])
+    raise ValueError(f"Unsupported couple_type: {couple_type}")
+
+
+def _extract_primary_ec(ec: Union[float, np.ndarray]) -> float:
+    ec_array = np.asarray(ec, dtype=float)
+    if ec_array.ndim == 0:
+        return float(ec_array)
+    return float(ec_array[0, 0])
+
+
+def transmon_effective_capacitance_from_ec(ec: Union[float, np.ndarray]) -> float:
+    """Convert the package's ``Ec`` convention into an effective capacitance."""
+    ec_value = _extract_primary_ec(ec)
+    if not np.isfinite(ec_value) or ec_value <= 0:
+        raise ValueError("Ec must be a positive finite value.")
+    return e**2 / (2.0 * ec_value * 1e9 * hbar)
+
+
+def estimate_drive_line_t1_ns(
+    *,
+    qubit_frequency_ghz: float,
+    couple_term: Union[float, Sequence[float], np.ndarray, None],
+    couple_type: DriveCoupleType = "induc",
+    ec: Union[float, np.ndarray, None] = None,
+    effective_capacitance_f: float | None = None,
+    line_impedance_ohm: float = 50.0,
+) -> float:
+    """Estimate drive-line-induced ``T1`` under the weak-coupling LC-mode model.
+
+    The return value is in nanoseconds. Mixed inductive and capacitive couplings
+    combine as parallel decay channels; disabled channels return ``np.inf``.
+    """
+    if qubit_frequency_ghz <= 0:
+        raise ValueError("qubit_frequency_ghz must be positive.")
+    if line_impedance_ohm <= 0:
+        raise ValueError("line_impedance_ohm must be positive.")
+
+    if effective_capacitance_f is None:
+        if ec is None:
+            raise ValueError("estimate_drive_line_t1_ns requires ec or effective_capacitance_f.")
+        effective_capacitance_f = transmon_effective_capacitance_from_ec(ec)
+    if not np.isfinite(effective_capacitance_f) or effective_capacitance_f <= 0:
+        raise ValueError("effective_capacitance_f must be positive.")
+
+    omega_rad_per_s = 2.0 * pi * float(qubit_frequency_ghz) * 1e9
+    induc_drive_h, capac_drive_f = _normalize_drive_couplings(couple_term, couple_type)
+
+    decay_rates_per_s: list[float] = []
+    if induc_drive_h > 0:
+        t1_induc_s = line_impedance_ohm / (
+            omega_rad_per_s**4 * induc_drive_h**2 * effective_capacitance_f
+        )
+        decay_rates_per_s.append(1.0 / t1_induc_s)
+    if capac_drive_f > 0:
+        correction = 1.0 + (omega_rad_per_s * capac_drive_f * line_impedance_ohm) ** 2
+        t1_capac_s = (
+            effective_capacitance_f
+            * correction
+            / (omega_rad_per_s**2 * capac_drive_f**2 * line_impedance_ohm)
+        )
+        decay_rates_per_s.append(1.0 / t1_capac_s)
+
+    if not decay_rates_per_s:
+        return float(np.inf)
+
+    total_t1_s = 1.0 / float(np.sum(decay_rates_per_s))
+    return total_t1_s * 1e9

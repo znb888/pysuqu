@@ -263,13 +263,24 @@ def format_xy_t1_report(
     gamma_up: float,
     gamma_down: float,
     t1: float,
+    gamma_down_noise: float | None = None,
+    gamma_drive: float | None = None,
+    t1_noise: float | None = None,
+    t1_drive: float | None = None,
 ) -> tuple[str, ...]:
     """Build the XY-noise T1 summary report."""
+    gamma_down_noise = gamma_down if gamma_down_noise is None else gamma_down_noise
+    gamma_drive = 0.0 if gamma_drive is None else gamma_drive
+    t1_noise = t1 if t1_noise is None else t1_noise
+    t1_drive = np.inf if t1_drive is None else t1_drive
     return (
         '--- XY Noise T1 ---',
         f'Qubit frequency: {_format_frequency_hz(qubit_freq)}',
         f'Output white noise temperature: {_format_summary(noise_output.white_noise_temperature, _format_temperature_k)}',
-        f'Gamma_up: {gamma_up:.3e} 1/s, Gamma_down: {gamma_down:.3e} 1/s',
+        f'Gamma_up: {gamma_up:.3e} 1/s, Gamma_down_noise: {gamma_down_noise:.3e} 1/s',
+        f'Gamma_drive: {gamma_drive:.3e} 1/s, Gamma_down_total: {gamma_down:.3e} 1/s',
+        f'Noise-only T1: {_format_time_seconds(t1_noise)}',
+        f'Drive-line T1: {_format_time_seconds(t1_drive)}',
         f'T1: {_format_time_seconds(t1)}',
     )
 
