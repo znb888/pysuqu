@@ -314,25 +314,30 @@ def S_transmission(S_in: Union[float, np.ndarray],
                    T_setup: np.ndarray = np.array([290, 45, 3.5, 0.9, 0.1, 0.01]), 
                    attenuationindB: np.ndarray = np.array([40, 1, 10, 10, 20, 10])) -> Union[float, np.ndarray]:
     """
-    Calculates the output noise spectral density (double-sided) after passing through a cascade of attenuators 
-    at different temperature stages (Friss formula for passive components).
+    Calculates the output noise spectral density (double-sided) after passing through a cascade of attenuators
+    at different temperature stages (Friis formula for passive components).
 
     Model:
         S_{out} = S_{in} * A + S_{thermal} * (1 - A)
-        Where A is the attenuation factor (0 < A < 1).
+        Where A is the power transmission factor (0 < A <= 1). This rule is
+        applied to every stage, including the first stage in the chain.
 
     Args:
         S_in (float or np.ndarray): Input noise spectral density [A^2/Hz].
         ff (float): Frequency [Hz].
         T_setup (np.ndarray): Array of temperatures for each stage [K].
-        attenuationindB (np.ndarray): Array of attenuation values in dB for each stage.
+        attenuationindB (np.ndarray): Array of power attenuation values in dB
+            for each stage. They are converted with ``A = 10**(-dB / 10)``.
 
     Returns:
         Union[float, np.ndarray]: Output noise spectral density [A^2/Hz].
     """
     attenuation = 10**(-attenuationindB / 10)
 
-    S_transmission = S_in * attenuation[0] + T2Sii_Double(T_setup[0], ff)
+    S_transmission = (
+        S_in * attenuation[0]
+        + (1 - attenuation[0]) * T2Sii_Double(T_setup[0], ff)
+    )
 
     for ii in range(1, len(T_setup)):
         S_transmission = attenuation[ii] * S_transmission + (1 - attenuation[ii]) * T2Sii_Double(T_setup[ii], ff)

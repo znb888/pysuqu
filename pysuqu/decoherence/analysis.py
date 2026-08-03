@@ -207,7 +207,7 @@ class XYRelaxationAnalyzer:
     ) -> tuple[float, float]:
         gamma_down_actual = 1 / (t1_us * 1e-6) if t1_us is not None else 1 / 100e-6
         return (
-            gamma_up / (gamma_up + gamma_down_actual),
+            gamma_up / (gamma_up + gamma_down_actual+gamma_down),
             gamma_up / (gamma_up + gamma_down),
         )
 
