@@ -59,10 +59,8 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
         self.assertTrue(np.isinf(actual['t1_drive']))
         self.assertAlmostEqual(actual['t1'], expected_t1)
 
-        expected_gamma_down_actual = 1 / (37.0 * 1e-6)
-        expected_thermal_excitation = expected_gamma_up / (
-            expected_gamma_up + expected_gamma_down_actual
-        )
+        expected_gamma_t1 = 1 / (37.0 * 1e-6)
+        expected_thermal_excitation = expected_gamma_up / expected_gamma_t1
         expected_thermal_excitation_onlyxy = expected_gamma_up / (
             expected_gamma_up + expected_gamma_down
         )
@@ -77,21 +75,6 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
             actual_thermal,
             (
                 expected_thermal_excitation,
-                expected_thermal_excitation_onlyxy,
-            ),
-        )
-
-        expected_default_gamma_down_actual = 1 / 100e-6
-        actual_thermal_without_t1 = analyzer.calculate_thermal_excitation(
-            gamma_up=actual['gamma_up'],
-            gamma_down=actual['gamma_down'],
-            t1_us=None,
-        )
-
-        self.assertEqual(
-            actual_thermal_without_t1,
-            (
-                expected_gamma_up / (expected_gamma_up + expected_default_gamma_down_actual),
                 expected_thermal_excitation_onlyxy,
             ),
         )
@@ -232,6 +215,7 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
 
         t1_result = xy_noise.cal_t1(is_print=False)
         thermal_result = xy_noise.cal_thermal_exitation(T1=44.0, is_print=False)
+        default_thermal_result = xy_noise.cal_thermal_exitation(is_print=False)
 
         self.assertEqual(len(builder_calls), 1)
         self.assertEqual(builder_calls[0]['couple_term'], xy_noise.couple_term)
@@ -250,6 +234,7 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
         self.assertEqual(xy_noise.T1, 0.2)
 
         self.assertEqual(thermal_result, (0.11, 0.22))
+        self.assertEqual(default_thermal_result, (0.11, 0.22))
         self.assertEqual(xy_noise.thermal_exitation, 0.11)
         self.assertEqual(xy_noise.thermal_exitation_onlyxy, 0.22)
 
@@ -272,10 +257,16 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
                     'gamma_down': 3.75,
                     't1_us': 44.0,
                 },
+                {
+                    'method': 'calculate_thermal_excitation',
+                    'gamma_up': 1.25,
+                    'gamma_down': 3.75,
+                    't1_us': 100,
+                },
             ],
         )
 
-    def test_xy_facade_auto_derives_transition_rates_before_thermal_excitation_when_t1_is_omitted(self):
+    def test_xy_facade_uses_derived_t1_when_thermal_excitation_t1_is_none(self):
         builder_calls = []
         analyzer_calls = []
 
@@ -330,7 +321,7 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
 
         xy_noise = self._construct(xy_analyzer_builder=xy_analyzer_builder)
 
-        thermal_result = xy_noise.cal_thermal_exitation(is_print=False)
+        thermal_result = xy_noise.cal_thermal_exitation(T1=None, is_print=False)
 
         self.assertEqual(len(builder_calls), 1)
         self.assertEqual(builder_calls[0]['couple_term'], xy_noise.couple_term)
@@ -359,7 +350,7 @@ class XYNoiseDecoherenceT1AnalyzerBoundaryTests(unittest.TestCase):
                     'method': 'calculate_thermal_excitation',
                     'gamma_up': 2.5,
                     'gamma_down': 7.5,
-                    't1_us': None,
+                    't1_us': 100_000.0,
                 },
             ],
         )

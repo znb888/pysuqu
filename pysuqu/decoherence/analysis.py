@@ -203,11 +203,11 @@ class XYRelaxationAnalyzer:
         *,
         gamma_up: float,
         gamma_down: float,
-        t1_us: float | None,
+        t1_us: float,
     ) -> tuple[float, float]:
-        gamma_down_actual = 1 / (t1_us * 1e-6) if t1_us is not None else 1 / 100e-6
+        gamma_t1 = 1 / (t1_us * 1e-6)
         return (
-            gamma_up / (gamma_up + gamma_down_actual+gamma_down),
+            gamma_up / gamma_t1,
             gamma_up / (gamma_up + gamma_down),
         )
 
@@ -315,10 +315,7 @@ class ReadoutCavityAnalyzer:
         kappa: float,
         chi: float,
         noise_freq: np.ndarray | None = None,
-        read_freq: float = 6.5e9,
     ) -> np.ndarray:
-        del read_freq
-
         if noise_freq is None:
             noise_freq = np.logspace(-2, np.log10(kappa / np.pi), 100)
 
@@ -339,13 +336,10 @@ class ReadoutCavityAnalyzer:
         kappa: float,
         chi: float,
         experiment: str = "Ramsey",
-        read_freq: float = 6.5e9,
         delay_list: np.ndarray = np.linspace(10, 10e3, 100) * 1e-9,
         N: int = 100,
         len_pi: float = 100e-9,
     ) -> np.ndarray:
-        del read_freq
-
         nbar_th = self._calculate_thermal_photon_number(n_bar=n_bar, kappa=kappa, chi=chi)
         if experiment == "Ramsey":
             dfactor = (

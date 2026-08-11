@@ -943,14 +943,14 @@ class XYNoiseDecoherence(Decoherence):
             )
         return result
 
-    def cal_thermal_exitation(self, T1: float = None, is_print: bool = True) -> Tuple[float, float]:
+    def cal_thermal_exitation(self, T1: Optional[float] = 100, is_print: bool = True) -> Tuple[float, float]:
         """
         Calculate total and XY-only thermal excitation probabilities.
 
         Args:
-            T1: Optional measured relaxation time in microseconds (`us`). When
-                omitted, the calculation falls back to the XY-only rates derived
-                by `cal_t1()`.
+            T1: Measured relaxation time in microseconds (`us`), default 100.
+                When set to `None`, use the relaxation time derived by
+                `cal_t1()`.
             is_print: Whether to emit the formatted thermal-excitation report.
 
         Returns:
@@ -969,6 +969,8 @@ class XYNoiseDecoherence(Decoherence):
                     stacklevel=2,
                 )
                 return 0.0, 0.0
+        if T1 is None:
+            T1 = self.T1 * 1e6
 
         thermal_excitation = self.xy_analyzer.calculate_thermal_excitation(
             gamma_up=self.Gamma_up,
@@ -1152,7 +1154,6 @@ class RNoiseDecoherence(Decoherence):
             kappa=kappa,
             chi=chi,
             noise_freq=noise_freq,
-            read_freq=read_freq,
         )
         return self.psd_read
 
@@ -1192,7 +1193,6 @@ class RNoiseDecoherence(Decoherence):
             kappa=kappa,
             chi=chi,
             experiment=experiment,
-            read_freq=read_freq,
             delay_list=delay_list,
             N=N,
             len_pi=len_pi,

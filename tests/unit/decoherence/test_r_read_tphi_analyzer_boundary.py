@@ -86,7 +86,6 @@ class RNoiseDecoherenceReadTphiAnalyzerBoundaryTests(unittest.TestCase):
             kappa=kappa,
             chi=chi,
             noise_freq=noise_freq,
-            read_freq=6.5e9,
         )
         actual_dephase = analyzer.calculate_read_dephase(
             n_bar=n_bar,
@@ -96,7 +95,6 @@ class RNoiseDecoherenceReadTphiAnalyzerBoundaryTests(unittest.TestCase):
             delay_list=delay_list,
             N=100,
             len_pi=100e-9,
-            read_freq=6.5e9,
         )
 
         np.testing.assert_allclose(actual_psd, expected_psd)
@@ -187,7 +185,7 @@ class RNoiseDecoherenceReadTphiAnalyzerBoundaryTests(unittest.TestCase):
                 )
                 return 0.321
 
-            def calculate_readcavity_psd(self, *, n_bar, kappa, chi, noise_freq, read_freq):
+            def calculate_readcavity_psd(self, *, n_bar, kappa, chi, noise_freq):
                 analyzer_calls.append(
                     {
                         "method": "calculate_readcavity_psd",
@@ -195,7 +193,6 @@ class RNoiseDecoherenceReadTphiAnalyzerBoundaryTests(unittest.TestCase):
                         "kappa": kappa,
                         "chi": chi,
                         "noise_freq": noise_freq,
-                        "read_freq": read_freq,
                     }
                 )
                 return fit_psd
@@ -210,7 +207,6 @@ class RNoiseDecoherenceReadTphiAnalyzerBoundaryTests(unittest.TestCase):
                 delay_list,
                 N,
                 len_pi,
-                read_freq,
             ):
                 analyzer_calls.append(
                     {
@@ -222,7 +218,6 @@ class RNoiseDecoherenceReadTphiAnalyzerBoundaryTests(unittest.TestCase):
                         "delay_list": delay_list,
                         "N": N,
                         "len_pi": len_pi,
-                        "read_freq": read_freq,
                     }
                 )
                 return fit_curve
@@ -267,7 +262,6 @@ class RNoiseDecoherenceReadTphiAnalyzerBoundaryTests(unittest.TestCase):
                     "kappa": 4.2e6 * 2 * np.pi,
                     "chi": 1.7e6 * 2 * np.pi,
                     "noise_freq": None,
-                    "read_freq": 6.5e9,
                 },
                 {
                     "method": "calculate_read_dephase",
@@ -278,7 +272,6 @@ class RNoiseDecoherenceReadTphiAnalyzerBoundaryTests(unittest.TestCase):
                     "delay_list": delay_list,
                     "N": 100,
                     "len_pi": 100e-9,
-                    "read_freq": 6.5e9,
                 },
             ],
         )
