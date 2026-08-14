@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Literal, Optional, Protocol, Tuple, Union
 
 import numpy as np
-from scipy.signal import butter, convolve, firwin, lfilter, sosfilt
+from scipy.signal import butter, convolve, firwin, get_window, lfilter, sosfilt
 
 
 SignalDomain = Literal["iq_complex", "rf_real"]
@@ -14,10 +15,19 @@ SignalPlane = Literal["baseband", "awg_iq", "awg_rf", "qubit_iq", "qubit_rf"]
 StageDomain = Literal["iq_complex", "rf_real", "any"]
 FilterKind = Literal["lowpass", "highpass", "bandpass", "bandstop"]
 FIRAlignment = Literal["leading", "centered"]
+TouchstoneInterpolation = Literal["cartesian", "polar"]
+OutOfBandPolicy = Literal["edge", "zero", "error"]
 
 _VALID_DOMAINS = {"iq_complex", "rf_real"}
 _VALID_PLANES = {"baseband", "awg_iq", "awg_rf", "qubit_iq", "qubit_rf"}
 _ALL_PLANES = ("baseband", "awg_iq", "awg_rf", "qubit_iq", "qubit_rf")
+_TOUCHSTONE_FREQ_SCALES = {
+    "hz": 1e-9,
+    "khz": 1e-6,
+    "mhz": 1e-3,
+    "ghz": 1.0,
+}
+_SUPPORTED_TWO_PORT_DATA_ORDERS = {"21_12", "12_21"}
 
 
 def _as_array(values: Union[np.ndarray, Iterable[complex]]) -> np.ndarray:
@@ -101,6 +111,180 @@ def _validate_filter_sample_rate(
             f"{stage_name} was designed for sample_rate={design_sample_rate}, "
             f"received trace sample_rate={trace_sample_rate}."
         )
+
+
+def _infer_touchstone_port_count(path: Union[str, Path]) -> int:
+    suffix = Path(path).suffix.lower()
+    if not suffix.startswith(".s") or not suffix.endswith("p"):
+        raise ValueError(
+            f"Touchstone path must end with .sNp, received suffix {Path(path).suffix!r}."
+        )
+    digits = suffix[2:-1]
+    if not digits.isdigit():
+        raise ValueError(f"Unable to infer port count from Touchstone suffix {suffix!r}.")
+    port_count = int(digits)
+    if port_count <= 0:
+        raise ValueError("Touchstone port count must be positive.")
+    return port_count
+
+
+def _read_text_with_fallbacks(path: Path) -> str:
+    for encoding in ("utf-8-sig", "utf-8", "latin-1"):
+        try:
+            return path.read_text(encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    raise UnicodeDecodeError("touchstone", b"", 0, 1, f"Unable to decode {path}")
+
+
+def _parse_touchstone_option_line(
+    line: str,
+) -> Tuple[str, str, str, Union[float, np.ndarray]]:
+    tokens = line[1:].strip().split()
+    if not tokens:
+        return "ghz", "s", "ma", 50.0
+
+    freq_unit = tokens[0].lower()
+    parameter = tokens[1].lower() if len(tokens) > 1 else "s"
+    data_format = tokens[2].lower() if len(tokens) > 2 else "ma"
+    reference: Union[float, np.ndarray] = 50.0
+
+    for idx, token in enumerate(tokens):
+        if token.lower() == "r":
+            if idx + 1 >= len(tokens):
+                raise ValueError("Touchstone option line has R without a reference value.")
+            reference = float(tokens[idx + 1])
+            break
+
+    if freq_unit not in _TOUCHSTONE_FREQ_SCALES:
+        raise ValueError(f"Unsupported Touchstone frequency unit: {freq_unit}")
+    if parameter != "s":
+        raise ValueError(
+            f"Only S-parameter Touchstone files are supported, received {parameter!r}."
+        )
+    if data_format not in ("ri", "ma", "db"):
+        raise ValueError(f"Unsupported Touchstone data format: {data_format}")
+
+    return freq_unit, parameter, data_format, reference
+
+
+def _touchstone_pairs_to_complex(
+    raw_pairs: np.ndarray,
+    data_format: str,
+) -> np.ndarray:
+    if data_format == "ri":
+        return raw_pairs[..., 0] + 1j * raw_pairs[..., 1]
+
+    magnitude = raw_pairs[..., 0]
+    phase_rad = np.deg2rad(raw_pairs[..., 1])
+    if data_format == "db":
+        magnitude = 10 ** (magnitude / 20.0)
+    return magnitude * np.exp(1j * phase_rad)
+
+
+def _touchstone_pair_order(
+    port_count: int,
+    *,
+    two_port_data_order: str = "21_12",
+) -> list[tuple[int, int]]:
+    if port_count == 2:
+        normalized = two_port_data_order.lower().replace("-", "_")
+        if normalized not in _SUPPORTED_TWO_PORT_DATA_ORDERS:
+            raise ValueError(
+                f"Unsupported [Two-Port Data Order]: {two_port_data_order!r}. "
+                f"Supported values: {sorted(_SUPPORTED_TWO_PORT_DATA_ORDERS)}"
+            )
+        if normalized == "12_21":
+            return [(0, 0), (0, 1), (1, 0), (1, 1)]
+        return [(0, 0), (1, 0), (0, 1), (1, 1)]
+
+    return [
+        (output_port, input_port)
+        for input_port in range(port_count)
+        for output_port in range(port_count)
+    ]
+
+
+def _interpolate_complex_response(
+    query_freq: np.ndarray,
+    reference_freq: np.ndarray,
+    reference_response: np.ndarray,
+    *,
+    interpolation: TouchstoneInterpolation,
+    out_of_band: OutOfBandPolicy,
+    stage_name: str,
+) -> np.ndarray:
+    if interpolation not in ("cartesian", "polar"):
+        raise ValueError(f"Unsupported Touchstone interpolation mode: {interpolation}")
+    if out_of_band not in ("edge", "zero", "error"):
+        raise ValueError(f"Unsupported Touchstone out_of_band policy: {out_of_band}")
+
+    query = np.asarray(query_freq, dtype=np.float64)
+    query_shape = query.shape
+    query_values = query.reshape(-1)
+    freq = np.asarray(reference_freq, dtype=np.float64)
+    response = np.asarray(reference_response, dtype=np.complex128)
+    if np.any(~np.isfinite(query_values)):
+        raise ValueError(f"{stage_name} query frequencies must be finite.")
+    if len(freq) == 0:
+        raise ValueError(f"{stage_name} cannot interpolate an empty Touchstone response.")
+
+    below = query_values < freq[0]
+    above = query_values > freq[-1]
+    if out_of_band == "error" and np.any(below | above):
+        raise ValueError(
+            f"{stage_name} queried frequencies outside the measured Touchstone span "
+            f"[{freq[0]}, {freq[-1]}]."
+        )
+
+    if interpolation == "cartesian":
+        if out_of_band == "zero":
+            left_real = left_imag = right_real = right_imag = 0.0
+        else:
+            left_real = float(np.real(response[0]))
+            left_imag = float(np.imag(response[0]))
+            right_real = float(np.real(response[-1]))
+            right_imag = float(np.imag(response[-1]))
+
+        real_part = np.interp(
+            query_values,
+            freq,
+            np.real(response),
+            left=left_real,
+            right=right_real,
+        )
+        imag_part = np.interp(
+            query_values,
+            freq,
+            np.imag(response),
+            left=left_imag,
+            right=right_imag,
+        )
+        return np.asarray(real_part + 1j * imag_part).reshape(query_shape)
+
+    magnitude = np.abs(response)
+    phase = np.unwrap(np.angle(response))
+    if out_of_band == "zero":
+        left_mag = right_mag = 0.0
+    else:
+        left_mag = float(magnitude[0])
+        right_mag = float(magnitude[-1])
+
+    interp_mag = np.interp(
+        query_values,
+        freq,
+        magnitude,
+        left=left_mag,
+        right=right_mag,
+    )
+    interp_phase = np.interp(
+        query_values,
+        freq,
+        phase,
+        left=float(phase[0]),
+        right=float(phase[-1]),
+    )
+    return np.asarray(interp_mag * np.exp(1j * interp_phase)).reshape(query_shape)
 
 
 def _normalize_output_values(
@@ -189,6 +373,301 @@ class SignalTrace:
     def clone(self, **changes: Any) -> "SignalTrace":
         """Return a copy with selected fields replaced."""
         return replace(self, **changes)
+
+
+@dataclass
+class TouchstoneNetwork:
+    """Parsed Touchstone S-parameter data in GHz simulation units."""
+
+    frequencies: np.ndarray
+    s_parameters: np.ndarray
+    reference: Union[float, np.ndarray] = 50.0
+    path: str = ""
+
+    def __post_init__(self) -> None:
+        self.frequencies = np.asarray(self.frequencies, dtype=np.float64)
+        self.s_parameters = np.asarray(self.s_parameters, dtype=np.complex128)
+
+        if self.frequencies.ndim != 1 or len(self.frequencies) == 0:
+            raise ValueError(
+                "TouchstoneNetwork.frequencies must be a non-empty 1D array."
+            )
+        if np.any(~np.isfinite(self.frequencies)):
+            raise ValueError("TouchstoneNetwork frequencies must be finite.")
+        if self.s_parameters.ndim != 3:
+            raise ValueError(
+                "TouchstoneNetwork.s_parameters must have shape "
+                "(n_freq, n_ports, n_ports)."
+            )
+        if self.s_parameters.shape[0] != len(self.frequencies):
+            raise ValueError(
+                "TouchstoneNetwork frequency and S-parameter lengths do not match."
+            )
+        if self.s_parameters.shape[1] == 0:
+            raise ValueError("TouchstoneNetwork must describe at least one port.")
+        if self.s_parameters.shape[1] != self.s_parameters.shape[2]:
+            raise ValueError(
+                "TouchstoneNetwork expects a square S-parameter matrix at each frequency."
+            )
+        if np.any(~np.isfinite(self.s_parameters)):
+            raise ValueError("TouchstoneNetwork S-parameters must be finite.")
+        if np.any(np.diff(self.frequencies) <= 0):
+            raise ValueError("TouchstoneNetwork frequencies must be strictly increasing.")
+
+        reference = np.asarray(self.reference, dtype=np.float64)
+        if reference.ndim == 0:
+            if not np.isfinite(reference) or reference <= 0:
+                raise ValueError("TouchstoneNetwork reference impedance must be positive.")
+            self.reference = float(reference)
+        elif reference.ndim == 1 and len(reference) == self.n_ports:
+            if np.any(~np.isfinite(reference)) or np.any(reference <= 0):
+                raise ValueError(
+                    "TouchstoneNetwork reference impedances must be positive and finite."
+                )
+            self.reference = reference
+        else:
+            raise ValueError(
+                "TouchstoneNetwork reference must be scalar or contain one value per port."
+            )
+
+    @property
+    def n_ports(self) -> int:
+        """Return the number of ports described by the network."""
+        return int(self.s_parameters.shape[1])
+
+    def get_response(self, output_port: int, input_port: int) -> np.ndarray:
+        """Return one selected one-based ``S[output, input]`` response."""
+        if not (1 <= input_port <= self.n_ports):
+            raise ValueError(
+                f"input_port must be within [1, {self.n_ports}], received {input_port}."
+            )
+        if not (1 <= output_port <= self.n_ports):
+            raise ValueError(
+                f"output_port must be within [1, {self.n_ports}], received {output_port}."
+            )
+        return self.s_parameters[:, output_port - 1, input_port - 1]
+
+
+def load_touchstone_network(file_path: Union[str, Path]) -> TouchstoneNetwork:
+    """Load a full-matrix Touchstone ``.sNp`` file."""
+    path = Path(file_path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    suffix_port_count = _infer_touchstone_port_count(path)
+    port_count = suffix_port_count
+    freq_unit = "ghz"
+    data_format = "ma"
+    reference: Union[float, np.ndarray] = 50.0
+    matrix_format = "full"
+    two_port_data_order = "21_12"
+    declared_frequency_count: Optional[int] = None
+    numeric_tokens: list[float] = []
+    saw_network_data_keyword = False
+
+    for raw_line in _read_text_with_fallbacks(path).splitlines():
+        line = raw_line.split("!", 1)[0].strip()
+        if not line:
+            continue
+
+        lower = line.lower()
+        if lower.startswith("#"):
+            freq_unit, _, data_format, reference = _parse_touchstone_option_line(line)
+            continue
+
+        if lower.startswith("[") and "]" in lower:
+            keyword_end = lower.index("]")
+            keyword = lower[1:keyword_end].strip()
+            payload = line[keyword_end + 1 :].strip()
+
+            if keyword == "number of ports":
+                port_count = int(payload)
+                if port_count != suffix_port_count:
+                    raise ValueError(
+                        f"Touchstone [Number of Ports] declares {port_count}, but "
+                        f"{path.suffix} declares {suffix_port_count}."
+                    )
+            elif keyword == "number of frequencies":
+                declared_frequency_count = int(payload)
+            elif keyword == "matrix format" and payload:
+                matrix_format = payload.lower()
+            elif keyword == "reference" and payload:
+                reference_values = np.array(
+                    [float(token) for token in payload.split()],
+                    dtype=np.float64,
+                )
+                reference = (
+                    float(reference_values[0])
+                    if len(reference_values) == 1
+                    else reference_values
+                )
+            elif keyword == "two-port data order" and payload:
+                two_port_data_order = payload.lower().replace("-", "_")
+            elif keyword == "network data":
+                saw_network_data_keyword = True
+            elif keyword in ("end", "noise data"):
+                break
+            continue
+
+        if saw_network_data_keyword or not lower.startswith("["):
+            normalized_line = line.replace("D", "E").replace("d", "e")
+            numeric_tokens.extend(float(token) for token in normalized_line.split())
+
+    if matrix_format != "full":
+        raise ValueError(
+            f"Touchstone matrix format {matrix_format!r} is not supported; "
+            "please export full matrices."
+        )
+
+    numbers_per_point = 1 + 2 * port_count * port_count
+    if len(numeric_tokens) == 0 or len(numeric_tokens) % numbers_per_point != 0:
+        raise ValueError(
+            f"Malformed Touchstone data in {path}: expected a multiple of "
+            f"{numbers_per_point} numeric values per frequency point, received "
+            f"{len(numeric_tokens)} values."
+        )
+
+    raw_data = np.asarray(numeric_tokens, dtype=np.float64).reshape(
+        -1,
+        numbers_per_point,
+    )
+    if declared_frequency_count is not None and len(raw_data) != declared_frequency_count:
+        raise ValueError(
+            f"Touchstone file declares {declared_frequency_count} frequencies, "
+            f"but contains {len(raw_data)}."
+        )
+
+    frequencies = raw_data[:, 0] * _TOUCHSTONE_FREQ_SCALES[freq_unit]
+    complex_pairs = _touchstone_pairs_to_complex(
+        raw_data[:, 1:].reshape(-1, port_count * port_count, 2),
+        data_format,
+    )
+    s_parameters = np.zeros(
+        (len(frequencies), port_count, port_count),
+        dtype=np.complex128,
+    )
+    for pair_index, (output_port, input_port) in enumerate(
+        _touchstone_pair_order(
+            port_count,
+            two_port_data_order=two_port_data_order,
+        )
+    ):
+        s_parameters[:, output_port, input_port] = complex_pairs[:, pair_index]
+
+    order = np.argsort(frequencies)
+    frequencies = frequencies[order]
+    s_parameters = s_parameters[order]
+    if np.any(np.diff(frequencies) <= 0):
+        raise ValueError(f"Touchstone frequencies in {path} must be strictly increasing.")
+
+    return TouchstoneNetwork(
+        frequencies=frequencies,
+        s_parameters=s_parameters,
+        reference=reference,
+        path=str(path),
+    )
+
+
+def evaluate_touchstone_response(
+    query_frequencies: Union[float, np.ndarray, Iterable[float]],
+    *,
+    file_path: Union[str, Path, None] = None,
+    network: Optional[TouchstoneNetwork] = None,
+    input_port: int = 1,
+    output_port: int = 2,
+    interpolation: TouchstoneInterpolation = "polar",
+    out_of_band: OutOfBandPolicy = "edge",
+) -> np.ndarray:
+    """Evaluate one selected Touchstone path on a GHz frequency grid."""
+    if network is None:
+        if file_path is None:
+            raise ValueError(
+                "evaluate_touchstone_response requires either file_path or network."
+            )
+        network = load_touchstone_network(file_path)
+    elif not isinstance(network, TouchstoneNetwork):
+        raise TypeError("network must be a TouchstoneNetwork instance.")
+
+    query = np.asarray(query_frequencies, dtype=np.float64)
+    response = _interpolate_complex_response(
+        query,
+        network.frequencies,
+        network.get_response(output_port, input_port),
+        interpolation=interpolation,
+        out_of_band=out_of_band,
+        stage_name=f"S{output_port}{input_port}",
+    )
+    return np.asarray(response, dtype=np.complex128).reshape(query.shape)
+
+
+def design_inverse_fir_from_touchstone(
+    *,
+    lo_freq: float,
+    sample_rate: float,
+    num_taps: int,
+    file_path: Union[str, Path, None] = None,
+    network: Optional[TouchstoneNetwork] = None,
+    input_port: int = 1,
+    output_port: int = 2,
+    interpolation: TouchstoneInterpolation = "polar",
+    out_of_band: OutOfBandPolicy = "zero",
+    threshold_db: float = -20.0,
+    window: Optional[Union[str, Tuple[Any, ...]]] = "kaiser",
+    kaiser_beta: float = 6.0,
+) -> np.ndarray:
+    """Design a centered complex baseband FIR inverse for one Touchstone path."""
+    if num_taps <= 0:
+        raise ValueError("num_taps must be positive.")
+    _validate_positive_sample_rate(sample_rate)
+    if not np.isfinite(lo_freq):
+        raise ValueError("lo_freq must be finite.")
+    if not np.isfinite(threshold_db):
+        raise ValueError("threshold_db must be finite.")
+    if window == "kaiser" and not np.isfinite(kaiser_beta):
+        raise ValueError("kaiser_beta must be finite.")
+
+    if network is None:
+        if file_path is None:
+            raise ValueError(
+                "design_inverse_fir_from_touchstone requires either file_path "
+                "or network."
+            )
+        network = load_touchstone_network(file_path)
+    elif not isinstance(network, TouchstoneNetwork):
+        raise TypeError("network must be a TouchstoneNetwork instance.")
+
+    n_fft = max(65536, int(num_taps) * 8)
+    freqs_bb = np.fft.fftfreq(n_fft, d=1.0 / sample_rate)
+    response = evaluate_touchstone_response(
+        freqs_bb + float(lo_freq),
+        network=network,
+        input_port=input_port,
+        output_port=output_port,
+        interpolation=interpolation,
+        out_of_band=out_of_band,
+    )
+
+    threshold_linear = 10 ** (threshold_db / 20.0)
+    inverse_response = np.zeros_like(response, dtype=np.complex128)
+    mask_pass = np.abs(response) > threshold_linear
+    inverse_response[mask_pass] = 1.0 / response[mask_pass]
+
+    impulse_centered = np.fft.fftshift(np.fft.ifft(inverse_response))
+    center_idx = len(impulse_centered) // 2
+    start = center_idx - (num_taps // 2)
+    kernel = np.asarray(
+        impulse_centered[start : start + num_taps],
+        dtype=np.complex128,
+    )
+    if window is None or window == "none":
+        return kernel
+
+    resolved_window = ("kaiser", kaiser_beta) if window == "kaiser" else window
+    window_values = np.asarray(
+        get_window(resolved_window, len(kernel)),
+        dtype=np.float64,
+    )
+    return kernel * window_values
 
 
 @dataclass
@@ -707,6 +1186,139 @@ class TransferFunctionStage(BaseTransmissionStage):
 
 
 @dataclass
+class TouchstoneStage(BaseTransmissionStage):
+    """Linear single-trace stage backed by one Touchstone S-parameter path."""
+
+    file_path: Union[str, Path] = ""
+    input_port: int = 1
+    output_port: int = 2
+    interpolation: TouchstoneInterpolation = "polar"
+    out_of_band: OutOfBandPolicy = "edge"
+    frequency_mode: Literal["absolute", "relative"] = "absolute"
+    network: Optional[TouchstoneNetwork] = None
+    name: str = "touchstone"
+    domain: StageDomain = "any"
+    allowed_planes: Tuple[str, ...] = ("awg_iq", "awg_rf", "qubit_iq", "qubit_rf")
+    is_lti: bool = True
+    output_plane: Optional[SignalPlane] = None
+
+    def __post_init__(self) -> None:
+        if self.interpolation not in ("cartesian", "polar"):
+            raise ValueError(
+                f"Unsupported Touchstone interpolation mode: {self.interpolation}"
+            )
+        if self.out_of_band not in ("edge", "zero", "error"):
+            raise ValueError(
+                f"Unsupported Touchstone out_of_band policy: {self.out_of_band}"
+            )
+        if self.frequency_mode not in ("absolute", "relative"):
+            raise ValueError(
+                f"Unsupported Touchstone frequency_mode: {self.frequency_mode}"
+            )
+
+        if self.network is None:
+            if not self.file_path:
+                raise ValueError(
+                    "TouchstoneStage requires either file_path or a preloaded network."
+                )
+            self.network = load_touchstone_network(self.file_path)
+        elif not isinstance(self.network, TouchstoneNetwork):
+            raise TypeError(
+                "TouchstoneStage.network must be a TouchstoneNetwork instance."
+            )
+
+        self.file_path = str(self.file_path or self.network.path)
+        self.network.get_response(self.output_port, self.input_port)
+
+    @classmethod
+    def from_file(
+        cls,
+        file_path: Union[str, Path],
+        *,
+        input_port: int = 1,
+        output_port: int = 2,
+        **kwargs: Any,
+    ) -> "TouchstoneStage":
+        """Build a stage directly from a Touchstone file."""
+        return cls(
+            file_path=file_path,
+            input_port=input_port,
+            output_port=output_port,
+            **kwargs,
+        )
+
+    def _selected_response(self) -> np.ndarray:
+        return self.network.get_response(self.output_port, self.input_port)
+
+    def _interpolate_selected_response(self, query_freq: np.ndarray) -> np.ndarray:
+        return _interpolate_complex_response(
+            query_freq,
+            self.network.frequencies,
+            self._selected_response(),
+            interpolation=self.interpolation,
+            out_of_band=self.out_of_band,
+            stage_name=self.name,
+        )
+
+    def _evaluate_response(
+        self,
+        trace: SignalTrace,
+        freq_axis: np.ndarray,
+    ) -> np.ndarray:
+        if trace.domain == "iq_complex":
+            base_freq = trace.lo_freq if self.frequency_mode == "absolute" else 0.0
+            return self._interpolate_selected_response(base_freq + freq_axis)
+
+        positive_response = self._interpolate_selected_response(np.abs(freq_axis))
+        response = np.asarray(positive_response, dtype=np.complex128)
+        negative_mask = freq_axis < 0
+        response[negative_mask] = np.conj(response[negative_mask])
+        return _enforce_real_self_conjugate_bins(response, freq_axis)
+
+    def apply(self, trace: SignalTrace) -> SignalTrace:
+        """Propagate one trace through the selected S-parameter response."""
+        self._validate_trace(trace)
+        if len(trace.values) == 0:
+            return self._finalize_trace(
+                trace,
+                trace.values,
+                metadata_updates={
+                    "last_stage": self.name,
+                    "touchstone_file": self.file_path,
+                    "input_port": self.input_port,
+                    "output_port": self.output_port,
+                    "fft_length": 0,
+                },
+            )
+
+        fft_length = _next_fft_length(len(trace.values))
+        freq_axis = np.fft.fftfreq(fft_length, d=1.0 / trace.sample_rate)
+        padded_values = np.pad(trace.values, (0, fft_length - len(trace.values)))
+        response = self._evaluate_response(trace, freq_axis)
+        filtered = np.fft.ifft(
+            np.fft.fft(padded_values, n=fft_length) * response,
+            n=fft_length,
+        )[: len(trace.values)]
+
+        return self._finalize_trace(
+            trace,
+            filtered,
+            metadata_updates={
+                "last_stage": self.name,
+                "touchstone_file": self.file_path,
+                "input_port": self.input_port,
+                "output_port": self.output_port,
+                "fft_length": fft_length,
+            },
+        )
+
+    def describe(self) -> str:
+        """Return a compact selected-path summary."""
+        file_name = Path(self.file_path).name if self.file_path else "network"
+        return f"{self.name}[S{self.output_port}{self.input_port}, {file_name}]"
+
+
+@dataclass
 class DelayStage(BaseTransmissionStage):
     """Time-domain delay with zero fill outside the original support."""
 
@@ -884,8 +1496,13 @@ __all__ = [
     "IIRFilterStage",
     "SignalTrace",
     "SOSFilterStage",
+    "TouchstoneNetwork",
+    "TouchstoneStage",
     "TransferFunctionStage",
     "TransmissionChain",
     "TransmissionResult",
     "TransmissionStage",
+    "design_inverse_fir_from_touchstone",
+    "evaluate_touchstone_response",
+    "load_touchstone_network",
 ]
