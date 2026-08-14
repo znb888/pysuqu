@@ -293,6 +293,8 @@ class RealQutipGateSmokeTests(unittest.TestCase):
             from contextlib import redirect_stdout
             from io import StringIO
 
+            import numpy as np
+
             from tests.support import install_plotly_stub
 
             install_plotly_stub()
@@ -321,6 +323,7 @@ class RealQutipGateSmokeTests(unittest.TestCase):
             energylevel_anharmonicity = float(
                 qubit.get_energylevel(2) / (2 * 3.141592653589793) - 2 * energylevel_f01
             )
+            flux_value = np.asarray(qubit.get_element_matrices('flux'))
             payload = {
                 'qutip_file': getattr(qt, '__file__', ''),
                 'hamiltonian_is_qobj': isinstance(solver_result.hamiltonian, qt.Qobj),
@@ -334,8 +337,8 @@ class RealQutipGateSmokeTests(unittest.TestCase):
                 'energylevel_anharmonicity': energylevel_anharmonicity,
                 'energy_keys': sorted(qubit.get_energy_matrices().keys()),
                 'element_keys': sorted(qubit.get_element_matrices().keys()),
-                'flux_shape': list(qubit.get_element_matrices('flux').shape),
-                'flux_value': float(qubit.get_element_matrices('flux')[0, 0]),
+                'flux_shape': list(flux_value.shape),
+                'flux_value': float(flux_value.item()),
                 'ej_value': float(qubit.get_energy_matrices('Ej')[0, 0]),
                 's_matrix': qubit.SMatrix.tolist(),
                 'retain_nodes': list(qubit.SMatrix_retainNodes),
@@ -366,7 +369,7 @@ class RealQutipGateSmokeTests(unittest.TestCase):
         )
         self.assertEqual(payload['energy_keys'], ['Ec', 'Ej', 'Ej_max', 'El'])
         self.assertEqual(payload['element_keys'], ['capac', 'flux', 'induc', 'resis'])
-        self.assertEqual(payload['flux_shape'], [1, 1])
+        self.assertEqual(payload['flux_shape'], [])
         self.assertAlmostEqual(payload['flux_value'], 0.125)
         self.assertGreater(payload['ej_value'], 0.0)
         self.assertEqual(payload['s_matrix'], [[1.0]])
@@ -1007,7 +1010,7 @@ class RealQutipGateSmokeTests(unittest.TestCase):
                     is_print=False,
                 )
 
-            original_flux = np.asarray(model.get_element_matrices('flux'), dtype=float)
+            original_flux = np.asarray(model.get_element_matrices('flux'), dtype=float).copy()
             baseline_qubit1_f01 = float(model.qubit1_f01)
             baseline_qubit2_f01 = float(model.qubit2_f01)
             baseline_coupler_f01 = float(model.coupler_f01)
@@ -1140,7 +1143,7 @@ class RealQutipGateSmokeTests(unittest.TestCase):
                     is_print=False,
                 )
 
-            original_flux = np.asarray(model.get_element_matrices('flux'), dtype=float)
+            original_flux = np.asarray(model.get_element_matrices('flux'), dtype=float).copy()
             baseline_qubit1_f01 = float(model.qubit1_f01)
             baseline_qubit2_f01 = float(model.qubit2_f01)
             baseline_coupler_f01 = float(model.coupler_f01)
@@ -1261,7 +1264,7 @@ class RealQutipGateSmokeTests(unittest.TestCase):
                     is_print=False,
                 )
 
-            original_flux = np.asarray(model.get_element_matrices('flux'), dtype=float)
+            original_flux = np.asarray(model.get_element_matrices('flux'), dtype=float).copy()
             baseline_qubit1_f01 = float(model.qubit1_f01)
             baseline_qubit2_f01 = float(model.qubit2_f01)
             baseline_coupler_f01 = float(model.coupler_f01)
@@ -1404,7 +1407,7 @@ class RealQutipGateSmokeTests(unittest.TestCase):
                     is_print=False,
                 )
 
-            original_flux = np.asarray(model.get_element_matrices('flux'), dtype=float)
+            original_flux = np.asarray(model.get_element_matrices('flux'), dtype=float).copy()
             baseline_qubit1_f01 = float(model.qubit1_f01)
             baseline_qubit2_f01 = float(model.qubit2_f01)
             baseline_coupler_f01 = float(model.coupler_f01)
@@ -1535,7 +1538,7 @@ class RealQutipGateSmokeTests(unittest.TestCase):
                     is_print=False,
                 )
 
-            original_flux = np.asarray(model.get_element_matrices('flux'), dtype=float)
+            original_flux = np.asarray(model.get_element_matrices('flux'), dtype=float).copy()
             baseline_qubit1_f01 = float(model.qubit1_f01)
             baseline_qubit2_f01 = float(model.qubit2_f01)
             baseline_coupler_f01 = float(model.coupler_f01)
