@@ -6,11 +6,14 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, Literal, Optional, Protocol, Tuple, Union
 
 import numpy as np
+from scipy.signal import butter, convolve, firwin, lfilter, sosfilt
 
 
 SignalDomain = Literal["iq_complex", "rf_real"]
 SignalPlane = Literal["baseband", "awg_iq", "awg_rf", "qubit_iq", "qubit_rf"]
 StageDomain = Literal["iq_complex", "rf_real", "any"]
+FilterKind = Literal["lowpass", "highpass", "bandpass", "bandstop"]
+FIRAlignment = Literal["leading", "centered"]
 
 _VALID_DOMAINS = {"iq_complex", "rf_real"}
 _VALID_PLANES = {"baseband", "awg_iq", "awg_rf", "qubit_iq", "qubit_rf"}
@@ -28,6 +31,76 @@ def _next_fft_length(signal_length: int, impulse_length: Optional[int] = None) -
     while fft_length < target:
         fft_length <<= 1
     return fft_length
+
+
+def _normalize_filter_kind(kind: str) -> FilterKind:
+    mapping = {
+        "low": "lowpass",
+        "lowpass": "lowpass",
+        "high": "highpass",
+        "highpass": "highpass",
+        "band": "bandpass",
+        "bandpass": "bandpass",
+        "stop": "bandstop",
+        "bandstop": "bandstop",
+        "notch": "bandstop",
+    }
+    normalized = mapping.get(kind.lower())
+    if normalized is None:
+        raise ValueError(f"Unsupported filter kind: {kind}")
+    return normalized
+
+
+def _normalize_cutoff(
+    cutoff_freq: Union[float, Tuple[float, float], np.ndarray],
+    kind: FilterKind,
+) -> Union[float, Tuple[float, float]]:
+    values = np.asarray(cutoff_freq, dtype=np.float64).reshape(-1)
+    if np.any(~np.isfinite(values)) or np.any(values <= 0):
+        raise ValueError("Cutoff frequencies must be positive and finite.")
+
+    if kind in ("lowpass", "highpass"):
+        if len(values) != 1:
+            raise ValueError(f"{kind} expects a single cutoff frequency.")
+        return float(values[0])
+
+    if len(values) != 2:
+        raise ValueError(f"{kind} expects a pair of cutoff frequencies.")
+    if values[0] >= values[1]:
+        raise ValueError("Band edges must be strictly increasing.")
+    return float(values[0]), float(values[1])
+
+
+def _validate_positive_sample_rate(sample_rate: float) -> None:
+    if not np.isfinite(sample_rate) or sample_rate <= 0:
+        raise ValueError("sample_rate must be positive and finite.")
+
+
+def _validate_sample_rate_and_cutoff(
+    sample_rate: float,
+    cutoff_freq: Union[float, Tuple[float, float]],
+) -> None:
+    _validate_positive_sample_rate(sample_rate)
+    nyquist = sample_rate / 2.0
+    cutoff_values = np.asarray(cutoff_freq, dtype=np.float64).reshape(-1)
+    if np.any(cutoff_values >= nyquist):
+        raise ValueError(
+            f"Cutoff frequencies must stay below the Nyquist frequency ({nyquist})."
+        )
+
+
+def _validate_filter_sample_rate(
+    design_sample_rate: Optional[float],
+    trace_sample_rate: float,
+    stage_name: str,
+) -> None:
+    if design_sample_rate is None:
+        return
+    if not np.isclose(design_sample_rate, trace_sample_rate, rtol=1e-12, atol=0.0):
+        raise ValueError(
+            f"{stage_name} was designed for sample_rate={design_sample_rate}, "
+            f"received trace sample_rate={trace_sample_rate}."
+        )
 
 
 def _normalize_output_values(
@@ -214,6 +287,300 @@ class AttenuatorStage(BaseTransmissionStage):
     def describe(self) -> str:
         """Return a compact attenuation summary."""
         return f"{self.name}[{self.loss_db:.3f} dB]"
+
+
+@dataclass
+class FIRFilterStage(BaseTransmissionStage):
+    """Discrete FIR stage with leading or group-delay-compensated alignment."""
+
+    kernel: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float64))
+    alignment: FIRAlignment = "leading"
+    name: str = "fir_filter"
+    domain: StageDomain = "any"
+    allowed_planes: Tuple[str, ...] = _ALL_PLANES
+    is_lti: bool = True
+    output_plane: Optional[SignalPlane] = None
+    sample_rate: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        self.kernel = _as_array(self.kernel)
+        if self.kernel.ndim != 1:
+            raise ValueError("FIRFilterStage.kernel must be a 1D array.")
+        if self.alignment not in ("leading", "centered"):
+            raise ValueError(f"Unsupported FIRFilterStage alignment: {self.alignment}")
+        if self.sample_rate is not None:
+            _validate_positive_sample_rate(self.sample_rate)
+
+    @classmethod
+    def from_windowed_sinc(
+        cls,
+        *,
+        cutoff_freq: Union[float, Tuple[float, float]],
+        sample_rate: float,
+        num_taps: int = 33,
+        filter_kind: str = "lowpass",
+        window: str = "hamming",
+        scale: bool = True,
+        name: str = "fir_filter",
+        **kwargs: Any,
+    ) -> "FIRFilterStage":
+        """Build an FIR stage from a windowed-sinc design."""
+        kind = _normalize_filter_kind(filter_kind)
+        normalized_cutoff = _normalize_cutoff(cutoff_freq, kind)
+        _validate_sample_rate_and_cutoff(sample_rate, normalized_cutoff)
+        kernel = firwin(
+            num_taps,
+            normalized_cutoff,
+            fs=sample_rate,
+            pass_zero=kind,
+            window=window,
+            scale=scale,
+        )
+        return cls(kernel=kernel, name=name, sample_rate=sample_rate, **kwargs)
+
+    @classmethod
+    def lowpass(
+        cls,
+        *,
+        cutoff_freq: float,
+        sample_rate: float,
+        num_taps: int = 33,
+        window: str = "hamming",
+        name: str = "fir_lowpass",
+        **kwargs: Any,
+    ) -> "FIRFilterStage":
+        """Build a low-pass FIR stage."""
+        return cls.from_windowed_sinc(
+            cutoff_freq=cutoff_freq,
+            sample_rate=sample_rate,
+            num_taps=num_taps,
+            filter_kind="lowpass",
+            window=window,
+            name=name,
+            **kwargs,
+        )
+
+    @classmethod
+    def highpass(
+        cls,
+        *,
+        cutoff_freq: float,
+        sample_rate: float,
+        num_taps: int = 33,
+        window: str = "hamming",
+        name: str = "fir_highpass",
+        **kwargs: Any,
+    ) -> "FIRFilterStage":
+        """Build a high-pass FIR stage."""
+        return cls.from_windowed_sinc(
+            cutoff_freq=cutoff_freq,
+            sample_rate=sample_rate,
+            num_taps=num_taps,
+            filter_kind="highpass",
+            window=window,
+            name=name,
+            **kwargs,
+        )
+
+    @classmethod
+    def bandpass(
+        cls,
+        *,
+        cutoff_freq: Tuple[float, float],
+        sample_rate: float,
+        num_taps: int = 65,
+        window: str = "hamming",
+        name: str = "fir_bandpass",
+        **kwargs: Any,
+    ) -> "FIRFilterStage":
+        """Build a band-pass FIR stage."""
+        return cls.from_windowed_sinc(
+            cutoff_freq=cutoff_freq,
+            sample_rate=sample_rate,
+            num_taps=num_taps,
+            filter_kind="bandpass",
+            window=window,
+            name=name,
+            **kwargs,
+        )
+
+    def apply(self, trace: SignalTrace) -> SignalTrace:
+        """Convolve the trace and preserve its original sample count."""
+        self._validate_trace(trace)
+        _validate_filter_sample_rate(self.sample_rate, trace.sample_rate, self.name)
+
+        if len(trace.values) == 0 or len(self.kernel) == 0:
+            filtered = trace.values
+        else:
+            filtered_full = convolve(
+                trace.values,
+                self.kernel,
+                mode="full",
+                method="auto",
+            )
+            if self.alignment == "centered":
+                delay = (len(self.kernel) - 1) // 2
+                filtered = filtered_full[delay : delay + len(trace.values)]
+            else:
+                filtered = filtered_full[: len(trace.values)]
+
+        return self._finalize_trace(
+            trace,
+            filtered,
+            metadata_updates={
+                "last_stage": self.name,
+                "kernel_length": len(self.kernel),
+                "alignment": self.alignment,
+                "design_sample_rate": self.sample_rate,
+            },
+        )
+
+    def describe(self) -> str:
+        """Return a compact FIR summary."""
+        return f"{self.name}[taps={len(self.kernel)}, {self.alignment}]"
+
+
+@dataclass
+class IIRFilterStage(BaseTransmissionStage):
+    """Direct-form IIR stage implemented with ``scipy.signal.lfilter``."""
+
+    b: np.ndarray = field(default_factory=lambda: np.array([1.0], dtype=np.float64))
+    a: np.ndarray = field(default_factory=lambda: np.array([1.0], dtype=np.float64))
+    name: str = "iir_filter"
+    domain: StageDomain = "any"
+    allowed_planes: Tuple[str, ...] = _ALL_PLANES
+    is_lti: bool = True
+    output_plane: Optional[SignalPlane] = None
+    sample_rate: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        self.b = _as_array(self.b)
+        self.a = _as_array(self.a)
+        if self.b.ndim != 1 or len(self.b) == 0:
+            raise ValueError("IIRFilterStage.b must be a non-empty 1D array.")
+        if self.a.ndim != 1 or len(self.a) == 0:
+            raise ValueError("IIRFilterStage.a must be a non-empty 1D array.")
+        if self.sample_rate is not None:
+            _validate_positive_sample_rate(self.sample_rate)
+
+    @classmethod
+    def butterworth(
+        cls,
+        *,
+        order: int,
+        cutoff_freq: Union[float, Tuple[float, float]],
+        sample_rate: float,
+        filter_kind: str = "lowpass",
+        name: str = "iir_butterworth",
+        **kwargs: Any,
+    ) -> "IIRFilterStage":
+        """Build a Butterworth IIR stage in transfer-function form."""
+        kind = _normalize_filter_kind(filter_kind)
+        normalized_cutoff = _normalize_cutoff(cutoff_freq, kind)
+        _validate_sample_rate_and_cutoff(sample_rate, normalized_cutoff)
+        b, a = butter(
+            order,
+            normalized_cutoff,
+            btype=kind,
+            fs=sample_rate,
+            output="ba",
+        )
+        return cls(b=b, a=a, name=name, sample_rate=sample_rate, **kwargs)
+
+    def apply(self, trace: SignalTrace) -> SignalTrace:
+        """Filter the waveform with ``scipy.signal.lfilter``."""
+        self._validate_trace(trace)
+        _validate_filter_sample_rate(self.sample_rate, trace.sample_rate, self.name)
+        filtered = (
+            trace.values
+            if len(trace.values) == 0
+            else lfilter(self.b, self.a, trace.values)
+        )
+        return self._finalize_trace(
+            trace,
+            filtered,
+            metadata_updates={
+                "last_stage": self.name,
+                "numerator_length": len(self.b),
+                "denominator_length": len(self.a),
+                "design_sample_rate": self.sample_rate,
+            },
+        )
+
+    def describe(self) -> str:
+        """Return a compact IIR coefficient summary."""
+        return f"{self.name}[len(b)={len(self.b)}, len(a)={len(self.a)}]"
+
+
+@dataclass
+class SOSFilterStage(BaseTransmissionStage):
+    """Second-order-sections stage implemented with ``scipy.signal.sosfilt``."""
+
+    sos: np.ndarray = field(
+        default_factory=lambda: np.array([[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]])
+    )
+    name: str = "sos_filter"
+    domain: StageDomain = "any"
+    allowed_planes: Tuple[str, ...] = _ALL_PLANES
+    is_lti: bool = True
+    output_plane: Optional[SignalPlane] = None
+    sample_rate: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        self.sos = np.asarray(self.sos, dtype=np.float64)
+        if self.sos.ndim != 2 or self.sos.shape[1:] != (6,) or len(self.sos) == 0:
+            raise ValueError(
+                "SOSFilterStage.sos must have non-empty shape (n_sections, 6)."
+            )
+        if self.sample_rate is not None:
+            _validate_positive_sample_rate(self.sample_rate)
+
+    @classmethod
+    def butterworth(
+        cls,
+        *,
+        order: int,
+        cutoff_freq: Union[float, Tuple[float, float]],
+        sample_rate: float,
+        filter_kind: str = "lowpass",
+        name: str = "sos_butterworth",
+        **kwargs: Any,
+    ) -> "SOSFilterStage":
+        """Build a Butterworth filter in SOS form."""
+        kind = _normalize_filter_kind(filter_kind)
+        normalized_cutoff = _normalize_cutoff(cutoff_freq, kind)
+        _validate_sample_rate_and_cutoff(sample_rate, normalized_cutoff)
+        sos = butter(
+            order,
+            normalized_cutoff,
+            btype=kind,
+            fs=sample_rate,
+            output="sos",
+        )
+        return cls(sos=sos, name=name, sample_rate=sample_rate, **kwargs)
+
+    def apply(self, trace: SignalTrace) -> SignalTrace:
+        """Filter the waveform with ``scipy.signal.sosfilt``."""
+        self._validate_trace(trace)
+        _validate_filter_sample_rate(self.sample_rate, trace.sample_rate, self.name)
+        filtered = (
+            trace.values
+            if len(trace.values) == 0
+            else sosfilt(self.sos, trace.values)
+        )
+        return self._finalize_trace(
+            trace,
+            filtered,
+            metadata_updates={
+                "last_stage": self.name,
+                "num_sections": int(self.sos.shape[0]),
+                "design_sample_rate": self.sample_rate,
+            },
+        )
+
+    def describe(self) -> str:
+        """Return a compact SOS section summary."""
+        return f"{self.name}[sections={int(self.sos.shape[0])}]"
 
 
 @dataclass
@@ -513,7 +880,10 @@ __all__ = [
     "AttenuatorStage",
     "BaseTransmissionStage",
     "DelayStage",
+    "FIRFilterStage",
+    "IIRFilterStage",
     "SignalTrace",
+    "SOSFilterStage",
     "TransferFunctionStage",
     "TransmissionChain",
     "TransmissionResult",

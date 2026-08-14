@@ -1,15 +1,20 @@
 import unittest
 
 import numpy as np
+from scipy.signal import lfilter, sosfilt
 
 from pysuqu.funclib import (
     AttenuatorStage,
     BaseTransmissionStage,
     DelayStage,
+    FIRFilterStage,
+    IIRFilterStage,
     SignalTrace,
+    SOSFilterStage,
     TransferFunctionStage,
     TransmissionChain,
     TransmissionResult,
+    WaveformGenerator,
 )
 
 
@@ -211,6 +216,204 @@ class TransferFunctionStageTests(unittest.TestCase):
 
         self.assertEqual(output.plane, 'qubit_rf')
         self.assertEqual(output.metadata['fft_length'], 0)
+
+
+class DigitalFilterStageTests(unittest.TestCase):
+    @staticmethod
+    def _trace(values, *, sample_rate=2.0, domain='rf_real', plane='awg_rf'):
+        return SignalTrace(
+            np.arange(len(values), dtype=float) / sample_rate,
+            np.asarray(values),
+            sample_rate,
+            domain,
+            plane,
+        )
+
+    def test_fir_leading_alignment_matches_legacy_awgenerator(self):
+        values = np.array([1.0, -0.5, 0.25, 2.0, 0.0])
+        kernel = np.array([0.2, 0.5, 0.3])
+        generator = WaveformGenerator(total_time=2.5, sample_rate=2.0)
+        expected = generator._apply_fir_filter(values, kernel)
+
+        output = FIRFilterStage(kernel=kernel).apply(self._trace(values))
+
+        np.testing.assert_allclose(output.values, expected)
+        self.assertEqual(output.metadata['alignment'], 'leading')
+        self.assertEqual(output.metadata['kernel_length'], 3)
+
+    def test_fir_centered_alignment_removes_integer_group_delay(self):
+        values = np.array([0.0, 0.0, 1.0, 0.0, 0.0])
+        kernel = np.array([0.25, 0.5, 0.25])
+        full = np.convolve(values, kernel, mode='full')
+
+        output = FIRFilterStage(kernel=kernel, alignment='centered').apply(
+            self._trace(values)
+        )
+
+        np.testing.assert_allclose(output.values, full[1:6])
+
+    def test_empty_fir_kernel_is_identity_but_still_finalizes_trace(self):
+        trace = self._trace([1.0, 2.0])
+
+        output = FIRFilterStage(output_plane='qubit_rf').apply(trace)
+
+        np.testing.assert_allclose(output.values, trace.values)
+        self.assertEqual(output.plane, 'qubit_rf')
+        self.assertEqual(output.metadata['kernel_length'], 0)
+
+    def test_windowed_fir_factories_build_expected_filter_types(self):
+        lowpass = FIRFilterStage.lowpass(
+            cutoff_freq=0.2,
+            sample_rate=2.0,
+            num_taps=17,
+        )
+        highpass = FIRFilterStage.highpass(
+            cutoff_freq=0.2,
+            sample_rate=2.0,
+            num_taps=17,
+        )
+        bandpass = FIRFilterStage.bandpass(
+            cutoff_freq=(0.2, 0.5),
+            sample_rate=2.0,
+            num_taps=17,
+        )
+        bandstop = FIRFilterStage.from_windowed_sinc(
+            cutoff_freq=(0.2, 0.5),
+            sample_rate=2.0,
+            num_taps=17,
+            filter_kind='notch',
+        )
+
+        def endpoint_gains(stage):
+            tap_indices = np.arange(len(stage.kernel))
+            return (
+                abs(np.sum(stage.kernel)),
+                abs(np.sum(stage.kernel * (-1.0) ** tap_indices)),
+            )
+
+        low_dc, low_nyquist = endpoint_gains(lowpass)
+        high_dc, high_nyquist = endpoint_gains(highpass)
+        band_dc, band_nyquist = endpoint_gains(bandpass)
+        stop_dc, stop_nyquist = endpoint_gains(bandstop)
+
+        self.assertGreater(low_dc, 0.9)
+        self.assertLess(low_nyquist, 0.05)
+        self.assertLess(high_dc, 0.05)
+        self.assertGreater(high_nyquist, 0.9)
+        self.assertLess(band_dc, 0.05)
+        self.assertLess(band_nyquist, 0.05)
+        self.assertGreater(stop_dc, 0.9)
+        self.assertGreater(stop_nyquist, 0.9)
+        self.assertEqual(lowpass.sample_rate, 2.0)
+
+    def test_iir_and_sos_match_scipy_reference_filters(self):
+        values = np.array([1.0, 0.0, 0.5, -0.25, 0.0, 0.0])
+        trace = self._trace(values)
+        iir = IIRFilterStage.butterworth(
+            order=3,
+            cutoff_freq=0.25,
+            sample_rate=2.0,
+        )
+        sos = SOSFilterStage.butterworth(
+            order=4,
+            cutoff_freq=(0.15, 0.45),
+            sample_rate=2.0,
+            filter_kind='bandpass',
+        )
+
+        iir_output = iir.apply(trace)
+        sos_output = sos.apply(trace)
+
+        np.testing.assert_allclose(iir_output.values, lfilter(iir.b, iir.a, values))
+        np.testing.assert_allclose(sos_output.values, sosfilt(sos.sos, values))
+        self.assertEqual(iir_output.metadata['design_sample_rate'], 2.0)
+        self.assertEqual(sos_output.metadata['num_sections'], 4)
+
+    def test_factory_designed_filters_reject_trace_sample_rate_mismatch(self):
+        stages = (
+            FIRFilterStage.lowpass(cutoff_freq=0.2, sample_rate=2.0),
+            IIRFilterStage.butterworth(
+                order=2,
+                cutoff_freq=0.2,
+                sample_rate=2.0,
+            ),
+            SOSFilterStage.butterworth(
+                order=2,
+                cutoff_freq=0.2,
+                sample_rate=2.0,
+            ),
+        )
+        mismatched = self._trace([1.0, 0.0], sample_rate=1.0)
+
+        for stage in stages:
+            with self.subTest(stage=stage.name):
+                with self.assertRaisesRegex(ValueError, 'designed for sample_rate=2.0'):
+                    stage.apply(mismatched)
+
+    def test_direct_coefficients_remain_sample_rate_agnostic(self):
+        trace = self._trace([1.0, 2.0], sample_rate=7.5)
+        stages = (
+            FIRFilterStage(kernel=[1.0]),
+            IIRFilterStage(b=[1.0], a=[1.0]),
+            SOSFilterStage(sos=[[1.0, 0.0, 0.0, 1.0, 0.0, 0.0]]),
+        )
+
+        for stage in stages:
+            with self.subTest(stage=stage.name):
+                np.testing.assert_allclose(stage.apply(trace).values, trace.values)
+
+    def test_filter_coefficients_and_alignment_are_validated(self):
+        invalid_constructors = (
+            lambda: FIRFilterStage(kernel=np.ones((2, 2))),
+            lambda: FIRFilterStage(kernel=[1.0], alignment='invalid'),
+            lambda: IIRFilterStage(b=[], a=[1.0]),
+            lambda: IIRFilterStage(b=[1.0], a=np.ones((1, 1))),
+            lambda: SOSFilterStage(sos=np.empty((0, 6))),
+            lambda: SOSFilterStage(sos=np.ones((2, 5))),
+        )
+
+        for constructor in invalid_constructors:
+            with self.subTest(constructor=constructor):
+                with self.assertRaises(ValueError):
+                    constructor()
+
+    def test_filter_design_parameters_are_validated(self):
+        invalid_designs = (
+            lambda: FIRFilterStage.lowpass(cutoff_freq=0.0, sample_rate=2.0),
+            lambda: FIRFilterStage.lowpass(cutoff_freq=np.nan, sample_rate=2.0),
+            lambda: FIRFilterStage.bandpass(
+                cutoff_freq=(0.5, 0.2),
+                sample_rate=2.0,
+            ),
+            lambda: IIRFilterStage.butterworth(
+                order=2,
+                cutoff_freq=1.0,
+                sample_rate=2.0,
+            ),
+            lambda: SOSFilterStage.butterworth(
+                order=2,
+                cutoff_freq=0.2,
+                sample_rate=np.inf,
+            ),
+        )
+
+        for design in invalid_designs:
+            with self.subTest(design=design):
+                with self.assertRaises(ValueError):
+                    design()
+
+    def test_empty_iir_and_sos_traces_preserve_output_plane(self):
+        trace = self._trace([])
+        stages = (
+            IIRFilterStage(output_plane='qubit_rf'),
+            SOSFilterStage(output_plane='qubit_rf'),
+        )
+
+        for stage in stages:
+            with self.subTest(stage=stage.name):
+                output = stage.apply(trace)
+                self.assertEqual(len(output.values), 0)
+                self.assertEqual(output.plane, 'qubit_rf')
 
 
 class TransmissionChainTests(unittest.TestCase):
