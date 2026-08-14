@@ -91,6 +91,10 @@ schedule = module.ChannelSchedule(
 )
 wave, _ = generator.generate_channel_waveform(schedule, return_complex=True)
 assert np.allclose(np.real(wave), np.ones(4))
+trace = generator.generate_awg_output(schedule, mode='iq')
+assert trace.domain == 'iq_complex'
+assert trace.plane == 'awg_iq'
+assert np.allclose(trace.values, wave)
 """
         result = run_python(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)

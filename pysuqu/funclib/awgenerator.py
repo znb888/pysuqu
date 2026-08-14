@@ -5,13 +5,15 @@ Lib for arbitrary wave generator.
 
 import os
 import csv
+import sys
+import importlib.util
 import numpy as np
 from scipy.signal import windows, convolve
 from scipy.special import i0, i1
 from scipy.interpolate import interp1d
 from scipy.io import wavfile
 from dataclasses import dataclass, field
-from typing import Literal, Tuple, Callable, Optional, Union, List
+from typing import Any, Dict, Literal, Tuple, Callable, Optional, Union, List
 from pathlib import Path
 
 
@@ -23,6 +25,77 @@ def _load_plotly_graph_objects():
             "plotly is required for awgenerator plotting helpers"
         ) from exc
     return go
+
+
+def _load_transmission_module():
+    """Load transmission even when this file is imported outside its package."""
+    try:
+        from . import transmission as transmission_module
+        return transmission_module
+    except ImportError:
+        module_name = "_pysuqu_funclib_transmission_fallback"
+        cached = sys.modules.get(module_name)
+        if cached is not None:
+            return cached
+
+        module_path = Path(__file__).with_name("transmission.py")
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Unable to load transmission module from {module_path}")
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+
+
+@dataclass
+class _PerChannelBundleStage:
+    """Dispatch one single-trace stage per bundle channel."""
+
+    channel_stages: Dict[str, Any]
+    name: str = "per_channel_stage"
+    bundle_stage: bool = True
+
+    @property
+    def is_lti(self) -> bool:
+        return all(
+            stage is None or getattr(stage, "is_lti", False)
+            for stage in self.channel_stages.values()
+        )
+
+    def describe(self) -> str:
+        active = {
+            name: stage
+            for name, stage in self.channel_stages.items()
+            if stage is not None
+        }
+        if not active:
+            return f"{self.name}[identity]"
+
+        parts = []
+        for channel_name, stage in active.items():
+            describe = getattr(stage, "describe", None)
+            stage_name = getattr(stage, "name", stage.__class__.__name__)
+            stage_desc = str(describe()) if callable(describe) else str(stage_name)
+            parts.append(f"{channel_name}:{stage_desc}")
+        return f"{self.name}[" + ", ".join(parts) + "]"
+
+    def apply(self, bundle):
+        transmission = _load_transmission_module()
+        output_traces = {}
+        for channel_name in bundle.order:
+            trace = bundle[channel_name]
+            stage = self.channel_stages.get(channel_name)
+            output = trace if stage is None else stage.apply(trace)
+            if not isinstance(output, transmission.SignalTrace):
+                raise TypeError(
+                    f"{self.describe()} expected channel {channel_name!r} "
+                    "stage to return a SignalTrace."
+                )
+            output_traces[channel_name] = output
+
+        return bundle.clone(traces=output_traces, order=bundle.order)
 
 # --- Pulse Configuration ---
 @dataclass
@@ -120,6 +193,8 @@ class ChannelSchedule:
         sampling_rate (float): DAC sampling rate [GSa/s].
         mixer_config (MixerParams): Hardware mixer settings associated with this channel.
         events (List[PulseEvent]): List of pulse events to be added together.
+        fir_kernel (Optional[np.ndarray]): Legacy FIR correction applied at the AWG.
+        transmission_chain (Optional[Any]): Line model applied after AWG compilation.
     """
     name: str = "Channel_default"
     sampling_rate: float = 2.0
@@ -127,6 +202,7 @@ class ChannelSchedule:
     mixer_correction: bool = True
     events: List[PulseEvent] = field(default_factory=list)
     fir_kernel: Optional[np.ndarray] = None
+    transmission_chain: Optional[Any] = None
 
     def add_pulse(self, start_time: float, envelope: EnvelopeParams, 
                   freq: float = 0.0, phase: float = 0.0):
@@ -140,11 +216,39 @@ class ChannelSchedule:
         self.events.append(event)
         self.events.sort(key=lambda x: x.start_time)
 
+    def clone_with(self, **changes):
+        """Return a copy while preserving schedule-level metadata by default."""
+        field_values = {
+            "name": self.name,
+            "sampling_rate": self.sampling_rate,
+            "mixer_config": self.mixer_config,
+            "mixer_correction": self.mixer_correction,
+            "events": list(self.events),
+            "fir_kernel": (
+                None
+                if self.fir_kernel is None
+                else np.array(self.fir_kernel, copy=True)
+            ),
+            "transmission_chain": self.transmission_chain,
+        }
+        field_values.update(changes)
+        return ChannelSchedule(**field_values)
+
     def display(self) -> None:
         """Visual summary of the channel configuration."""
         print(f"\n{'='*15} Channel Schedule: {self.name} {'='*15}")
         print(f"Mixer LO: {self.mixer_config.lo_freq:.3f} GHz | SR: {self.sampling_rate:.2f} GSa/s")
         print(f"Corrections: Gain={self.mixer_config.gain_ratio}, Phase={self.mixer_config.phase_error}")
+        if self.fir_kernel is not None and len(self.fir_kernel) > 0:
+            print(f"Legacy FIR kernel length: {len(self.fir_kernel)}")
+        if self.transmission_chain is not None:
+            describe = getattr(self.transmission_chain, 'describe', None)
+            if callable(describe):
+                print(f"Transmission chain: {describe()}")
+            else:
+                stage_count = len(getattr(self.transmission_chain, 'stages', []))
+                chain_name = getattr(self.transmission_chain, 'name', 'chain')
+                print(f"Transmission chain: {chain_name} ({stage_count} stage(s))")
         print("-" * 65)
         print(f"{'Start (ns)':<12} | {'Freq (MHz)':<12} | {'Phase (rad)':<12} | {'Envelope'}")
         print("-" * 65)
@@ -548,7 +652,299 @@ class WaveformGenerator:
         self.t_axis = np.linspace(0, total_time, self.num_samples, endpoint=False)
         self.dt = 1.0 / sample_rate
 
-    def generate_channel_waveform(self, schedule: 'ChannelSchedule', 
+    def _validate_schedule_sampling_rate(self, schedule: 'ChannelSchedule') -> None:
+        if schedule.sampling_rate is None:
+            return
+        if not np.isclose(schedule.sampling_rate, self.sample_rate):
+            raise ValueError(
+                f"ChannelSchedule sampling_rate ({schedule.sampling_rate} GSa/s) "
+                f"does not match WaveformGenerator sample_rate ({self.sample_rate} GSa/s)."
+            )
+
+    @staticmethod
+    def _resolve_transmission_chain(
+        schedule: 'ChannelSchedule',
+        chain: Optional[Any] = None,
+    ) -> Optional[Any]:
+        return chain if chain is not None else schedule.transmission_chain
+
+    @staticmethod
+    def _normalize_schedule_collection(
+        schedules: Union[
+            Dict[str, 'ChannelSchedule'],
+            List['ChannelSchedule'],
+            Tuple['ChannelSchedule', ...],
+        ],
+    ) -> Dict[str, 'ChannelSchedule']:
+        if isinstance(schedules, dict):
+            schedule_map = dict(schedules)
+        else:
+            schedule_map = {}
+            for index, schedule in enumerate(schedules):
+                if not isinstance(schedule, ChannelSchedule):
+                    raise TypeError("Schedule collections must contain ChannelSchedule objects.")
+                name = schedule.name or f"channel_{index}"
+                if name in schedule_map:
+                    raise ValueError(
+                        f"Duplicate channel name {name!r} in schedule collection. "
+                        "Pass a dict to disambiguate channels explicitly."
+                    )
+                schedule_map[name] = schedule
+
+        if not schedule_map:
+            raise ValueError("At least one ChannelSchedule is required.")
+        for name, schedule in schedule_map.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("Bundle channel names must be non-empty strings.")
+            if not isinstance(schedule, ChannelSchedule):
+                raise TypeError("Schedule collections must contain ChannelSchedule objects.")
+        return schedule_map
+
+    @staticmethod
+    def _coerce_bundle_chain(chain: Any):
+        transmission = _load_transmission_module()
+        if chain is None:
+            return None
+        if isinstance(chain, transmission.BundleTransmissionChain):
+            return chain
+        if isinstance(chain, transmission.TransmissionChain):
+            return transmission.BundleTransmissionChain(
+                name=getattr(chain, 'name', 'bundle_chain'),
+                stages=list(chain.stages),
+            )
+        if hasattr(chain, 'stages'):
+            return transmission.BundleTransmissionChain(
+                name=getattr(chain, 'name', 'bundle_chain'),
+                stages=list(chain.stages),
+            )
+        return transmission.BundleTransmissionChain(stages=[chain])
+
+    @staticmethod
+    def _expand_single_trace_chain_stages(chain: Any) -> List[Any]:
+        transmission = _load_transmission_module()
+        if chain is None:
+            return []
+        if isinstance(chain, transmission.BundleTransmissionChain):
+            raise TypeError(
+                "ChannelSchedule.transmission_chain must be a single-trace stage or "
+                "TransmissionChain when auto-resolving a bundle. Pass MIMO chains "
+                "explicitly via generate_qubit_bundle(..., chain=...)."
+            )
+        if isinstance(chain, transmission.TransmissionChain):
+            return list(chain.stages)
+        if hasattr(chain, 'stages'):
+            stages = list(chain.stages)
+            if any(getattr(stage, 'bundle_stage', False) for stage in stages):
+                raise TypeError(
+                    "ChannelSchedule.transmission_chain contains bundle stages. "
+                    "Pass MIMO chains explicitly via generate_qubit_bundle(..., chain=...)."
+                )
+            return stages
+        if getattr(chain, 'bundle_stage', False):
+            raise TypeError(
+                "ChannelSchedule.transmission_chain cannot be a bundle-only stage. "
+                "Pass it explicitly via generate_qubit_bundle(..., chain=...)."
+            )
+        return [chain]
+
+    def _resolve_bundle_chain(
+        self,
+        schedule_map: Dict[str, 'ChannelSchedule'],
+        chain: Optional[Any] = None,
+    ):
+        transmission = _load_transmission_module()
+        if chain is not None:
+            return self._coerce_bundle_chain(chain)
+
+        per_channel_stages = {
+            name: self._expand_single_trace_chain_stages(schedule.transmission_chain)
+            for name, schedule in schedule_map.items()
+        }
+        stage_count = max(
+            (len(stages) for stages in per_channel_stages.values()),
+            default=0,
+        )
+        if stage_count == 0:
+            return None
+
+        derived_stages = []
+        for stage_index in range(stage_count):
+            channel_stages = {
+                name: stages[stage_index] if stage_index < len(stages) else None
+                for name, stages in per_channel_stages.items()
+            }
+            derived_stages.append(
+                _PerChannelBundleStage(
+                    channel_stages=channel_stages,
+                    name=f"per_channel_stage_{stage_index + 1}",
+                )
+            )
+
+        return transmission.BundleTransmissionChain(
+            name="auto_schedule_bundle_chain",
+            stages=derived_stages,
+        )
+
+    def _build_signal_trace(
+        self,
+        values: np.ndarray,
+        domain: Literal['iq_complex', 'rf_real'],
+        plane: str,
+        schedule: 'ChannelSchedule',
+        label_suffix: str,
+    ):
+        transmission = _load_transmission_module()
+        return transmission.SignalTrace(
+            t_axis=self.t_axis.copy(),
+            values=np.array(values, copy=True),
+            sample_rate=self.sample_rate,
+            domain=domain,
+            plane=plane,
+            lo_freq=schedule.mixer_config.lo_freq,
+            label=f"{schedule.name}_{label_suffix}",
+            metadata={"schedule_name": schedule.name},
+        )
+
+    @staticmethod
+    def _apply_transmission(chain: Any, payload: Any, capture_history: bool):
+        try:
+            return chain.apply(payload, capture_history=capture_history)
+        except TypeError as exc:
+            message = str(exc).lower()
+            unsupported_keyword = (
+                "capture_history" in message
+                and ("unexpected keyword" in message or "keyword argument" in message)
+            )
+            if not unsupported_keyword:
+                raise
+            output = chain.apply(payload)
+            if not capture_history:
+                return output
+
+            transmission = _load_transmission_module()
+            if isinstance(payload, transmission.SignalTrace):
+                if not isinstance(output, transmission.SignalTrace):
+                    raise TypeError("Transmission stages must return a SignalTrace.")
+                return transmission.TransmissionResult(
+                    input_trace=payload,
+                    output_trace=output,
+                    stage_outputs=[output],
+                )
+            if isinstance(payload, transmission.SignalBundle):
+                if not isinstance(output, transmission.SignalBundle):
+                    raise TypeError("Bundle transmission stages must return a SignalBundle.")
+                return transmission.BundleTransmissionResult(
+                    input_bundle=payload,
+                    output_bundle=output,
+                    stage_outputs=[output],
+                )
+            raise TypeError("Unsupported transmission payload type.")
+
+    def _finalize_qubit_trace(
+        self,
+        trace,
+        *,
+        schedule: 'ChannelSchedule',
+        mode: Literal['iq', 'rf'],
+        input_plane: str,
+    ):
+        transmission = _load_transmission_module()
+        if not isinstance(trace, transmission.SignalTrace):
+            raise TypeError("Transmission chains must return a SignalTrace.")
+
+        expected_domain = 'iq_complex' if mode == 'iq' else 'rf_real'
+        output_plane = 'qubit_iq' if mode == 'iq' else 'qubit_rf'
+        if trace.domain != expected_domain:
+            raise ValueError(
+                f"Transmission chain produced domain {trace.domain} for mode={mode!r}, "
+                f"expected {expected_domain}."
+            )
+        if trace.plane not in (input_plane, output_plane):
+            raise ValueError(
+                f"Transmission chain produced plane {trace.plane} for mode={mode!r}. "
+                f"Expected either {input_plane} or {output_plane}."
+            )
+        return trace.clone(plane=output_plane, label=f"{schedule.name}_{output_plane}")
+
+    def _finalize_qubit_bundle(
+        self,
+        bundle,
+        *,
+        mode: Literal['iq', 'rf'],
+        input_plane: str,
+    ):
+        transmission = _load_transmission_module()
+        if not isinstance(bundle, transmission.SignalBundle):
+            raise TypeError("Bundle transmission chains must return a SignalBundle.")
+
+        expected_domain = 'iq_complex' if mode == 'iq' else 'rf_real'
+        output_plane = 'qubit_iq' if mode == 'iq' else 'qubit_rf'
+        if bundle.domain != expected_domain:
+            raise ValueError(
+                f"Transmission chain produced bundle domain {bundle.domain} for "
+                f"mode={mode!r}, expected {expected_domain}."
+            )
+        if bundle.plane not in (input_plane, output_plane):
+            raise ValueError(
+                f"Transmission chain produced bundle plane {bundle.plane} for "
+                f"mode={mode!r}. Expected either {input_plane} or {output_plane}."
+            )
+
+        traces = {
+            name: trace.clone(plane=output_plane, label=f"{name}_{output_plane}")
+            for name, trace in bundle.traces.items()
+        }
+        return bundle.clone(
+            traces=traces,
+            order=bundle.order,
+            label=f"{bundle.label}_{output_plane}",
+        )
+
+    def _compile_modulated_complex_wave(self, schedule: 'ChannelSchedule') -> np.ndarray:
+        self._validate_schedule_sampling_rate(schedule)
+
+        full_complex_wave = np.zeros(self.num_samples, dtype=np.complex128)
+        global_phase_accum = 0.0
+        for event in sorted(schedule.events, key=lambda item: item.start_time):
+            start_idx = int(np.round(event.start_time * self.sample_rate))
+            duration_samples = int(np.round(event.envelope.duration * self.sample_rate))
+            if start_idx >= self.num_samples:
+                continue
+            end_idx = min(start_idx + duration_samples, self.num_samples)
+            actual_len = end_idx - start_idx
+            if actual_len <= 0:
+                continue
+
+            t_local = np.linspace(0, actual_len * self.dt, actual_len, endpoint=False)
+            baseband_pulse = self._generate_baseband(t_local, event.envelope)
+            t_absolute = self.t_axis[start_idx:end_idx]
+            phase_term = event.phase_offset + global_phase_accum + (
+                2 * np.pi * event.if_freq * t_absolute
+            )
+            full_complex_wave[start_idx:end_idx] += (
+                baseband_pulse * np.exp(1j * phase_term)
+            )
+            global_phase_accum += event.frame_change
+
+        return full_complex_wave
+
+    def _compile_awg_iq_complex(self, schedule: 'ChannelSchedule') -> np.ndarray:
+        full_complex_wave = self._compile_modulated_complex_wave(schedule)
+        if schedule.mixer_correction:
+            I_dac, Q_dac = self._apply_mixer_correction(
+                full_complex_wave,
+                schedule.mixer_config,
+            )
+        else:
+            I_dac = np.real(full_complex_wave)
+            Q_dac = np.imag(full_complex_wave)
+
+        if schedule.fir_kernel is not None and len(schedule.fir_kernel) > 0:
+            I_dac = self._apply_fir_filter(I_dac, schedule.fir_kernel)
+            Q_dac = self._apply_fir_filter(Q_dac, schedule.fir_kernel)
+        return I_dac + 1j * Q_dac
+
+    def generate_channel_waveform(self, schedule: 'ChannelSchedule',
                                   return_complex: bool = False) -> Tuple[np.ndarray, np.ndarray]:
         """
         Generates the final DAC waveforms (I and Q) for a specific Channel Schedule.
@@ -556,53 +952,17 @@ class WaveformGenerator:
 
         Args:
             schedule (ChannelSchedule): The schedule containing events and mixer config.
-            return_complex (bool): If True, returns (Complex_Wave, None). 
+            return_complex (bool): If True, returns (Complex_Wave, None).
                                    If False, returns (I_dac, Q_dac).
-            is_mixercorrect (bool): Whether to correct the mixer error. 
+            is_mixercorrect (bool): Whether to correct the mixer error.
 
         Returns:
             Tuple[np.ndarray, np.ndarray]: (I_array, Q_array) calibrated for the DAC.
         """
-        full_complex_wave = np.zeros(self.num_samples, dtype=np.complex128)
-        global_phase_accum = 0.0
-        sorted_events = sorted(schedule.events, key=lambda x: x.start_time)
-
-        for event in sorted_events:
-            start_idx = int(np.round(event.start_time * self.sample_rate))
-            duration_samples = int(np.round(event.envelope.duration * self.sample_rate))
-            
-            # Boundary checks
-            if start_idx >= self.num_samples: continue
-            end_idx = start_idx + duration_samples
-            if end_idx > self.num_samples: end_idx = self.num_samples
-            actual_len = end_idx - start_idx
-            if actual_len <= 0: continue
-
-            t_local = np.linspace(0, actual_len * self.dt, actual_len, endpoint=False)
-            baseband_pulse = self._generate_baseband(t_local, event.envelope)
-
-            t_absolute = self.t_axis[start_idx:end_idx]
-            phase_term = (event.phase_offset + global_phase_accum) + \
-                         (2 * np.pi * event.if_freq * t_absolute) # if_freq is in GHz, t in ns
-            modulated_pulse = baseband_pulse * np.exp(1j * phase_term)
-            full_complex_wave[start_idx:end_idx] += modulated_pulse
-            
-            global_phase_accum += event.frame_change
-
-        if schedule.mixer_correction:
-            I_dac, Q_dac = self._apply_mixer_correction(full_complex_wave, schedule.mixer_config)
-        else:
-            I_dac = np.real(full_complex_wave)
-            Q_dac = np.imag(full_complex_wave)
-        if schedule.fir_kernel is not None and len(schedule.fir_kernel) > 0:
-            I_dac = self._apply_fir_filter(I_dac, schedule.fir_kernel)
-            Q_dac = self._apply_fir_filter(Q_dac, schedule.fir_kernel)
-
+        awg_iq = self._compile_awg_iq_complex(schedule)
         if return_complex:
-            full_complex_wave = I_dac + 1j * Q_dac
-            return full_complex_wave, None
-        else:
-            return I_dac, Q_dac
+            return awg_iq, None
+        return np.real(awg_iq), np.imag(awg_iq)
 
     def generate_rf_waveform(self, schedule: 'ChannelSchedule') -> np.ndarray:
         """
@@ -620,6 +980,222 @@ class WaveformGenerator:
         rf_wave = I_dac * np.cos(w_lo * self.t_axis) - Q_dac * np.sin(w_lo * self.t_axis)
         
         return rf_wave
+
+    def generate_awg_output(
+        self,
+        schedule: 'ChannelSchedule',
+        mode: Literal['iq', 'rf'] = 'iq',
+    ):
+        """Return the AWG-side sampled signal as a SignalTrace."""
+        if mode == 'iq':
+            return self._build_signal_trace(
+                self._compile_awg_iq_complex(schedule),
+                domain='iq_complex',
+                plane='awg_iq',
+                schedule=schedule,
+                label_suffix='awg_iq',
+            )
+        if mode == 'rf':
+            return self._build_signal_trace(
+                self.generate_rf_waveform(schedule),
+                domain='rf_real',
+                plane='awg_rf',
+                schedule=schedule,
+                label_suffix='awg_rf',
+            )
+        raise ValueError(f"Unsupported AWG output mode: {mode}")
+
+    def generate_awg_bundle(
+        self,
+        schedules: Union[
+            Dict[str, 'ChannelSchedule'],
+            List['ChannelSchedule'],
+            Tuple['ChannelSchedule', ...],
+        ],
+        mode: Literal['iq', 'rf'] = 'iq',
+    ):
+        """Return multiple aligned AWG traces as one SignalBundle."""
+        transmission = _load_transmission_module()
+        schedule_map = self._normalize_schedule_collection(schedules)
+        traces = {
+            name: self.generate_awg_output(schedule, mode=mode).clone(
+                label=f"{name}_awg_{mode}"
+            )
+            for name, schedule in schedule_map.items()
+        }
+        return transmission.SignalBundle(
+            traces=traces,
+            order=tuple(schedule_map),
+            label=f"awg_{mode}_bundle",
+        )
+
+    def generate_qubit_output(
+        self,
+        schedule: 'ChannelSchedule',
+        chain: Optional[Any] = None,
+        mode: Literal['iq', 'rf'] = 'rf',
+        capture_history: bool = False,
+    ):
+        """Return one solver-facing trace after its optional transmission chain."""
+        transmission = _load_transmission_module()
+        resolved_chain = self._resolve_transmission_chain(schedule, chain)
+        awg_trace = self.generate_awg_output(schedule, mode=mode)
+
+        if resolved_chain is None:
+            output_trace = self._finalize_qubit_trace(
+                awg_trace,
+                schedule=schedule,
+                mode=mode,
+                input_plane=awg_trace.plane,
+            )
+            if capture_history:
+                return transmission.TransmissionResult(
+                    input_trace=awg_trace,
+                    output_trace=output_trace,
+                    stage_outputs=[],
+                )
+            return output_trace
+
+        chain_input = awg_trace
+        try:
+            applied = self._apply_transmission(
+                resolved_chain,
+                chain_input,
+                capture_history,
+            )
+        except ValueError as exc:
+            if not (mode == 'rf' and self._chain_requires_iq_fallback(exc)):
+                raise
+            chain_input = self.generate_awg_output(schedule, mode='iq')
+            applied = self._apply_transmission(
+                resolved_chain,
+                chain_input,
+                capture_history,
+            )
+
+        if capture_history:
+            output_trace = applied.output_trace
+            if mode == 'rf' and output_trace.domain == 'iq_complex':
+                output_trace = self.convert_iq_trace_to_rf(
+                    output_trace,
+                    output_plane='qubit_rf',
+                )
+            output_trace = self._finalize_qubit_trace(
+                output_trace,
+                schedule=schedule,
+                mode=mode,
+                input_plane=chain_input.plane,
+            )
+            stage_outputs = [
+                stage_trace.clone(label=f"{schedule.name}_{stage_trace.label}")
+                for stage_trace in applied.stage_outputs
+            ]
+            return transmission.TransmissionResult(
+                input_trace=applied.input_trace,
+                output_trace=output_trace,
+                stage_outputs=stage_outputs,
+            )
+
+        output_trace = applied
+        if mode == 'rf' and output_trace.domain == 'iq_complex':
+            output_trace = self.convert_iq_trace_to_rf(
+                output_trace,
+                output_plane='qubit_rf',
+            )
+        return self._finalize_qubit_trace(
+            output_trace,
+            schedule=schedule,
+            mode=mode,
+            input_plane=chain_input.plane,
+        )
+
+    def generate_qubit_bundle(
+        self,
+        schedules: Union[
+            Dict[str, 'ChannelSchedule'],
+            List['ChannelSchedule'],
+            Tuple['ChannelSchedule', ...],
+        ],
+        chain: Optional[Any] = None,
+        mode: Literal['iq', 'rf'] = 'rf',
+        capture_history: bool = False,
+    ):
+        """Return multiple solver-facing traces after an optional bundle chain."""
+        transmission = _load_transmission_module()
+        schedule_map = self._normalize_schedule_collection(schedules)
+        resolved_chain = self._resolve_bundle_chain(schedule_map, chain)
+        awg_bundle = self.generate_awg_bundle(schedule_map, mode=mode)
+
+        if resolved_chain is None:
+            output_bundle = self._finalize_qubit_bundle(
+                awg_bundle,
+                mode=mode,
+                input_plane=awg_bundle.plane,
+            )
+            if capture_history:
+                return transmission.BundleTransmissionResult(
+                    input_bundle=awg_bundle,
+                    output_bundle=output_bundle,
+                    stage_outputs=[],
+                )
+            return output_bundle
+
+        chain_input = awg_bundle
+        try:
+            applied = self._apply_transmission(
+                resolved_chain,
+                chain_input,
+                capture_history,
+            )
+        except ValueError as exc:
+            if not (mode == 'rf' and self._chain_requires_iq_fallback(exc)):
+                raise
+            chain_input = self.generate_awg_bundle(schedule_map, mode='iq')
+            applied = self._apply_transmission(
+                resolved_chain,
+                chain_input,
+                capture_history,
+            )
+
+        if capture_history:
+            output_bundle = applied.output_bundle
+            if mode == 'rf' and output_bundle.domain == 'iq_complex':
+                output_bundle = self.convert_iq_bundle_to_rf(output_bundle)
+            output_bundle = self._finalize_qubit_bundle(
+                output_bundle,
+                mode=mode,
+                input_plane=chain_input.plane,
+            )
+            return transmission.BundleTransmissionResult(
+                input_bundle=applied.input_bundle,
+                output_bundle=output_bundle,
+                stage_outputs=[
+                    stage_bundle.clone(label=f"{stage_bundle.label}_{index}")
+                    for index, stage_bundle in enumerate(
+                        applied.stage_outputs,
+                        start=1,
+                    )
+                ],
+            )
+
+        output_bundle = applied
+        if mode == 'rf' and output_bundle.domain == 'iq_complex':
+            output_bundle = self.convert_iq_bundle_to_rf(output_bundle)
+        return self._finalize_qubit_bundle(
+            output_bundle,
+            mode=mode,
+            input_plane=chain_input.plane,
+        )
+
+    @staticmethod
+    def _chain_requires_iq_fallback(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "expects iq_complex" in message and "received rf_real" in message
+
+    @staticmethod
+    def _chain_requires_rf_fallback(exc: Exception) -> bool:
+        message = str(exc).lower()
+        return "expects rf_real" in message and "received iq_complex" in message
 
     def _generate_baseband(self, t: np.ndarray, env_params: 'EnvelopeParams') -> np.ndarray:
         """
@@ -807,8 +1383,13 @@ class WaveformGenerator:
         channel.events.append(pulse)
         self.plot_schedule(channel, plot_mode)
     
-    def get_qutip_func(self, schedule: 'ChannelSchedule', 
-                       mode: Literal['rf', 'complex_envelope'] = 'rf') -> Callable:
+    def get_qutip_func(
+        self,
+        schedule: 'ChannelSchedule',
+        mode: Literal['rf', 'complex_envelope'] = 'rf',
+        chain: Optional[Any] = None,
+        plane: Literal['awg', 'qubit'] = 'qubit',
+    ) -> Callable:
         """
         Returns a closure function `func(t, args)` compatible with QuTiP solvers.
         
@@ -824,27 +1405,35 @@ class WaveformGenerator:
         Returns:
             Callable[[float, dict], float|complex]: The time-dependent coefficient function.
         """
-        I_dac, Q_dac = self.generate_channel_waveform(schedule)
+        if plane not in ('awg', 'qubit'):
+            raise ValueError(f"Unsupported waveform plane: {plane}")
+        if mode not in ('rf', 'complex_envelope'):
+            raise ValueError(f"Unsupported QuTiP drive mode: {mode}")
 
-        t_axis = self.t_axis
-        lo_freq = schedule.mixer_config.lo_freq
+        if mode == 'complex_envelope':
+            trace = (
+                self.generate_awg_output(schedule, mode='iq')
+                if plane == 'awg'
+                else self.generate_qubit_output(schedule, chain=chain, mode='iq')
+            )
+            return self._trace_to_qutip_func(trace)
 
-        def qutip_drive_func(t: float, args=None):
-            """
-            Inner function called by QuTiP solver at every time step.
-            t: Time in simulation units (assuming ns to match WaveformGenerator).
-            """
-            i_val = np.interp(t, t_axis, I_dac, left=0.0, right=0.0)
-            q_val = np.interp(t, t_axis, Q_dac, left=0.0, right=0.0)
-            
-            if mode == 'complex_envelope':
-                return i_val + 1j * q_val
-            
-            else: # mode == 'rf'
-                phase_lo = 2 * np.pi * lo_freq * t
-                return i_val * np.cos(phase_lo) - q_val * np.sin(phase_lo)
+        # Mix the carrier at solver query time whenever the chain accepts IQ. This
+        # preserves the continuous LO even when the sampled envelope is below the
+        # RF Nyquist rate.
+        try:
+            trace = (
+                self.generate_awg_output(schedule, mode='iq')
+                if plane == 'awg'
+                else self.generate_qubit_output(schedule, chain=chain, mode='iq')
+            )
+            return self.trace_to_qutip_rf_func(trace)
+        except ValueError as exc:
+            if plane == 'awg' or not self._chain_requires_rf_fallback(exc):
+                raise
 
-        return qutip_drive_func
+        trace = self.generate_qubit_output(schedule, chain=chain, mode='rf')
+        return self._trace_to_qutip_func(trace)
 
     @staticmethod
     def _trace_to_qutip_func(trace) -> Callable:
@@ -899,6 +1488,128 @@ class WaveformGenerator:
             return i_val * np.cos(carrier_phase) - q_val * np.sin(carrier_phase)
 
         return qutip_drive_func
+
+    def convert_iq_trace_to_rf(
+        self,
+        trace,
+        *,
+        lo_freq: Optional[float] = None,
+        output_plane: Optional[str] = None,
+    ):
+        """Mix one IQ SignalTrace onto its LO carrier."""
+        transmission = _load_transmission_module()
+        if not isinstance(trace, transmission.SignalTrace):
+            raise TypeError("convert_iq_trace_to_rf expects a SignalTrace input.")
+        if trace.domain != 'iq_complex':
+            raise ValueError("convert_iq_trace_to_rf requires an iq_complex SignalTrace.")
+
+        carrier_freq = float(trace.lo_freq if lo_freq is None else lo_freq)
+        if output_plane is None:
+            plane_map = {'awg_iq': 'awg_rf', 'qubit_iq': 'qubit_rf'}
+            try:
+                resolved_plane = plane_map[trace.plane]
+            except KeyError as exc:
+                raise ValueError(
+                    "output_plane must be provided when converting an IQ trace "
+                    f"from plane {trace.plane!r}."
+                ) from exc
+        else:
+            resolved_plane = output_plane
+
+        carrier_phase = 2 * np.pi * carrier_freq * trace.t_axis
+        rf_values = (
+            np.real(trace.values) * np.cos(carrier_phase)
+            - np.imag(trace.values) * np.sin(carrier_phase)
+        )
+        return trace.clone(
+            values=np.asarray(rf_values, dtype=np.float64),
+            domain='rf_real',
+            plane=resolved_plane,
+            lo_freq=carrier_freq,
+            label=f"{trace.label}_rf",
+            metadata={**trace.metadata, "converted_from": trace.label},
+        )
+
+    def convert_iq_bundle_to_rf(
+        self,
+        bundle,
+        *,
+        output_plane: Optional[str] = None,
+    ):
+        """Mix every trace in one IQ SignalBundle onto its own LO carrier."""
+        transmission = _load_transmission_module()
+        if not isinstance(bundle, transmission.SignalBundle):
+            raise TypeError("convert_iq_bundle_to_rf expects a SignalBundle input.")
+        if bundle.domain != 'iq_complex':
+            raise ValueError("convert_iq_bundle_to_rf requires an iq_complex SignalBundle.")
+
+        if output_plane is None:
+            first_plane = bundle[bundle.order[0]].plane
+            plane_map = {'awg_iq': 'awg_rf', 'qubit_iq': 'qubit_rf'}
+            try:
+                resolved_plane = plane_map[first_plane]
+            except KeyError as exc:
+                raise ValueError(
+                    "output_plane must be provided when converting an IQ bundle "
+                    f"from plane {first_plane!r}."
+                ) from exc
+        else:
+            resolved_plane = output_plane
+
+        converted_traces = {
+            name: self.convert_iq_trace_to_rf(trace, output_plane=resolved_plane)
+            for name, trace in bundle.traces.items()
+        }
+        return bundle.clone(
+            traces=converted_traces,
+            order=bundle.order,
+            label=f"{bundle.label}_rf",
+        )
+
+    def get_qutip_bundle_funcs(
+        self,
+        schedules: Union[
+            Dict[str, 'ChannelSchedule'],
+            List['ChannelSchedule'],
+            Tuple['ChannelSchedule', ...],
+        ],
+        mode: Literal['rf', 'complex_envelope'] = 'rf',
+        chain: Optional[Any] = None,
+        plane: Literal['awg', 'qubit'] = 'qubit',
+    ) -> Dict[str, Callable]:
+        """Compile a bundle into QuTiP callbacks keyed by output channel."""
+        if plane not in ('awg', 'qubit'):
+            raise ValueError(f"Unsupported waveform plane: {plane}")
+        if mode not in ('rf', 'complex_envelope'):
+            raise ValueError(f"Unsupported QuTiP drive mode: {mode}")
+
+        if mode == 'complex_envelope':
+            trace_mode = 'iq'
+        else:
+            try:
+                bundle = (
+                    self.generate_awg_bundle(schedules, mode='iq')
+                    if plane == 'awg'
+                    else self.generate_qubit_bundle(schedules, chain=chain, mode='iq')
+                )
+                return {
+                    name: self.trace_to_qutip_rf_func(bundle[name])
+                    for name in bundle.order
+                }
+            except ValueError as exc:
+                if plane == 'awg' or not self._chain_requires_rf_fallback(exc):
+                    raise
+                trace_mode = 'rf'
+
+        bundle = (
+            self.generate_awg_bundle(schedules, mode=trace_mode)
+            if plane == 'awg'
+            else self.generate_qubit_bundle(schedules, chain=chain, mode=trace_mode)
+        )
+        return {
+            name: self._trace_to_qutip_func(bundle[name])
+            for name in bundle.order
+        }
 
 
 class WaveformDerivatives:
