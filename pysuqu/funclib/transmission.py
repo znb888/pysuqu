@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Literal, Optional, Protocol, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Literal, Optional, Protocol, Sequence, Tuple, Union
 
 import numpy as np
 from scipy.signal import butter, convolve, firwin, get_window, lfilter, sosfilt
@@ -111,6 +111,37 @@ def _validate_filter_sample_rate(
             f"{stage_name} was designed for sample_rate={design_sample_rate}, "
             f"received trace sample_rate={trace_sample_rate}."
         )
+
+
+def _resolve_derivative_orders(
+    derivative_orders: Optional[Iterable[int]],
+    coefficient_count: int,
+) -> tuple[int, ...]:
+    if coefficient_count < 0:
+        raise ValueError("coefficient_count must be non-negative.")
+    if derivative_orders is None:
+        return tuple(range(1, coefficient_count + 1))
+
+    raw_orders = tuple(derivative_orders)
+    if len(raw_orders) != coefficient_count:
+        raise ValueError(
+            "derivative_orders must contain exactly one order for each coefficient."
+        )
+
+    orders = []
+    for order in raw_orders:
+        if isinstance(order, (bool, np.bool_)) or not isinstance(
+            order,
+            (int, np.integer),
+        ):
+            raise ValueError("Derivative orders must be positive integers.")
+        orders.append(int(order))
+
+    if any(order <= 0 for order in orders):
+        raise ValueError("Derivative orders must be positive integers.")
+    if len(set(orders)) != len(orders):
+        raise ValueError("Derivative orders must be unique.")
+    return tuple(orders)
 
 
 def _infer_touchstone_port_count(path: Union[str, Path]) -> int:
@@ -373,6 +404,320 @@ class SignalTrace:
     def clone(self, **changes: Any) -> "SignalTrace":
         """Return a copy with selected fields replaced."""
         return replace(self, **changes)
+
+
+def _validate_derivative_options(
+    sample_period: float,
+    edge_order: int,
+    normalization_epsilon: float,
+) -> None:
+    if not np.isfinite(sample_period) or sample_period <= 0:
+        raise ValueError("sample_period must be positive and finite.")
+    if edge_order not in (1, 2):
+        raise ValueError("edge_order must be 1 or 2.")
+    if not np.isfinite(normalization_epsilon) or normalization_epsilon <= 0:
+        raise ValueError("normalization_epsilon must be positive and finite.")
+
+
+def compute_derivative_basis(
+    values: Union[np.ndarray, Iterable[complex]],
+    sample_period: float,
+    derivative_orders: Sequence[int],
+    *,
+    normalize_to_peak: bool = False,
+    reference_peak: Optional[float] = None,
+    edge_order: int = 2,
+    normalization_epsilon: float = 1e-15,
+) -> tuple[list[np.ndarray], np.ndarray]:
+    """Build finite-difference derivative basis waveforms in requested order."""
+    base_values = np.asarray(values, dtype=np.complex128)
+    if base_values.ndim != 1:
+        raise ValueError("compute_derivative_basis expects a 1D waveform.")
+    if np.any(~np.isfinite(base_values)):
+        raise ValueError("Derivative basis input values must be finite.")
+    _validate_derivative_options(sample_period, edge_order, normalization_epsilon)
+
+    raw_orders = tuple(derivative_orders)
+    orders = _resolve_derivative_orders(raw_orders, len(raw_orders))
+    if not orders:
+        return [], np.array([], dtype=np.float64)
+    if len(base_values) < 2:
+        raise ValueError("Derivative basis generation requires at least two samples.")
+
+    resolved_edge_order = 2 if edge_order == 2 and len(base_values) >= 3 else 1
+    current = base_values.copy()
+    basis_by_order: dict[int, np.ndarray] = {}
+    for order in range(1, max(orders) + 1):
+        current = np.gradient(
+            current,
+            sample_period,
+            edge_order=resolved_edge_order,
+        )
+        basis_by_order[order] = np.asarray(current, dtype=np.complex128)
+
+    if reference_peak is None:
+        target_peak = float(np.max(np.abs(base_values)))
+    else:
+        target_peak = float(reference_peak)
+        if not np.isfinite(target_peak) or target_peak < 0:
+            raise ValueError("reference_peak must be non-negative and finite.")
+
+    basis_list = []
+    basis_scales = []
+    for order in orders:
+        basis = basis_by_order[order]
+        scale = 1.0
+        if normalize_to_peak:
+            basis_peak = float(np.max(np.abs(basis)))
+            if (
+                basis_peak <= normalization_epsilon
+                or target_peak <= normalization_epsilon
+            ):
+                scale = 0.0
+            else:
+                scale = target_peak / basis_peak
+        basis_list.append(np.asarray(basis * scale, dtype=np.complex128))
+        basis_scales.append(float(scale))
+
+    return basis_list, np.asarray(basis_scales, dtype=np.float64)
+
+
+def apply_derivative_precorrection(
+    values: Union[np.ndarray, Iterable[complex]],
+    sample_period: float,
+    coefficients: Union[np.ndarray, Iterable[complex]],
+    *,
+    derivative_orders: Optional[Sequence[int]] = None,
+    normalize_to_peak: bool = True,
+    phase_rad: float = 0.0,
+    edge_order: int = 2,
+    normalization_epsilon: float = 1e-15,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Add weighted derivative terms and an optional phase to one waveform."""
+    base_values = np.asarray(values, dtype=np.complex128)
+    if base_values.ndim != 1:
+        raise ValueError("apply_derivative_precorrection expects a 1D waveform.")
+    if np.any(~np.isfinite(base_values)):
+        raise ValueError("Precorrection input values must be finite.")
+    _validate_derivative_options(sample_period, edge_order, normalization_epsilon)
+    if not np.isfinite(phase_rad):
+        raise ValueError("phase_rad must be finite.")
+
+    coeff_array = np.asarray(tuple(coefficients), dtype=np.complex128).reshape(-1)
+    if np.any(~np.isfinite(coeff_array)):
+        raise ValueError("Derivative coefficients must be finite.")
+    orders = _resolve_derivative_orders(derivative_orders, len(coeff_array))
+    basis_list, basis_scales = compute_derivative_basis(
+        base_values,
+        sample_period,
+        orders,
+        normalize_to_peak=normalize_to_peak,
+        edge_order=edge_order,
+        normalization_epsilon=normalization_epsilon,
+    )
+
+    corrected = base_values.copy()
+    for coefficient, basis in zip(coeff_array, basis_list):
+        corrected += coefficient * basis
+    if abs(phase_rad) >= normalization_epsilon:
+        corrected *= np.exp(1j * float(phase_rad))
+
+    metadata = {
+        "derivative_orders": list(orders),
+        "basis_scales": [float(scale) for scale in basis_scales],
+        "phase_rad": float(phase_rad),
+        "normalize_to_peak": bool(normalize_to_peak),
+        "coefficients_real": [float(np.real(value)) for value in coeff_array],
+        "coefficients_imag": [float(np.imag(value)) for value in coeff_array],
+    }
+    return np.asarray(corrected, dtype=np.complex128), metadata
+
+
+@dataclass(frozen=True)
+class DerivativePrecorrectionDesign:
+    """Least-squares design result for derivative-polynomial precorrection."""
+
+    coefficients: np.ndarray
+    derivative_orders: tuple[int, ...] = ()
+    phase_rad: float = 0.0
+    normalize_to_peak: bool = True
+    edge_order: int = 2
+    basis_scales: np.ndarray = field(
+        default_factory=lambda: np.array([], dtype=np.float64)
+    )
+    spectral_weights: np.ndarray = field(
+        default_factory=lambda: np.array([], dtype=np.float64)
+    )
+    residual_rms: float = 0.0
+
+    def __post_init__(self) -> None:
+        coefficients = np.asarray(self.coefficients, dtype=np.complex128).reshape(-1)
+        if np.any(~np.isfinite(coefficients)):
+            raise ValueError("Derivative coefficients must be finite.")
+        raw_orders = tuple(self.derivative_orders)
+        orders = _resolve_derivative_orders(
+            raw_orders if raw_orders else None,
+            len(coefficients),
+        )
+        basis_scales = np.asarray(self.basis_scales, dtype=np.float64).reshape(-1)
+        spectral_weights = np.asarray(
+            self.spectral_weights,
+            dtype=np.float64,
+        ).reshape(-1)
+        if len(basis_scales) not in (0, len(coefficients)):
+            raise ValueError("basis_scales must be empty or match coefficients length.")
+        if np.any(~np.isfinite(basis_scales)):
+            raise ValueError("basis_scales must be finite.")
+        if np.any(~np.isfinite(spectral_weights)) or np.any(spectral_weights < 0):
+            raise ValueError("spectral_weights must be non-negative and finite.")
+        if not np.isfinite(self.phase_rad):
+            raise ValueError("phase_rad must be finite.")
+        if self.edge_order not in (1, 2):
+            raise ValueError("edge_order must be 1 or 2.")
+        if not np.isfinite(self.residual_rms) or self.residual_rms < 0:
+            raise ValueError("residual_rms must be non-negative and finite.")
+
+        object.__setattr__(self, "coefficients", coefficients)
+        object.__setattr__(self, "derivative_orders", orders)
+        object.__setattr__(self, "normalize_to_peak", bool(self.normalize_to_peak))
+        object.__setattr__(self, "basis_scales", basis_scales)
+        object.__setattr__(self, "spectral_weights", spectral_weights)
+
+
+def design_derivative_precorrection(
+    trace: SignalTrace,
+    response_values: Union[np.ndarray, Sequence[np.ndarray]],
+    *,
+    derivative_orders: Sequence[int],
+    normalize_to_peak: bool = True,
+    spectral_weight_power: float = 1.0,
+    ridge: float = 1e-9,
+    include_global_phase: bool = True,
+    edge_order: int = 2,
+    normalization_epsilon: float = 1e-15,
+) -> DerivativePrecorrectionDesign:
+    """Fit derivative weights that approximately invert frequency responses."""
+    if not isinstance(trace, SignalTrace):
+        raise TypeError("design_derivative_precorrection expects a SignalTrace.")
+    if trace.domain != "iq_complex":
+        raise ValueError("Derivative precorrection design requires an iq_complex trace.")
+    if not np.isfinite(spectral_weight_power) or spectral_weight_power < 0:
+        raise ValueError("spectral_weight_power must be non-negative and finite.")
+    if not np.isfinite(ridge) or ridge < 0:
+        raise ValueError("ridge must be non-negative and finite.")
+    _validate_derivative_options(
+        1.0 / trace.sample_rate,
+        edge_order,
+        normalization_epsilon,
+    )
+
+    response_array = np.asarray(response_values, dtype=np.complex128)
+    if response_array.ndim == 1:
+        response_array = response_array[np.newaxis, :]
+    if (
+        response_array.ndim != 2
+        or response_array.shape[0] == 0
+        or response_array.shape[1] == 0
+    ):
+        raise ValueError(
+            "response_values must have shape (n_freq,) or (n_paths, n_freq)."
+        )
+    if np.any(~np.isfinite(response_array)):
+        raise ValueError("response_values must be finite.")
+
+    raw_orders = tuple(derivative_orders)
+    if not raw_orders:
+        raise ValueError("derivative_orders must not be empty.")
+    orders = _resolve_derivative_orders(raw_orders, len(raw_orders))
+    basis_list, basis_scales = compute_derivative_basis(
+        trace.values,
+        1.0 / trace.sample_rate,
+        orders,
+        normalize_to_peak=normalize_to_peak,
+        edge_order=edge_order,
+        normalization_epsilon=normalization_epsilon,
+    )
+
+    fft_length = response_array.shape[1]
+    target_fft = np.fft.fft(trace.values, n=fft_length)
+    basis_ffts = [np.fft.fft(basis, n=fft_length) for basis in basis_list]
+    spectral_weights = np.abs(target_fft)
+    max_weight = float(np.max(spectral_weights))
+    if max_weight > normalization_epsilon:
+        spectral_weights = spectral_weights / max_weight
+    else:
+        spectral_weights = np.ones_like(spectral_weights, dtype=np.float64)
+    if spectral_weight_power == 0:
+        spectral_weights = np.ones_like(spectral_weights, dtype=np.float64)
+    elif spectral_weight_power != 1.0:
+        spectral_weights = spectral_weights ** float(spectral_weight_power)
+
+    fit_rows = []
+    fit_targets = []
+    for response in response_array:
+        columns = [
+            spectral_weights * response * basis_fft
+            for basis_fft in basis_ffts
+        ]
+        fit_rows.append(np.column_stack(columns))
+        fit_targets.append(spectral_weights * (target_fft - response * target_fft))
+    fit_matrix = np.vstack(fit_rows)
+    fit_target = np.concatenate(fit_targets)
+    if ridge > 0:
+        fit_matrix = np.vstack(
+            [
+                fit_matrix,
+                np.sqrt(float(ridge))
+                * np.eye(len(orders), dtype=np.complex128),
+            ]
+        )
+        fit_target = np.concatenate(
+            [fit_target, np.zeros(len(orders), dtype=np.complex128)]
+        )
+
+    coefficients, *_ = np.linalg.lstsq(fit_matrix, fit_target, rcond=None)
+    predistorted, _ = apply_derivative_precorrection(
+        trace.values,
+        1.0 / trace.sample_rate,
+        coefficients,
+        derivative_orders=orders,
+        normalize_to_peak=normalize_to_peak,
+        edge_order=edge_order,
+        normalization_epsilon=normalization_epsilon,
+    )
+    predistorted_fft = np.fft.fft(predistorted, n=fft_length)
+
+    phase_rad = 0.0
+    if include_global_phase:
+        overlap = np.sum(
+            (spectral_weights[np.newaxis, :] ** 2)
+            * response_array
+            * predistorted_fft[np.newaxis, :]
+            * np.conj(target_fft)[np.newaxis, :]
+        )
+        if abs(overlap) > normalization_epsilon:
+            phase_rad = -float(np.angle(overlap))
+
+    corrected_fft = (
+        np.exp(1j * phase_rad)
+        * predistorted_fft[np.newaxis, :]
+        * response_array
+    )
+    residual = (
+        spectral_weights[np.newaxis, :]
+        * (corrected_fft - target_fft[np.newaxis, :])
+    ).reshape(-1)
+    residual_rms = float(np.sqrt(np.mean(np.abs(residual) ** 2)))
+    return DerivativePrecorrectionDesign(
+        coefficients=coefficients,
+        derivative_orders=orders,
+        phase_rad=phase_rad,
+        normalize_to_peak=normalize_to_peak,
+        edge_order=edge_order,
+        basis_scales=basis_scales,
+        spectral_weights=spectral_weights,
+        residual_rms=residual_rms,
+    )
 
 
 @dataclass
@@ -1104,6 +1449,94 @@ class FIRFilterStage(BaseTransmissionStage):
     def describe(self) -> str:
         """Return a compact FIR summary."""
         return f"{self.name}[taps={len(self.kernel)}, {self.alignment}]"
+
+
+@dataclass
+class DerivativePrecorrectionStage(BaseTransmissionStage):
+    """Apply a DRAG-like derivative polynomial directly in the time domain."""
+
+    coefficients: np.ndarray = field(
+        default_factory=lambda: np.array([], dtype=np.complex128)
+    )
+    derivative_orders: tuple[int, ...] = ()
+    normalize_to_peak: bool = True
+    phase_rad: float = 0.0
+    edge_order: int = 2
+    normalization_epsilon: float = 1e-15
+    name: str = "derivative_precorrection"
+    domain: StageDomain = "iq_complex"
+    allowed_planes: Tuple[str, ...] = ("awg_iq", "qubit_iq")
+    is_lti: bool = False
+    output_plane: Optional[SignalPlane] = None
+
+    def __post_init__(self) -> None:
+        self.coefficients = np.asarray(
+            self.coefficients,
+            dtype=np.complex128,
+        ).reshape(-1)
+        if np.any(~np.isfinite(self.coefficients)):
+            raise ValueError("Derivative coefficients must be finite.")
+        raw_orders = tuple(self.derivative_orders)
+        self.derivative_orders = _resolve_derivative_orders(
+            raw_orders if raw_orders else None,
+            len(self.coefficients),
+        )
+        _validate_derivative_options(
+            1.0,
+            self.edge_order,
+            self.normalization_epsilon,
+        )
+        if not np.isfinite(self.phase_rad):
+            raise ValueError("phase_rad must be finite.")
+
+    @classmethod
+    def from_design(
+        cls,
+        design: DerivativePrecorrectionDesign,
+        *,
+        name: str = "derivative_precorrection",
+        **kwargs: Any,
+    ) -> "DerivativePrecorrectionStage":
+        """Build a stage from ``design_derivative_precorrection`` output."""
+        if not isinstance(design, DerivativePrecorrectionDesign):
+            raise TypeError("design must be a DerivativePrecorrectionDesign.")
+        return cls(
+            coefficients=design.coefficients.copy(),
+            derivative_orders=design.derivative_orders,
+            normalize_to_peak=design.normalize_to_peak,
+            phase_rad=design.phase_rad,
+            edge_order=design.edge_order,
+            name=name,
+            **kwargs,
+        )
+
+    def apply(self, trace: SignalTrace) -> SignalTrace:
+        """Apply derivative precorrection and attach its resolved metadata."""
+        self._validate_trace(trace)
+        corrected, metadata = apply_derivative_precorrection(
+            trace.values,
+            1.0 / trace.sample_rate,
+            self.coefficients,
+            derivative_orders=self.derivative_orders,
+            normalize_to_peak=self.normalize_to_peak,
+            phase_rad=self.phase_rad,
+            edge_order=self.edge_order,
+            normalization_epsilon=self.normalization_epsilon,
+        )
+        metadata["last_stage"] = self.name
+        return self._finalize_trace(
+            trace,
+            corrected,
+            metadata_updates=metadata,
+        )
+
+    def describe(self) -> str:
+        """Return derivative orders, normalization mode, and phase."""
+        orders = ",".join(str(order) for order in self.derivative_orders) or "-"
+        return (
+            f"{self.name}[orders={orders}, normalize={self.normalize_to_peak}, "
+            f"phase={self.phase_rad:.4f} rad]"
+        )
 
 
 @dataclass
@@ -2064,6 +2497,8 @@ __all__ = [
     "BundleTransmissionResult",
     "BundleTransmissionStage",
     "DelayStage",
+    "DerivativePrecorrectionDesign",
+    "DerivativePrecorrectionStage",
     "FIRFilterStage",
     "IIRFilterStage",
     "MIMOTouchstoneStage",
@@ -2076,6 +2511,9 @@ __all__ = [
     "TransmissionChain",
     "TransmissionResult",
     "TransmissionStage",
+    "apply_derivative_precorrection",
+    "compute_derivative_basis",
+    "design_derivative_precorrection",
     "design_inverse_fir_from_touchstone",
     "evaluate_touchstone_response",
     "load_touchstone_network",
