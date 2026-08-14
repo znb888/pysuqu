@@ -51,6 +51,8 @@ pip install -e .
 - `pysuqu.qubit` for single-qubit and multi-qubit superconducting circuit
   modeling
 - `pysuqu.decoherence` for decoherence and noise-analysis workflows
+- transmission-chain simulation for AWG/qubit reference planes, Touchstone
+  S-parameters, digital precorrection, and multi-line MIMO propagation
 - `demo/` for end-to-end notebook examples
 
 ### Quick Start
@@ -81,6 +83,7 @@ best next stop.
 - [Getting started guide](https://github.com/znb888/pysuqu/blob/main/docs/guides/getting-started.md)
 - [Documentation index](https://github.com/znb888/pysuqu/blob/main/docs/README.md)
 - [Demo notebooks](https://github.com/znb888/pysuqu/blob/main/demo/README.md)
+- [Transmission-chain guide](https://github.com/znb888/pysuqu/blob/main/docs/guides/transmission-chains.md)
 - [Module map](https://github.com/znb888/pysuqu/blob/main/docs/architecture/module-map.md)
 
 ### Public API Notes
@@ -120,6 +123,7 @@ pip install -e .
 
 - `pysuqu.qubit`：单比特、多比特和耦合器相关的建模能力
 - `pysuqu.decoherence`：退相干与噪声分析工作流
+- 传输链仿真：AWG/量子比特参考面、Touchstone S 参数、数字预校正与多线 MIMO 传播
 - `demo/`：端到端 notebook 示例
 
 ### 快速开始
@@ -148,6 +152,7 @@ print(qubit.get_energylevel()[:3])
 - [入门指南](https://github.com/znb888/pysuqu/blob/main/docs/guides/getting-started.md)
 - [文档索引](https://github.com/znb888/pysuqu/blob/main/docs/README.md)
 - [Demo 说明](https://github.com/znb888/pysuqu/blob/main/demo/README.md)
+- [传输链指南](https://github.com/znb888/pysuqu/blob/main/docs/guides/transmission-chains.md)
 - [模块地图](https://github.com/znb888/pysuqu/blob/main/docs/architecture/module-map.md)
 
 ### 公共 API 说明

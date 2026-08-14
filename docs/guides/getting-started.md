@@ -61,6 +61,19 @@ from pysuqu.decoherence import (
 )
 ```
 
+For waveform and transmission-chain simulation, the same stable package entry
+exports the scheduling, stage, Touchstone, and propagation APIs:
+
+```python
+from pysuqu.qubit import (
+    AttenuatorStage,
+    ChannelSchedule,
+    TouchstoneStage,
+    TransmissionChain,
+    WaveformGenerator,
+)
+```
+
 ## Experimental / Compatibility Boundary
 
 - Prefer the stable package exports under `pysuqu.qubit` for normal work.
@@ -121,10 +134,12 @@ old private notebook set is still excluded.
 - [../../demo/demo_02_decoherence.ipynb](../../demo/demo_02_decoherence.ipynb)
 - [../../demo/demo_03_waveform_and_gate_basics.ipynb](../../demo/demo_03_waveform_and_gate_basics.ipynb)
 - [../../demo/demo_04_dynamic_simulation.ipynb](../../demo/demo_04_dynamic_simulation.ipynb)
+- [../../demo/demo_05_transmission_chain_touchstone.ipynb](../../demo/demo_05_transmission_chain_touchstone.ipynb)
 
 ## Next References
 
 - [../architecture/module-map.md](../architecture/module-map.md)
 - [../architecture/refactor-status.md](../architecture/refactor-status.md)
 - [code-style.md](code-style.md)
+- [transmission-chains.md](transmission-chains.md)
 

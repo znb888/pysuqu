@@ -9,6 +9,8 @@ the place to decide which public guide or reference to open next.
 
 - [guides/getting-started.md](guides/getting-started.md) for installation,
   imports, and a minimal usage example
+- [guides/transmission-chains.md](guides/transmission-chains.md) for AWG-to-qubit
+  propagation, Touchstone models, MIMO chains, and derivative precorrection
 - [architecture/module-map.md](architecture/module-map.md) for package layout
   and recommended import surfaces
 - [architecture/refactor-status.md](architecture/refactor-status.md) for the

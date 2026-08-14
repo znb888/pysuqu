@@ -1,6 +1,6 @@
 ﻿# Module Map
 
-Updated for the public `pysuqu 2.0.1` repository.
+Updated for the current public repository.
 
 ## Package Layout
 
@@ -33,6 +33,7 @@ pysuqu/
     mathlib.py
     noisemodel.py
     qutiplib.py
+    transmission.py
 ```
 
 ## Recommended Import Surfaces
@@ -72,6 +73,20 @@ from pysuqu.decoherence import (
 )
 ```
 
+### Transmission APIs
+
+```python
+from pysuqu.qubit import (
+    AttenuatorStage,
+    ChannelSchedule,
+    DerivativePrecorrectionStage,
+    MIMOTouchstoneStage,
+    TouchstoneStage,
+    TransmissionChain,
+    WaveformGenerator,
+)
+```
+
 ## Responsibilities
 
 ### `pysuqu.qubit`
@@ -98,6 +113,8 @@ from pysuqu.decoherence import (
 
 - mathematical helpers
 - waveform-generation helpers
+- AWG-to-qubit transmission stages, Touchstone models, and MIMO bundles
+- derivative and FIR precorrection design helpers
 - noise-model conversion helpers
 - qutip integration helpers
 
