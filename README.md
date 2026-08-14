@@ -55,6 +55,18 @@ pip install -e .
   S-parameters, digital precorrection, and multi-line MIMO propagation
 - `demo/` for end-to-end notebook examples
 
+### What's New In 2.0.4
+
+Version `2.0.4` adds an end-to-end control-line simulation workflow:
+
+- composable attenuation, delay, transfer-function, FIR, IIR, and SOS stages
+- Touchstone S-parameter parsing for single-path and multi-line MIMO models
+- transmission-aware AWG compilation, gate simulation, and signal diagnostics
+- derivative-based precorrection plus a runnable synthetic Touchstone tutorial
+
+See the [2.0.4 release notes](https://github.com/znb888/pysuqu/blob/main/docs/releases/2.0.4.md)
+for the complete public summary.
+
 ### Quick Start
 
 This example builds a simple transmon-like qubit model and prints the first
@@ -125,6 +137,17 @@ pip install -e .
 - `pysuqu.decoherence`：退相干与噪声分析工作流
 - 传输链仿真：AWG/量子比特参考面、Touchstone S 参数、数字预校正与多线 MIMO 传播
 - `demo/`：端到端 notebook 示例
+
+### 2.0.4 新增内容
+
+`2.0.4` 增加了端到端控制链路仿真工作流：
+
+- 可组合的衰减、延时、传递函数、FIR、IIR 和 SOS 级联模型
+- 面向单路径与多线 MIMO 模型的 Touchstone S 参数解析
+- 支持传输链的 AWG 编译、门仿真与信号诊断
+- 基于导数的预校正，以及可直接运行的合成 Touchstone 教程
+
+完整说明见 [2.0.4 发布说明](https://github.com/znb888/pysuqu/blob/main/docs/releases/2.0.4.md)。
 
 ### 快速开始
 

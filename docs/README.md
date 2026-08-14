@@ -16,6 +16,8 @@ the place to decide which public guide or reference to open next.
 - [architecture/refactor-status.md](architecture/refactor-status.md) for the
   current public module status
 - [guides/code-style.md](guides/code-style.md) for development conventions
+- [releases/2.0.4.md](releases/2.0.4.md) for the transmission-chain release
+  summary and validation record
 - [../demo/README.md](../demo/README.md) for the public tutorial notebooks
 
 ## Public Layout
@@ -26,6 +28,7 @@ docs/
   architecture/
   assets/
   guides/
+  releases/
 ```
 
 ## Directory Roles
@@ -35,6 +38,7 @@ docs/
 - `architecture/` contains stable package maps and status notes for the public
   modules.
 - `assets/` contains shared public visuals used by the documentation.
+- `releases/` records concise public summaries for tagged releases.
 
 ## Public Scope
 
