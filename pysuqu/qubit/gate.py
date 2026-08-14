@@ -19,8 +19,10 @@ from copy import copy
 
 # local lib
 from .base import AbstractQubit, Phi0, e, pi
+from .solver import HamiltonianEvo
 from ..funclib.awgenerator import *
 from ..funclib import truncate_hilbert_space
+from ..funclib.transmission import TransmissionChain
 
 
 def _load_plotly_helpers():
@@ -103,6 +105,122 @@ class GateBase:
             solver_args.setdefault('Tphi2', decoherence_params["Tphi2"])
         return solver_args
 
+    def _resolve_multidrive_initial_state(
+        self,
+        initial_state: Union[qt.Qobj, int, List[complex]],
+        *,
+        allow_gate_parser: bool,
+    ) -> qt.Qobj:
+        """Resolve an initial state for a multi-drive simulation."""
+        if isinstance(initial_state, qt.Qobj):
+            return initial_state
+
+        if allow_gate_parser:
+            parse_initial_state = getattr(self, '_parse_initial_state', None)
+            if callable(parse_initial_state):
+                return parse_initial_state(initial_state)
+
+        raise TypeError(
+            "initial_state must be a qutip.Qobj when using a custom static_hamiltonian. "
+            "Integer and list inputs require the gate-owned qubit Hamiltonian."
+        )
+
+    def build_multidrive_hamiltonian(
+        self,
+        schedules: Union[
+            Dict[str, ChannelSchedule],
+            List[ChannelSchedule],
+            Tuple[ChannelSchedule, ...],
+        ],
+        drive_operators,
+        transmission_chain: Optional[Any] = None,
+        mode: Literal['rf', 'complex_envelope'] = 'rf',
+        plane: Literal['awg', 'qubit'] = 'qubit',
+        channel_order: Optional[Tuple[str, ...]] = None,
+        static_hamiltonian: Optional[qt.Qobj] = None,
+    ) -> Tuple[list, Dict[str, Any]]:
+        """Build a multi-drive Hamiltonian from an aligned schedule bundle."""
+        resolved_static = (
+            self.qubit.get_hamiltonian()
+            if static_hamiltonian is None
+            else static_hamiltonian
+        )
+        drive_funcs = self.awg.get_qutip_bundle_funcs(
+            schedules,
+            mode=mode,
+            chain=transmission_chain,
+            plane=plane,
+        )
+        resolved_order = channel_order
+        if resolved_order is None and isinstance(drive_operators, dict):
+            resolved_order = tuple(drive_funcs)
+
+        solver = HamiltonianEvo(resolved_static)
+        h_total = solver.build_time_dependent_hamiltonian(
+            drive_operators=drive_operators,
+            drive_funcs=drive_funcs,
+            channel_order=resolved_order,
+            static_hamiltonian=resolved_static,
+        )
+        return h_total, drive_funcs
+
+    def run_multidrive_simulation(
+        self,
+        schedules: Union[
+            Dict[str, ChannelSchedule],
+            List[ChannelSchedule],
+            Tuple[ChannelSchedule, ...],
+        ],
+        drive_operators,
+        initial_state: Union[qt.Qobj, int, List[complex]] = 0,
+        transmission_chain: Optional[Any] = None,
+        mode: Literal['rf', 'complex_envelope'] = 'rf',
+        plane: Literal['awg', 'qubit'] = 'qubit',
+        channel_order: Optional[Tuple[str, ...]] = None,
+        static_hamiltonian: Optional[qt.Qobj] = None,
+        tlist: Optional[np.ndarray] = None,
+        c_ops: Optional[list] = None,
+        e_ops: Optional[list] = None,
+        options: Optional[Dict[str, Any]] = None,
+        args: Optional[Dict[str, Any]] = None,
+    ) -> qt.Result:
+        """Run a gate-level simulation driven by a propagated schedule bundle."""
+        use_gate_hamiltonian = static_hamiltonian is None
+        psi0 = self._resolve_multidrive_initial_state(
+            initial_state,
+            allow_gate_parser=use_gate_hamiltonian,
+        )
+        h_total, _ = self.build_multidrive_hamiltonian(
+            schedules=schedules,
+            drive_operators=drive_operators,
+            transmission_chain=transmission_chain,
+            mode=mode,
+            plane=plane,
+            channel_order=channel_order,
+            static_hamiltonian=static_hamiltonian,
+        )
+
+        if c_ops is None and use_gate_hamiltonian:
+            get_c_ops = getattr(self, '_get_c_ops', None)
+            resolved_c_ops = get_c_ops() if callable(get_c_ops) else []
+        else:
+            resolved_c_ops = [] if c_ops is None else c_ops
+
+        resolved_args = (
+            self._default_solver_args(args)
+            if use_gate_hamiltonian
+            else dict(args or {})
+        )
+        return qt.mesolve(
+            h_total,
+            psi0,
+            self.awg.t_axis if tlist is None else tlist,
+            c_ops=resolved_c_ops,
+            e_ops=[] if e_ops is None else e_ops,
+            options=self._default_solver_options(options),
+            args=resolved_args,
+        )
+
 class SingleQubitGate(GateBase):
     def __init__(
         self, 
@@ -115,6 +233,7 @@ class SingleQubitGate(GateBase):
         qubit_type: str = 'Transmon', 
         energy_trunc_level: int = 10, 
         pulse_channel: ChannelSchedule = None,
+        transmission_chain: Optional[TransmissionChain] = None,
     ):
         """
         Initialize a single-qubit gate simulation.
@@ -127,6 +246,7 @@ class SingleQubitGate(GateBase):
             qubit_freqmax (float, optional): Maximum qubit frequency [GHz].
             qubit_type (str): Qubit model type.
             energy_trunc_level (List[int]): Hilbert space dimension for the qubit.
+            transmission_chain: Gate-level default control-line model.
         """
         super().__init__(
             total_time, sample_rate, qubit_frequency, 
@@ -143,6 +263,7 @@ class SingleQubitGate(GateBase):
             )
         else:
             self.pulse_channel = pulse_channel
+        self.transmission_chain = transmission_chain
 
     def load_pulse(self, pulses: Union[PulseEvent, List[PulseEvent]]) -> ChannelSchedule:
         """
@@ -352,11 +473,25 @@ class SingleQubitGate(GateBase):
             self.awg.plot_schedule(params, plot_mode=plot_mode)
         else:
             raise TypeError("Do not support type of params.")
+
+    def _resolve_transmission_chain(
+        self,
+        channel: ChannelSchedule,
+        transmission_chain: Optional[TransmissionChain] = None,
+    ) -> Optional[TransmissionChain]:
+        """Resolve call, channel, and gate-level chains in descending priority."""
+        if transmission_chain is not None:
+            return transmission_chain
+        channel_chain = getattr(channel, 'transmission_chain', None)
+        if channel_chain is not None:
+            return channel_chain
+        return getattr(self, 'transmission_chain', None)
         
     def run_simulation(
         self, 
         channel: Union[ChannelSchedule, None] = None,
         initial_state_input: Union[int, List[complex]] = 0,
+        transmission_chain: Optional[TransmissionChain] = None,
         **kwargs
     ) -> qt.Result:
         """
@@ -378,6 +513,10 @@ class SingleQubitGate(GateBase):
         c_term = kwargs.get('couple_term', 0.5e-12)
         c_type = kwargs.get('couple_type', 'induc')
         induc_phi_model = kwargs.get('induc_phi_model', 'exact')
+        active_chain = self._resolve_transmission_chain(
+            channel,
+            transmission_chain=transmission_chain,
+        )
         
         H_static = self.qubit.get_hamiltonian()
         H_drive = self.get_drive_hamiltonian(
@@ -385,7 +524,7 @@ class SingleQubitGate(GateBase):
             couple_type=c_type,
             induc_phi_model=induc_phi_model,
         )
-        drive_func = self.awg.get_qutip_func(channel)
+        drive_func = self.awg.get_qutip_func(channel, chain=active_chain)
         c_ops = self._get_c_ops()
         
         H_total = [H_static, [H_drive, drive_func]]
@@ -724,6 +863,7 @@ class SingleQubitGate(GateBase):
         channel: ChannelSchedule = None,
         couple_term: float = 0.5e-12,
         couple_type: Literal['induc', 'capac'] = 'induc',
+        transmission_chain: Optional[TransmissionChain] = None,
         frame: Literal['rotating', 'lab'] = 'rotating',
         options: Optional[Dict[str, Any]] = None,
         args: Optional[Dict[str, Any]] = None,
@@ -741,13 +881,17 @@ class SingleQubitGate(GateBase):
             raise ValueError("frame must be either 'rotating' or 'lab'.")
 
         basis_states = self._computational_basis_states()
+        active_chain = self._resolve_transmission_chain(
+            channel,
+            transmission_chain=transmission_chain,
+        )
         H_static = self.qubit.get_hamiltonian()
         H_drive = self.get_drive_hamiltonian(
             couple_term=couple_term,
             couple_type=couple_type,
             induc_phi_model=induc_phi_model,
         )
-        drive_func = self.awg.get_qutip_func(channel)
+        drive_func = self.awg.get_qutip_func(channel, chain=active_chain)
         H_total = [H_static, [H_drive, drive_func]]
         resolved_options = self._default_solver_options(options)
         resolved_args = dict(args or {})
@@ -950,6 +1094,7 @@ class SingleQubitGate(GateBase):
         *,
         couple_term: float = 0.5e-12,
         couple_type: Literal['induc', 'capac'] = 'induc',
+        transmission_chain: Optional[TransmissionChain] = None,
         frame: Literal['rotating', 'lab'] = 'rotating',
         options: Optional[Dict[str, Any]] = None,
         args: Optional[Dict[str, Any]] = None,
@@ -969,6 +1114,7 @@ class SingleQubitGate(GateBase):
             channel=channel,
             couple_term=couple_term,
             couple_type=couple_type,
+            transmission_chain=transmission_chain,
             frame=frame,
             options=options,
             args=args,
@@ -1019,6 +1165,7 @@ class SingleQubitGate(GateBase):
         process_unitary: Union[qt.Qobj, np.ndarray, List[List[complex]], None] = None,
         couple_term: float = 0.5e-12,
         couple_type: Literal['induc', 'capac'] = 'induc',
+        transmission_chain: Optional[TransmissionChain] = None,
         frame: Literal['rotating', 'lab'] = 'rotating',
         options: Optional[Dict[str, Any]] = None,
         args: Optional[Dict[str, Any]] = None,
@@ -1060,6 +1207,7 @@ class SingleQubitGate(GateBase):
                 channel=channel,
                 couple_term=couple_term,
                 couple_type=couple_type,
+                transmission_chain=transmission_chain,
                 frame=frame,
                 options=options,
                 args=args,
@@ -1167,6 +1315,7 @@ class SingleQubitGate(GateBase):
         initial_state_input: Union[int, List[complex]] = 0,
         result: qt.Result = None,
         is_print: bool = True,
+        transmission_chain: Optional[TransmissionChain] = None,
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
     ) -> Dict[str, float]:
         """
@@ -1193,6 +1342,7 @@ class SingleQubitGate(GateBase):
             res = self.run_simulation(
                 channel=channel,
                 initial_state_input=initial_state_input,
+                transmission_chain=transmission_chain,
                 couple_term=couple_term,
                 couple_type=couple_type,
                 induc_phi_model=induc_phi_model,
@@ -1201,6 +1351,38 @@ class SingleQubitGate(GateBase):
             res = result
         return self._summarize_fidelity_metrics(
             result=res,
+            target_state=target_state,
+            is_print=is_print,
+        )
+
+    def calculate_trace_fidelity(
+        self,
+        trace,
+        *,
+        target_state: Union[qt.Qobj, List[complex]] = qt.basis(2, 1),
+        couple_term: float = 0.5e-12,
+        couple_type: Literal['induc', 'capac'] = 'induc',
+        initial_state_input: Union[int, List[complex]] = 0,
+        result: qt.Result = None,
+        is_print: bool = True,
+        options: Optional[Dict[str, Any]] = None,
+        args: Optional[Dict[str, Any]] = None,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
+    ) -> Dict[str, float]:
+        """Compute state-transfer fidelity for an already propagated drive trace."""
+        if result is None:
+            result = self.run_trace_simulation(
+                trace,
+                initial_state_input=initial_state_input,
+                couple_term=couple_term,
+                couple_type=couple_type,
+                options=options,
+                args=args,
+                induc_phi_model=induc_phi_model,
+            )
+
+        return self._summarize_fidelity_metrics(
+            result=result,
             target_state=target_state,
             is_print=is_print,
         )
@@ -1253,11 +1435,7 @@ class SingleQubitGate(GateBase):
             
             unite_events = copy(self.pulse_channel.events)
             unite_events[pulse_index] = curr_event
-            # Preserve mixer_config from original channel
-            curr_schedule = ChannelSchedule(
-                events=unite_events,
-                mixer_config=self.pulse_channel.mixer_config
-            )
+            curr_schedule = self.pulse_channel.clone_with(events=unite_events)
             
             metrics = self.calculate_fidelity(
                 target_state=target_state, 

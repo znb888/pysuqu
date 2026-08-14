@@ -39,7 +39,7 @@ class GateFidelityProjectionTests(unittest.TestCase):
         trace_awg = WaveformGenerator.__new__(WaveformGenerator)
         gate.awg = SimpleNamespace(
             t_axis=np.array([0.0, 1.0]),
-            get_qutip_func=lambda channel: (lambda t, args=None: 0.0),
+            get_qutip_func=lambda channel, chain=None: (lambda t, args=None: 0.0),
             trace_to_qutip_func=trace_awg.trace_to_qutip_func,
             trace_to_qutip_rf_func=trace_awg.trace_to_qutip_rf_func,
         )
