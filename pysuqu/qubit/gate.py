@@ -474,6 +474,35 @@ class SingleQubitGate(GateBase):
         else:
             raise TypeError("Do not support type of params.")
 
+    def visualize_signal(
+        self,
+        channel: Union[ChannelSchedule, None] = None,
+        plot_mode: Literal['iq', 'rf'] = 'iq',
+        plane: Literal['awg', 'qubit'] = 'qubit',
+        transmission_chain: Optional[TransmissionChain] = None,
+        capture_history: bool = False,
+    ):
+        """Visualize AWG or propagated qubit-side electrical waveforms."""
+        if channel is None:
+            if self.pulse_channel is None:
+                raise ValueError(
+                    "No channel loaded! Please call .load_channel() first or "
+                    "pass 'channel' argument."
+                )
+            channel = self.pulse_channel
+
+        active_chain = self._resolve_transmission_chain(
+            channel,
+            transmission_chain=transmission_chain,
+        )
+        return self.awg.plot_schedule(
+            channel,
+            plot_mode=plot_mode,
+            plane=plane,
+            chain=active_chain,
+            capture_history=capture_history,
+        )
+
     def _resolve_transmission_chain(
         self,
         channel: ChannelSchedule,

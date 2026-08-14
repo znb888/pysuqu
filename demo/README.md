@@ -12,11 +12,17 @@ This directory contains public tutorial notebooks for `pysuqu`.
   - waveform generation, schedule import, and a minimal gate simulation path
 - `demo_04_dynamic_simulation.ipynb`
   - single-qubit gate dynamics, fidelity diagnostics, and local calibration checks
+- `demo_05_transmission_chain_touchstone.ipynb`
+  - single-line and MIMO transmission chains, synthetic Touchstone models,
+    qubit-plane traces, and multi-drive gate simulation
 
 ## Data Policy
 
 The `data/` files in this directory are fully synthetic and contain no private
 measurements, notebook outputs, or old demo assets.
+
+Demo 05 creates temporary synthetic Touchstone files under
+`tmp/demo_05_touchstone/` when it runs.
 
 ## Running
 

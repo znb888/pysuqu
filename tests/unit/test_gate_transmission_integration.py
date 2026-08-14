@@ -98,6 +98,28 @@ class GateTransmissionResolutionTests(unittest.TestCase):
 
 
 class GateSimulationTransmissionTests(unittest.TestCase):
+    def test_visualize_signal_passes_resolved_chain_and_history_options(self):
+        channel_chain = object()
+        channel = make_schedule(transmission_chain=channel_chain)
+        gate = make_gate(gate_chain=object(), channel=channel)
+        gate.awg.plot_schedule = MagicMock(return_value='figure')
+
+        result = gate.visualize_signal(
+            channel=channel,
+            plot_mode='rf',
+            plane='qubit',
+            capture_history=True,
+        )
+
+        self.assertEqual(result, 'figure')
+        gate.awg.plot_schedule.assert_called_once_with(
+            channel,
+            plot_mode='rf',
+            plane='qubit',
+            chain=channel_chain,
+            capture_history=True,
+        )
+
     def test_run_simulation_passes_resolved_chain_to_awg(self):
         gate_chain = object()
         channel_chain = object()

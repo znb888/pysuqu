@@ -1197,6 +1197,124 @@ class WaveformGenerator:
         message = str(exc).lower()
         return "expects rf_real" in message and "received iq_complex" in message
 
+    @staticmethod
+    def _plot_trace_to_figure(
+        fig,
+        trace,
+        go,
+        plot_mode: Literal['iq', 'rf'] = 'iq',
+        name_prefix: str = "",
+    ) -> None:
+        trace_name = f"{name_prefix}{trace.label}" if name_prefix else trace.label
+        if plot_mode == 'iq':
+            if trace.domain != 'iq_complex':
+                raise ValueError("plot_mode='iq' requires an iq_complex SignalTrace.")
+            fig.add_trace(
+                go.Scatter(
+                    x=trace.t_axis,
+                    y=np.real(trace.values),
+                    mode='lines',
+                    name=f"{trace_name} I",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=trace.t_axis,
+                    y=np.imag(trace.values),
+                    mode='lines',
+                    name=f"{trace_name} Q",
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=trace.t_axis,
+                    y=np.abs(trace.values),
+                    mode='lines',
+                    name=f"{trace_name} |IQ|",
+                    line=dict(width=1, dash='dot'),
+                )
+            )
+            return
+
+        if plot_mode == 'rf':
+            if trace.domain != 'rf_real':
+                raise ValueError("plot_mode='rf' requires an rf_real SignalTrace.")
+            fig.add_trace(
+                go.Scatter(
+                    x=trace.t_axis,
+                    y=trace.values,
+                    mode='lines',
+                    name=trace_name,
+                )
+            )
+            return
+        raise ValueError(f"Unsupported plot mode: {plot_mode}")
+
+    def plot_trace(
+        self,
+        trace,
+        plot_mode: Optional[Literal['iq', 'rf']] = None,
+    ):
+        """Visualize one sampled signal trace and return the Plotly figure."""
+        go = _load_plotly_graph_objects()
+        mode = plot_mode or (
+            'iq' if getattr(trace, 'domain', None) == 'iq_complex' else 'rf'
+        )
+        fig = go.Figure()
+        self._plot_trace_to_figure(fig, trace, go, plot_mode=mode)
+        fig.update_layout(
+            title=f"Signal Trace: {trace.label} [{trace.plane}]",
+            xaxis_title="Time (ns)",
+            yaxis_title="Amplitude (V)" if mode == 'rf' else "Amplitude",
+            template="plotly_white",
+            hovermode="x unified",
+        )
+        fig.show()
+        return fig
+
+    def plot_transmission_result(
+        self,
+        result,
+        plot_mode: Literal['iq', 'rf'] = 'iq',
+        include_input: bool = True,
+    ):
+        """Visualize input, intermediate stages, and output of one chain."""
+        go = _load_plotly_graph_objects()
+        fig = go.Figure()
+        if include_input:
+            self._plot_trace_to_figure(
+                fig,
+                result.input_trace,
+                go,
+                plot_mode=plot_mode,
+                name_prefix="input: ",
+            )
+        for index, trace in enumerate(result.stage_outputs, start=1):
+            stage_name = trace.metadata.get("last_stage", f"stage_{index}")
+            self._plot_trace_to_figure(
+                fig,
+                trace,
+                go,
+                plot_mode=plot_mode,
+                name_prefix=f"{index}:{stage_name}: ",
+            )
+        self._plot_trace_to_figure(
+            fig,
+            result.output_trace,
+            go,
+            plot_mode=plot_mode,
+            name_prefix="output: ",
+        )
+        fig.update_layout(
+            title=f"Transmission Chain Response: {result.output_trace.label}",
+            xaxis_title="Time (ns)",
+            yaxis_title=("Amplitude (V)" if plot_mode == 'rf' else "Amplitude"),
+            template="plotly_white",
+            hovermode="x unified",
+        )
+        fig.show()
+        return fig
+
     def _generate_baseband(self, t: np.ndarray, env_params: 'EnvelopeParams') -> np.ndarray:
         """
         Generates the complex baseband envelope (I + i*DRAG).
@@ -1333,55 +1451,61 @@ class WaveformGenerator:
         
         return filtered_full[:len(signal)]
     
-    def plot_schedule(self, schedule: 'ChannelSchedule', plot_mode: Literal['iq', 'rf'] = 'iq'):
+    def plot_schedule(
+        self,
+        schedule: 'ChannelSchedule',
+        plot_mode: Literal['iq', 'rf'] = 'iq',
+        plane: Literal['awg', 'qubit'] = 'awg',
+        chain: Optional[Any] = None,
+        capture_history: bool = False,
+    ):
         """
         Visualize the generated Channel Schedule.
         
         Args:
             schedule: The schedule object.
             plot_mode: 'iq' (Envelope) or 'rf' (Modulated Carrier approx).
+            plane: Which reference plane to visualize, 'awg' or 'qubit'.
+            chain: Optional transmission-chain override for the qubit plane.
+            capture_history: Plot intermediate stages on the qubit plane.
         """
-        I_dac, Q_dac = self.generate_channel_waveform(schedule)
-        t = self.t_axis
-        go = _load_plotly_graph_objects()
+        if plane not in ('awg', 'qubit'):
+            raise ValueError(f"Unsupported plot plane: {plane}")
+        if plane == 'qubit':
+            trace_or_result = self.generate_qubit_output(
+                schedule,
+                chain=chain,
+                mode=plot_mode,
+                capture_history=capture_history,
+            )
+            if hasattr(trace_or_result, 'output_trace'):
+                return self.plot_transmission_result(
+                    trace_or_result,
+                    plot_mode=plot_mode,
+                )
+            return self.plot_trace(trace_or_result, plot_mode=plot_mode)
 
-        fig = go.Figure()
-        
-        if plot_mode == 'iq':
-            fig.add_trace(go.Scatter(x=t, y=I_dac, mode='lines', name='I (DAC)', line=dict(color='blue')))
-            fig.add_trace(go.Scatter(x=t, y=Q_dac, mode='lines', name='Q (DAC)', line=dict(color='orange')))
-            
-            # Compute Magnitude for reference
-            mag = np.sqrt(I_dac**2 + Q_dac**2)
-            fig.add_trace(go.Scatter(x=t, y=mag, mode='lines', name='Magnitude', 
-                                     line=dict(color='black', width=1, dash='dot'), opacity=0.5))
-            
-            title = f"Control Waveform: {schedule.name} (I/Q)"
-            
-        elif plot_mode == 'rf':
-            w_lo = 2 * np.pi * schedule.mixer_config.lo_freq # rad/ns
-            rf_wave = I_dac * np.cos(w_lo * t) - Q_dac * np.sin(w_lo * t) # -sin for standard IQ mixer
-            
-            fig.add_trace(go.Scatter(x=t, y=rf_wave, mode='lines', name='RF Output', 
-                                     line=dict(color='grey', width=1)))
-            title = f"Simulated RF Output: {schedule.name} (LO={schedule.mixer_config.lo_freq}G)"
-
-        fig.update_layout(
-            title=title,
-            xaxis_title="Time (ns)",
-            yaxis_title="Amplitude (V)",
-            template="plotly_white",
-            hovermode="x unified"
-        )
-        fig.show()
+        trace = self.generate_awg_output(schedule, mode=plot_mode)
+        return self.plot_trace(trace, plot_mode=plot_mode)
     
-    def plot_pulse(self, pulse: 'PulseEvent', plot_mode: Literal['iq', 'rf'] = 'iq'):
+    def plot_pulse(
+        self,
+        pulse: 'PulseEvent',
+        plot_mode: Literal['iq', 'rf'] = 'iq',
+        plane: Literal['awg', 'qubit'] = 'awg',
+        chain: Optional[Any] = None,
+    ):
         """
         Visualize single Pulse Event.
         """
-        channel = ChannelSchedule()
+        channel = ChannelSchedule(sampling_rate=self.sample_rate)
         channel.events.append(pulse)
-        self.plot_schedule(channel, plot_mode)
+        return self.plot_schedule(
+            channel,
+            plot_mode=plot_mode,
+            plane=plane,
+            chain=chain,
+        )
     
     def get_qutip_func(
         self,

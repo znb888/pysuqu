@@ -1,4 +1,6 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -19,6 +21,27 @@ from pysuqu.funclib import (
     TransmissionResult,
     WaveformGenerator,
 )
+
+
+class _FakeScatter:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class _FakeFigure:
+    def __init__(self):
+        self.traces = []
+        self.layout = {}
+        self.show_count = 0
+
+    def add_trace(self, trace):
+        self.traces.append(trace)
+
+    def update_layout(self, **kwargs):
+        self.layout.update(kwargs)
+
+    def show(self):
+        self.show_count += 1
 
 
 def make_schedule(
@@ -333,6 +356,97 @@ class BundlePropagationTests(unittest.TestCase):
             rf_bundle['y'].values,
             np.cos(2 * np.pi * 0.5 * self.generator.t_axis),
         )
+
+
+class TransmissionPlottingTests(unittest.TestCase):
+    def setUp(self):
+        self.generator = WaveformGenerator(total_time=2.0, sample_rate=4.0)
+        self.go = SimpleNamespace(Figure=_FakeFigure, Scatter=_FakeScatter)
+
+    def test_plot_trace_renders_iq_components_and_returns_figure(self):
+        trace = self.generator.generate_awg_output(make_schedule(), mode='iq')
+
+        with patch(
+            'pysuqu.funclib.awgenerator._load_plotly_graph_objects',
+            return_value=self.go,
+        ):
+            figure = self.generator.plot_trace(trace)
+
+        self.assertEqual(len(figure.traces), 3)
+        self.assertEqual(figure.traces[0].kwargs['name'], 'drive_awg_iq I')
+        self.assertEqual(figure.traces[2].kwargs['name'], 'drive_awg_iq |IQ|')
+        self.assertEqual(figure.show_count, 1)
+        self.assertIn('[awg_iq]', figure.layout['title'])
+
+    def test_plot_transmission_result_includes_input_stages_and_output(self):
+        result = self.generator.generate_qubit_output(
+            make_schedule(),
+            chain=TransmissionChain(
+                stages=[AttenuatorStage(loss_db=3.0), DelayStage(delay_ns=0.25)]
+            ),
+            mode='iq',
+            capture_history=True,
+        )
+
+        with patch(
+            'pysuqu.funclib.awgenerator._load_plotly_graph_objects',
+            return_value=self.go,
+        ):
+            figure = self.generator.plot_transmission_result(result)
+
+        self.assertEqual(len(figure.traces), 12)
+        self.assertTrue(figure.traces[0].kwargs['name'].startswith('input:'))
+        self.assertTrue(figure.traces[-1].kwargs['name'].startswith('output:'))
+
+    def test_plot_schedule_routes_qubit_history_to_result_plotter(self):
+        chain = TransmissionChain(stages=[AttenuatorStage(loss_db=3.0)])
+        sentinel = object()
+
+        with patch.object(
+            self.generator,
+            'plot_transmission_result',
+            return_value=sentinel,
+        ) as plot_result:
+            output = self.generator.plot_schedule(
+                make_schedule(),
+                plane='qubit',
+                chain=chain,
+                capture_history=True,
+            )
+
+        self.assertIs(output, sentinel)
+        self.assertIsInstance(plot_result.call_args.args[0], TransmissionResult)
+        self.assertEqual(plot_result.call_args.kwargs['plot_mode'], 'iq')
+
+    def test_plot_pulse_inherits_generator_sample_rate(self):
+        pulse = make_schedule().events[0]
+        sentinel = object()
+
+        with patch.object(
+            self.generator,
+            'plot_schedule',
+            return_value=sentinel,
+        ) as plot_schedule:
+            output = self.generator.plot_pulse(pulse, plane='qubit')
+
+        plotted_schedule = plot_schedule.call_args.args[0]
+        self.assertIs(output, sentinel)
+        self.assertEqual(plotted_schedule.sampling_rate, self.generator.sample_rate)
+        self.assertEqual(plot_schedule.call_args.kwargs['plane'], 'qubit')
+
+    def test_plot_mode_and_plane_validation_are_explicit(self):
+        iq_trace = self.generator.generate_awg_output(make_schedule(), mode='iq')
+        figure = _FakeFigure()
+
+        with self.assertRaisesRegex(ValueError, 'rf_real'):
+            self.generator._plot_trace_to_figure(
+                figure,
+                iq_trace,
+                self.go,
+                plot_mode='rf',
+            )
+        with self.assertRaisesRegex(ValueError, 'plot plane'):
+            self.generator.plot_schedule(make_schedule(), plane='invalid')
 
 
 class QutipCompilationTests(unittest.TestCase):
