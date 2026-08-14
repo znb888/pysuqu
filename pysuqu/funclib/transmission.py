@@ -376,6 +376,115 @@ class SignalTrace:
 
 
 @dataclass
+class SignalBundle:
+    """Aligned collection of traces used for multi-line and MIMO propagation."""
+
+    traces: Dict[str, SignalTrace]
+    order: Tuple[str, ...] = ()
+    label: str = "bundle"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.traces = dict(self.traces)
+        if not self.traces:
+            raise ValueError("SignalBundle requires at least one trace.")
+
+        for name, trace in self.traces.items():
+            if not isinstance(name, str) or not name:
+                raise ValueError("SignalBundle trace names must be non-empty strings.")
+            if not isinstance(trace, SignalTrace):
+                raise TypeError(
+                    f"SignalBundle trace {name!r} must be a SignalTrace instance."
+                )
+
+        if self.order:
+            order = tuple(self.order)
+            if len(order) != len(self.traces) or set(order) != set(self.traces):
+                raise ValueError(
+                    "SignalBundle.order must contain each trace name exactly once."
+                )
+        else:
+            order = tuple(self.traces.keys())
+        self.order = order
+
+        reference = self.traces[self.order[0]]
+        for name in self.order:
+            trace = self.traces[name]
+            if trace.domain != reference.domain:
+                raise ValueError("All SignalBundle traces must share the same domain.")
+            if trace.plane != reference.plane:
+                raise ValueError("All SignalBundle traces must share the same plane.")
+            if not np.isclose(
+                trace.sample_rate,
+                reference.sample_rate,
+                rtol=1e-12,
+                atol=0.0,
+            ):
+                raise ValueError(
+                    "All SignalBundle traces must share the same sample_rate."
+                )
+            if len(trace.t_axis) != len(reference.t_axis) or not np.allclose(
+                trace.t_axis,
+                reference.t_axis,
+                rtol=1e-12,
+                atol=1e-12,
+            ):
+                raise ValueError("All SignalBundle traces must share the same t_axis.")
+
+    @property
+    def names(self) -> Tuple[str, ...]:
+        """Return trace names in propagation order."""
+        return self.order
+
+    @property
+    def domain(self) -> SignalDomain:
+        """Return the shared signal domain."""
+        return self.traces[self.order[0]].domain
+
+    @property
+    def plane(self) -> SignalPlane:
+        """Return the shared reference plane."""
+        return self.traces[self.order[0]].plane
+
+    @property
+    def sample_rate(self) -> float:
+        """Return the shared sample rate in samples/ns."""
+        return float(self.traces[self.order[0]].sample_rate)
+
+    @property
+    def t_axis(self) -> np.ndarray:
+        """Return the shared time axis in ns."""
+        return self.traces[self.order[0]].t_axis
+
+    @property
+    def shared_lo_freq(self) -> Optional[float]:
+        """Return the common LO in GHz, or ``None`` when traces differ."""
+        lo_freqs = np.array(
+            [self.traces[name].lo_freq for name in self.order],
+            dtype=np.float64,
+        )
+        if np.all(np.isfinite(lo_freqs)) and np.allclose(
+            lo_freqs,
+            lo_freqs[0],
+            rtol=1e-12,
+            atol=1e-12,
+        ):
+            return float(lo_freqs[0])
+        return None
+
+    def __getitem__(self, name: str) -> SignalTrace:
+        return self.traces[name]
+
+    def clone(self, **changes: Any) -> "SignalBundle":
+        """Return a copy with selected fields replaced."""
+        return replace(self, **changes)
+
+    def describe(self) -> str:
+        """Return a concise bundle summary."""
+        return f"{self.label} ({len(self.order)} trace(s)): " + ", ".join(self.order)
+
+
+@dataclass
 class TouchstoneNetwork:
     """Parsed Touchstone S-parameter data in GHz simulation units."""
 
@@ -679,6 +788,15 @@ class TransmissionResult:
     stage_outputs: list[SignalTrace] = field(default_factory=list)
 
 
+@dataclass
+class BundleTransmissionResult:
+    """Structured output that captures intermediate bundle stages."""
+
+    input_bundle: SignalBundle
+    output_bundle: SignalBundle
+    stage_outputs: list[SignalBundle] = field(default_factory=list)
+
+
 class TransmissionStage(Protocol):
     """Structural interface for single-trace transmission stages."""
 
@@ -689,6 +807,20 @@ class TransmissionStage(Protocol):
 
     def apply(self, trace: SignalTrace) -> SignalTrace:
         """Transform one trace."""
+        ...
+
+
+class BundleTransmissionStage(Protocol):
+    """Structural interface for stages that transform an aligned bundle."""
+
+    name: str
+    domain: StageDomain
+    allowed_planes: Tuple[str, ...]
+    is_lti: bool
+    bundle_stage: bool
+
+    def apply(self, bundle: SignalBundle) -> SignalBundle:
+        """Transform one aligned bundle."""
         ...
 
 
@@ -734,6 +866,61 @@ class BaseTransmissionStage:
 
     def apply(self, trace: SignalTrace) -> SignalTrace:
         """Transform one trace."""
+        raise NotImplementedError
+
+    def describe(self) -> str:
+        """Return a compact stage description for diagnostics."""
+        return self.name
+
+
+@dataclass
+class BaseBundleTransmissionStage:
+    """Shared validation and output helpers for bundle-level stages."""
+
+    name: str = "bundle_stage"
+    domain: StageDomain = "any"
+    allowed_planes: Tuple[str, ...] = _ALL_PLANES
+    is_lti: bool = True
+    output_plane: Optional[SignalPlane] = None
+    bundle_stage: bool = field(default=True, init=False, repr=False)
+
+    def _validate_bundle(self, bundle: SignalBundle) -> None:
+        if not isinstance(bundle, SignalBundle):
+            raise TypeError(f"{self.name} expects a SignalBundle input.")
+        if self.domain != "any" and bundle.domain != self.domain:
+            raise ValueError(
+                f"{self.name} expects {self.domain} bundles, received {bundle.domain}."
+            )
+        if bundle.plane not in self.allowed_planes:
+            raise ValueError(
+                f"{self.name} does not accept bundles on plane {bundle.plane}. "
+                f"Allowed planes: {self.allowed_planes}"
+            )
+
+    def _finalize_bundle(
+        self,
+        bundle: SignalBundle,
+        traces: Dict[str, SignalTrace],
+        *,
+        label: Optional[str] = None,
+        metadata_updates: Optional[Dict[str, Any]] = None,
+    ) -> SignalBundle:
+        next_traces = {
+            name: trace.clone(plane=self.output_plane or trace.plane)
+            for name, trace in traces.items()
+        }
+        next_metadata = dict(bundle.metadata)
+        if metadata_updates:
+            next_metadata.update(metadata_updates)
+        return bundle.clone(
+            traces=next_traces,
+            order=tuple(next_traces.keys()),
+            label=label or bundle.label,
+            metadata=next_metadata,
+        )
+
+    def apply(self, bundle: SignalBundle) -> SignalBundle:
+        """Transform one aligned bundle."""
         raise NotImplementedError
 
     def describe(self) -> str:
@@ -1319,6 +1506,308 @@ class TouchstoneStage(BaseTransmissionStage):
 
 
 @dataclass
+class MIMOTouchstoneStage(BaseBundleTransmissionStage):
+    """Bundle-level Touchstone stage for MIMO propagation and crosstalk."""
+
+    file_path: Union[str, Path] = ""
+    input_ports: Tuple[int, ...] = (1,)
+    output_ports: Tuple[int, ...] = (1,)
+    input_channels: Optional[Tuple[str, ...]] = None
+    output_channels: Optional[Tuple[str, ...]] = None
+    interpolation: TouchstoneInterpolation = "polar"
+    out_of_band: OutOfBandPolicy = "edge"
+    frequency_mode: Literal["absolute", "relative"] = "absolute"
+    network: Optional[TouchstoneNetwork] = None
+    name: str = "mimo_touchstone"
+    domain: StageDomain = "any"
+    allowed_planes: Tuple[str, ...] = ("awg_iq", "awg_rf", "qubit_iq", "qubit_rf")
+    is_lti: bool = True
+    output_plane: Optional[SignalPlane] = None
+
+    def __post_init__(self) -> None:
+        for field_name, ports in (
+            ("input_ports", self.input_ports),
+            ("output_ports", self.output_ports),
+        ):
+            if not ports:
+                raise ValueError(f"MIMOTouchstoneStage.{field_name} must not be empty.")
+            if any(
+                isinstance(port, bool) or not isinstance(port, (int, np.integer))
+                for port in ports
+            ):
+                raise TypeError(
+                    f"MIMOTouchstoneStage.{field_name} must contain integers."
+                )
+            normalized = tuple(int(port) for port in ports)
+            if len(set(normalized)) != len(normalized):
+                raise ValueError(
+                    f"MIMOTouchstoneStage.{field_name} must not contain duplicates."
+                )
+            setattr(self, field_name, normalized)
+
+        self.input_channels = self._normalize_channel_selection(
+            self.input_channels,
+            len(self.input_ports),
+            "input_channels",
+        )
+        self.output_channels = self._normalize_channel_selection(
+            self.output_channels,
+            len(self.output_ports),
+            "output_channels",
+        )
+        if self.interpolation not in ("cartesian", "polar"):
+            raise ValueError(
+                f"Unsupported Touchstone interpolation mode: {self.interpolation}"
+            )
+        if self.out_of_band not in ("edge", "zero", "error"):
+            raise ValueError(
+                f"Unsupported Touchstone out_of_band policy: {self.out_of_band}"
+            )
+        if self.frequency_mode not in ("absolute", "relative"):
+            raise ValueError(
+                f"Unsupported Touchstone frequency_mode: {self.frequency_mode}"
+            )
+
+        if self.network is None:
+            if not self.file_path:
+                raise ValueError(
+                    "MIMOTouchstoneStage requires either file_path or a preloaded network."
+                )
+            self.network = load_touchstone_network(self.file_path)
+        elif not isinstance(self.network, TouchstoneNetwork):
+            raise TypeError(
+                "MIMOTouchstoneStage.network must be a TouchstoneNetwork instance."
+            )
+
+        self.file_path = str(self.file_path or self.network.path)
+        for output_port in self.output_ports:
+            for input_port in self.input_ports:
+                self.network.get_response(output_port, input_port)
+
+    @staticmethod
+    def _normalize_channel_selection(
+        channels: Optional[Tuple[str, ...]],
+        expected_length: int,
+        field_name: str,
+    ) -> Optional[Tuple[str, ...]]:
+        if channels is None:
+            return None
+        normalized = tuple(channels)
+        if len(normalized) != expected_length:
+            raise ValueError(
+                f"MIMOTouchstoneStage.{field_name} expected {expected_length} "
+                f"name(s), received {len(normalized)}."
+            )
+        if any(not isinstance(name, str) or not name for name in normalized):
+            raise ValueError(
+                f"MIMOTouchstoneStage.{field_name} must contain non-empty strings."
+            )
+        if len(set(normalized)) != len(normalized):
+            raise ValueError(
+                f"MIMOTouchstoneStage.{field_name} must not contain duplicates."
+            )
+        return normalized
+
+    @classmethod
+    def from_file(
+        cls,
+        file_path: Union[str, Path],
+        *,
+        input_ports: Tuple[int, ...],
+        output_ports: Tuple[int, ...],
+        **kwargs: Any,
+    ) -> "MIMOTouchstoneStage":
+        """Build a MIMO stage directly from a Touchstone file."""
+        return cls(
+            file_path=file_path,
+            input_ports=input_ports,
+            output_ports=output_ports,
+            **kwargs,
+        )
+
+    def _resolve_input_channels(self, bundle: SignalBundle) -> Tuple[str, ...]:
+        names = self.input_channels or bundle.order
+        if len(names) != len(self.input_ports):
+            raise ValueError(
+                f"{self.name} expected {len(self.input_ports)} input channel(s), "
+                f"received {len(names)}."
+            )
+        missing = [name for name in names if name not in bundle.traces]
+        if missing:
+            raise ValueError(f"{self.name} could not find input channel(s): {missing}")
+        return tuple(names)
+
+    def _resolve_output_channels(
+        self,
+        input_channels: Tuple[str, ...],
+    ) -> Tuple[str, ...]:
+        if self.output_channels is not None:
+            return self.output_channels
+        if len(input_channels) == len(self.output_ports):
+            return tuple(input_channels)
+        return tuple(f"port_{port}" for port in self.output_ports)
+
+    def _interpolate_pair_response(
+        self,
+        output_port: int,
+        input_port: int,
+        query_freq: np.ndarray,
+    ) -> np.ndarray:
+        return _interpolate_complex_response(
+            query_freq,
+            self.network.frequencies,
+            self.network.get_response(output_port, input_port),
+            interpolation=self.interpolation,
+            out_of_band=self.out_of_band,
+            stage_name=self.name,
+        )
+
+    def _evaluate_response_matrix(
+        self,
+        bundle: SignalBundle,
+        freq_axis: np.ndarray,
+    ) -> np.ndarray:
+        response = np.zeros(
+            (len(self.output_ports), len(self.input_ports), len(freq_axis)),
+            dtype=np.complex128,
+        )
+
+        if bundle.domain == "iq_complex":
+            if self.frequency_mode == "absolute":
+                if bundle.shared_lo_freq is None:
+                    raise ValueError(
+                        f"{self.name} requires all iq_complex traces to share one "
+                        "lo_freq in absolute frequency mode."
+                    )
+                base_freq = bundle.shared_lo_freq
+            else:
+                base_freq = 0.0
+            query_freq = base_freq + freq_axis
+            for out_idx, output_port in enumerate(self.output_ports):
+                for in_idx, input_port in enumerate(self.input_ports):
+                    response[out_idx, in_idx] = self._interpolate_pair_response(
+                        output_port,
+                        input_port,
+                        query_freq,
+                    )
+            return response
+
+        query_freq = np.abs(freq_axis)
+        for out_idx, output_port in enumerate(self.output_ports):
+            for in_idx, input_port in enumerate(self.input_ports):
+                pair_response = self._interpolate_pair_response(
+                    output_port,
+                    input_port,
+                    query_freq,
+                )
+                pair_response = np.asarray(pair_response, dtype=np.complex128)
+                negative_mask = freq_axis < 0
+                pair_response[negative_mask] = np.conj(pair_response[negative_mask])
+                response[out_idx, in_idx] = _enforce_real_self_conjugate_bins(
+                    pair_response,
+                    freq_axis,
+                )
+        return response
+
+    def _make_output_trace(
+        self,
+        bundle: SignalBundle,
+        input_channels: Tuple[str, ...],
+        output_channels: Tuple[str, ...],
+        output_index: int,
+        values: np.ndarray,
+        fft_length: int,
+    ) -> SignalTrace:
+        channel_name = output_channels[output_index]
+        reference_trace = bundle[
+            input_channels[min(output_index, len(input_channels) - 1)]
+        ]
+        return reference_trace.clone(
+            values=_normalize_output_values(values, bundle.domain, self.name),
+            plane=self.output_plane or reference_trace.plane,
+            label=f"{channel_name}_{self.name}",
+            metadata={
+                **reference_trace.metadata,
+                "last_stage": self.name,
+                "touchstone_file": self.file_path,
+                "input_ports": self.input_ports,
+                "output_ports": self.output_ports,
+                "input_channels": input_channels,
+                "output_channels": output_channels,
+                "fft_length": fft_length,
+            },
+        )
+
+    def apply(self, bundle: SignalBundle) -> SignalBundle:
+        """Propagate an aligned bundle through the selected MIMO block."""
+        self._validate_bundle(bundle)
+        input_channels = self._resolve_input_channels(bundle)
+        output_channels = self._resolve_output_channels(input_channels)
+        num_samples = len(bundle.t_axis)
+
+        if num_samples == 0:
+            next_traces = {
+                channel_name: self._make_output_trace(
+                    bundle,
+                    input_channels,
+                    output_channels,
+                    output_index,
+                    np.array([], dtype=(
+                        np.complex128 if bundle.domain == "iq_complex" else np.float64
+                    )),
+                    0,
+                )
+                for output_index, channel_name in enumerate(output_channels)
+            }
+        else:
+            fft_length = _next_fft_length(num_samples)
+            freq_axis = np.fft.fftfreq(fft_length, d=1.0 / bundle.sample_rate)
+            response_matrix = self._evaluate_response_matrix(bundle, freq_axis)
+            input_spectra = np.zeros(
+                (len(input_channels), fft_length),
+                dtype=np.complex128,
+            )
+            for index, channel_name in enumerate(input_channels):
+                padded_values = np.pad(
+                    bundle[channel_name].values,
+                    (0, fft_length - num_samples),
+                )
+                input_spectra[index] = np.fft.fft(padded_values, n=fft_length)
+
+            next_traces = {}
+            for output_index, channel_name in enumerate(output_channels):
+                output_spectrum = np.sum(
+                    response_matrix[output_index] * input_spectra,
+                    axis=0,
+                )
+                output_values = np.fft.ifft(
+                    output_spectrum,
+                    n=fft_length,
+                )[:num_samples]
+                next_traces[channel_name] = self._make_output_trace(
+                    bundle,
+                    input_channels,
+                    output_channels,
+                    output_index,
+                    output_values,
+                    fft_length,
+                )
+
+        return self._finalize_bundle(
+            bundle,
+            next_traces,
+            label=f"{bundle.label}_{self.name}",
+            metadata_updates={"last_stage": self.name},
+        )
+
+    def describe(self) -> str:
+        """Return a compact MIMO port mapping summary."""
+        file_name = Path(self.file_path).name if self.file_path else "network"
+        mapping = f"out={self.output_ports}<-in={self.input_ports}"
+        return f"{self.name}[{mapping}, {file_name}]"
+
+
+@dataclass
 class DelayStage(BaseTransmissionStage):
     """Time-domain delay with zero fill outside the original support."""
 
@@ -1488,12 +1977,97 @@ class TransmissionChain:
         return current
 
 
+@dataclass
+class BundleTransmissionChain:
+    """Ordered chain mixing single-trace and bundle-aware stages."""
+
+    name: str = "default_bundle_chain"
+    stages: list[Any] = field(default_factory=list)
+
+    def append(self, stage: Any) -> None:
+        """Append one stage."""
+        self.stages.append(stage)
+
+    def extend(self, stages: Iterable[Any]) -> None:
+        """Append several stages in order."""
+        self.stages.extend(stages)
+
+    def describe(self) -> str:
+        """Return a concise left-to-right description."""
+        if not self.stages:
+            return f"{self.name} (0 stage(s))"
+        return (
+            f"{self.name} ({len(self.stages)} stage(s)): "
+            + " -> ".join(_describe_stage(stage) for stage in self.stages)
+        )
+
+    @property
+    def is_lti(self) -> bool:
+        """Return ``True`` only when every stage is LTI."""
+        return all(getattr(stage, "is_lti", False) for stage in self.stages)
+
+    def _apply_stage(self, stage: Any, bundle: SignalBundle) -> SignalBundle:
+        apply = getattr(stage, "apply", None)
+        if not callable(apply):
+            raise TypeError(f"{_describe_stage(stage)} does not define apply().")
+
+        if getattr(stage, "bundle_stage", False):
+            output = apply(bundle)
+            if not isinstance(output, SignalBundle):
+                raise TypeError(
+                    f"{_describe_stage(stage)} must return a SignalBundle when used "
+                    "in BundleTransmissionChain."
+                )
+            return output
+
+        output_traces: Dict[str, SignalTrace] = {}
+        for name in bundle.order:
+            trace_output = apply(bundle[name])
+            if not isinstance(trace_output, SignalTrace):
+                raise TypeError(
+                    f"{_describe_stage(stage)} must return a SignalTrace when mapped "
+                    "over a SignalBundle."
+                )
+            output_traces[name] = trace_output
+        return bundle.clone(traces=output_traces, order=bundle.order)
+
+    def apply(
+        self,
+        bundle: SignalBundle,
+        capture_history: bool = False,
+    ) -> Union[SignalBundle, BundleTransmissionResult]:
+        """Apply every stage in sequence to one aligned bundle."""
+        if not isinstance(bundle, SignalBundle):
+            raise TypeError("BundleTransmissionChain expects a SignalBundle input.")
+
+        current = bundle
+        history: list[SignalBundle] = []
+        for stage in self.stages:
+            current = self._apply_stage(stage, current)
+            if capture_history:
+                history.append(current)
+
+        if capture_history:
+            return BundleTransmissionResult(
+                input_bundle=bundle,
+                output_bundle=current,
+                stage_outputs=history,
+            )
+        return current
+
+
 __all__ = [
     "AttenuatorStage",
+    "BaseBundleTransmissionStage",
     "BaseTransmissionStage",
+    "BundleTransmissionChain",
+    "BundleTransmissionResult",
+    "BundleTransmissionStage",
     "DelayStage",
     "FIRFilterStage",
     "IIRFilterStage",
+    "MIMOTouchstoneStage",
+    "SignalBundle",
     "SignalTrace",
     "SOSFilterStage",
     "TouchstoneNetwork",
