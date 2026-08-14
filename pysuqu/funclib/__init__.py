@@ -10,6 +10,7 @@ from .noisemodel import *
 _OPTIONAL_SUBMODULES = (
     '.qutiplib',
     '.awgenerator',
+    '.transmission',
 )
 
 
