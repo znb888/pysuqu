@@ -7,6 +7,7 @@ from pysuqu.funclib import (
     BaseTransmissionStage,
     DelayStage,
     SignalTrace,
+    TransferFunctionStage,
     TransmissionChain,
     TransmissionResult,
 )
@@ -113,6 +114,103 @@ class TransmissionStageTests(unittest.TestCase):
         self.assertEqual(output.plane, 'qubit_rf')
         self.assertEqual(output.metadata['last_stage'], 'delay')
         self.assertEqual(output.metadata['delay_ns'], 0.0)
+
+
+class TransferFunctionStageTests(unittest.TestCase):
+    @staticmethod
+    def _trace(values, *, domain='rf_real', plane='awg_rf', sample_rate=1.0):
+        return SignalTrace(
+            np.arange(len(values), dtype=float) / sample_rate,
+            np.asarray(values),
+            sample_rate,
+            domain,
+            plane,
+        )
+
+    def test_impulse_response_matches_linear_convolution_without_wraparound(self):
+        values = np.array([0.0, 0.0, 0.0, 1.0])
+        impulse = np.array([1.0, 2.0, 3.0])
+        stage = TransferFunctionStage.from_impulse_response(impulse)
+
+        output = stage.apply(self._trace(values))
+
+        np.testing.assert_allclose(
+            output.values,
+            np.convolve(values, impulse)[:4],
+            atol=1e-15,
+        )
+        np.testing.assert_allclose(output.values[:3], 0.0, atol=1e-15)
+        self.assertEqual(output.metadata['fft_length'], 8)
+
+    def test_callable_receives_fft_frequency_axis_in_ghz(self):
+        captured = []
+
+        def response(freq_axis):
+            captured.append(freq_axis.copy())
+            return np.ones_like(freq_axis)
+
+        trace = self._trace(
+            [1.0 + 1.0j, 2.0, 0.0, 0.0],
+            domain='iq_complex',
+            plane='awg_iq',
+            sample_rate=2.0,
+        )
+        output = TransferFunctionStage(H=response).apply(trace)
+
+        np.testing.assert_allclose(captured[0], np.fft.fftfreq(8, d=0.5))
+        np.testing.assert_allclose(output.values, trace.values)
+
+    def test_scalar_response_is_broadcast_over_the_fft_grid(self):
+        trace = self._trace([1.0 + 2.0j, -2.0j], domain='iq_complex', plane='awg_iq')
+
+        output = TransferFunctionStage(H=lambda freq: 0.5).apply(trace)
+
+        np.testing.assert_allclose(output.values, 0.5 * trace.values)
+
+    def test_first_order_filters_accept_real_rf_traces(self):
+        trace = self._trace([1.0, 0.5, -0.25, 0.125])
+
+        lowpass = TransferFunctionStage.first_order_lowpass(cutoff_freq=0.25).apply(trace)
+        highpass = TransferFunctionStage.first_order_highpass(cutoff_freq=0.25).apply(trace)
+
+        self.assertFalse(np.iscomplexobj(lowpass.values))
+        self.assertFalse(np.iscomplexobj(highpass.values))
+        self.assertTrue(np.all(np.isfinite(lowpass.values)))
+        self.assertTrue(np.all(np.isfinite(highpass.values)))
+
+    def test_real_trace_still_rejects_non_hermitian_response(self):
+        trace = self._trace([1.0, 0.0, 0.0, 0.0])
+        stage = TransferFunctionStage(H=lambda freq: np.where(freq > 0, 1.0, 0.0))
+
+        with self.assertRaisesRegex(ValueError, 'complex values'):
+            stage.apply(trace)
+
+    def test_response_shape_errors_are_explicit(self):
+        trace = self._trace([1.0, 0.0, 0.0, 0.0], domain='iq_complex', plane='awg_iq')
+
+        with self.assertRaisesRegex(ValueError, 'scalar or 1D'):
+            TransferFunctionStage(H=np.ones((8, 1))).apply(trace)
+        with self.assertRaisesRegex(ValueError, 'return length 8'):
+            TransferFunctionStage(H=np.ones(7)).apply(trace)
+
+    def test_factory_inputs_are_validated(self):
+        for impulse in ([], np.ones((2, 2))):
+            with self.subTest(impulse=np.asarray(impulse).shape):
+                with self.assertRaisesRegex(ValueError, 'non-empty 1D'):
+                    TransferFunctionStage.from_impulse_response(impulse)
+
+        for cutoff in (0.0, -1.0, np.inf, np.nan):
+            with self.subTest(cutoff=cutoff):
+                with self.assertRaisesRegex(ValueError, 'positive and finite'):
+                    TransferFunctionStage.first_order_lowpass(cutoff_freq=cutoff)
+
+    def test_empty_trace_still_applies_output_plane(self):
+        trace = self._trace([])
+
+        output = TransferFunctionStage(output_plane='qubit_rf').apply(trace)
+
+        self.assertEqual(output.plane, 'qubit_rf')
+        self.assertEqual(output.metadata['fft_length'], 0)
 
 
 class TransmissionChainTests(unittest.TestCase):

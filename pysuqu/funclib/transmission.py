@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Any, Dict, Iterable, Literal, Optional, Protocol, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Literal, Optional, Protocol, Tuple, Union
 
 import numpy as np
 
@@ -21,6 +21,15 @@ def _as_array(values: Union[np.ndarray, Iterable[complex]]) -> np.ndarray:
     return np.asarray(values)
 
 
+def _next_fft_length(signal_length: int, impulse_length: Optional[int] = None) -> int:
+    effective_impulse_length = impulse_length if impulse_length is not None else signal_length
+    target = max(1, signal_length + max(1, effective_impulse_length) - 1)
+    fft_length = 1
+    while fft_length < target:
+        fft_length <<= 1
+    return fft_length
+
+
 def _normalize_output_values(
     values: np.ndarray,
     domain: StageDomain,
@@ -36,6 +45,29 @@ def _normalize_output_values(
         return np.asarray(normalized, dtype=np.float64)
 
     return np.asarray(values, dtype=np.complex128)
+
+
+def _enforce_real_self_conjugate_bins(
+    response: np.ndarray,
+    freq_axis: np.ndarray,
+) -> np.ndarray:
+    """Force FFT bins that must equal their own conjugate to be purely real."""
+    normalized = np.asarray(response, dtype=np.complex128).copy()
+    freq = np.asarray(freq_axis, dtype=np.float64)
+
+    if len(freq) == 0:
+        return normalized
+
+    self_conjugate_mask = np.isclose(freq, 0.0)
+    if len(freq) % 2 == 0 and len(freq) > 1:
+        sample_rate = len(freq) * abs(freq[1] - freq[0])
+        nyquist_freq = 0.5 * sample_rate
+        self_conjugate_mask |= np.isclose(np.abs(freq), nyquist_freq)
+
+    normalized[..., self_conjugate_mask] = np.real(
+        normalized[..., self_conjugate_mask]
+    )
+    return normalized
 
 
 def _describe_stage(stage: Any) -> str:
@@ -182,6 +214,129 @@ class AttenuatorStage(BaseTransmissionStage):
     def describe(self) -> str:
         """Return a compact attenuation summary."""
         return f"{self.name}[{self.loss_db:.3f} dB]"
+
+
+@dataclass
+class TransferFunctionStage(BaseTransmissionStage):
+    """General linear stage defined by a complex transfer function ``H(f)``."""
+
+    H: Union[Callable[[np.ndarray], Union[np.ndarray, complex]], np.ndarray] = field(
+        default_factory=lambda: (lambda freq: np.ones_like(freq, dtype=np.complex128))
+    )
+    name: str = "transfer_function"
+    domain: StageDomain = "any"
+    allowed_planes: Tuple[str, ...] = ("awg_iq", "awg_rf", "qubit_iq", "qubit_rf")
+    is_lti: bool = True
+    output_plane: Optional[SignalPlane] = None
+    min_impulse_length: Optional[int] = None
+
+    @classmethod
+    def from_impulse_response(
+        cls,
+        impulse_response: Union[np.ndarray, Iterable[complex]],
+        *,
+        name: str = "impulse_response",
+        **kwargs: Any,
+    ) -> "TransferFunctionStage":
+        """Build a transfer-function stage from an impulse response."""
+        impulse = _as_array(impulse_response)
+        if impulse.ndim != 1 or len(impulse) == 0:
+            raise ValueError("impulse_response must be a non-empty 1D array.")
+
+        def response(freq_axis: np.ndarray) -> np.ndarray:
+            return np.fft.fft(impulse, n=len(freq_axis))
+
+        return cls(H=response, name=name, min_impulse_length=len(impulse), **kwargs)
+
+    @classmethod
+    def first_order_lowpass(
+        cls,
+        *,
+        cutoff_freq: float,
+        name: str = "first_order_lowpass",
+        **kwargs: Any,
+    ) -> "TransferFunctionStage":
+        """Build a first-order low-pass stage with a pole frequency in GHz."""
+        if not np.isfinite(cutoff_freq) or cutoff_freq <= 0:
+            raise ValueError("cutoff_freq must be positive and finite.")
+        return cls(
+            H=lambda freq: 1.0 / (1.0 + 1j * freq / cutoff_freq),
+            name=name,
+            **kwargs,
+        )
+
+    @classmethod
+    def first_order_highpass(
+        cls,
+        *,
+        cutoff_freq: float,
+        name: str = "first_order_highpass",
+        **kwargs: Any,
+    ) -> "TransferFunctionStage":
+        """Build a first-order high-pass stage with a corner frequency in GHz."""
+        if not np.isfinite(cutoff_freq) or cutoff_freq <= 0:
+            raise ValueError("cutoff_freq must be positive and finite.")
+        return cls(
+            H=lambda freq: (1j * freq / cutoff_freq)
+            / (1.0 + 1j * freq / cutoff_freq),
+            name=name,
+            **kwargs,
+        )
+
+    def _evaluate_response(self, freq_axis: np.ndarray) -> np.ndarray:
+        response = self.H(freq_axis) if callable(self.H) else self.H
+        response = np.asarray(response)
+        if response.ndim == 0:
+            response = np.full_like(freq_axis, response, dtype=np.complex128)
+        if response.ndim != 1:
+            raise ValueError(
+                f"{self.name} expected H(f) to return a scalar or 1D response."
+            )
+        if len(response) != len(freq_axis):
+            raise ValueError(
+                f"{self.name} expected H(f) to return length {len(freq_axis)}, "
+                f"received {len(response)}."
+            )
+        return np.asarray(response, dtype=np.complex128)
+
+    def apply(self, trace: SignalTrace) -> SignalTrace:
+        """Filter a trace in the frequency domain with ``H(f)``."""
+        self._validate_trace(trace)
+        if len(trace.values) == 0:
+            return self._finalize_trace(
+                trace,
+                trace.values,
+                metadata_updates={"last_stage": self.name, "fft_length": 0},
+            )
+
+        fft_length = _next_fft_length(
+            len(trace.values),
+            impulse_length=self.min_impulse_length or len(trace.values),
+        )
+        freq_axis = np.fft.fftfreq(fft_length, d=1.0 / trace.sample_rate)
+        padded_values = np.pad(trace.values, (0, fft_length - len(trace.values)))
+        response = self._evaluate_response(freq_axis)
+        if trace.domain == "rf_real":
+            response = _enforce_real_self_conjugate_bins(response, freq_axis)
+
+        filtered = np.fft.ifft(
+            np.fft.fft(padded_values, n=fft_length) * response,
+            n=fft_length,
+        )
+        filtered = filtered[: len(trace.values)]
+
+        return self._finalize_trace(
+            trace,
+            filtered,
+            metadata_updates={
+                "last_stage": self.name,
+                "fft_length": fft_length,
+            },
+        )
+
+    def describe(self) -> str:
+        """Return a compact summary for a frequency-domain stage."""
+        return f"{self.name}[fft]"
 
 
 @dataclass
@@ -359,6 +514,7 @@ __all__ = [
     "BaseTransmissionStage",
     "DelayStage",
     "SignalTrace",
+    "TransferFunctionStage",
     "TransmissionChain",
     "TransmissionResult",
     "TransmissionStage",
