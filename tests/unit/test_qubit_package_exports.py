@@ -32,6 +32,7 @@ from pysuqu.funclib.transmission import (
 )
 from pysuqu.qubit.analysis import SingleQubitSpectrum, analyze_single_qubit_spectrum
 from pysuqu.qubit.base import AbstractQubit, ParameterizedQubit, Phi0, pi
+from pysuqu.qubit.circuit import TransmonReflectionModel
 from pysuqu.qubit.gate import (
     ChannelSchedule,
     EnvelopeParams,
@@ -85,6 +86,7 @@ class QubitPackageExportTests(unittest.TestCase):
         self.assertIs(qubit.TransferFunctionStage, TransferFunctionStage)
         self.assertIs(qubit.TransmissionChain, TransmissionChain)
         self.assertIs(qubit.TransmissionResult, TransmissionResult)
+        self.assertIs(qubit.TransmonReflectionModel, TransmonReflectionModel)
         self.assertIs(qubit.WaveformGenerator, WaveformGenerator)
         self.assertIs(qubit.apply_derivative_precorrection, apply_derivative_precorrection)
         self.assertIs(qubit.analyze_single_qubit_spectrum, analyze_single_qubit_spectrum)
@@ -135,6 +137,7 @@ class QubitPackageExportTests(unittest.TestCase):
                 'TransferFunctionStage',
                 'TransmissionChain',
                 'TransmissionResult',
+                'TransmonReflectionModel',
                 'WaveformGenerator',
                 'apply_derivative_precorrection',
                 'analyze_single_qubit_spectrum',

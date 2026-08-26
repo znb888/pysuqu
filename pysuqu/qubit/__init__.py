@@ -2,6 +2,7 @@
 
 from .analysis import SingleQubitSpectrum, analyze_single_qubit_spectrum
 from .base import AbstractQubit, ParameterizedQubit, Phi0, pi
+from .circuit import TransmonReflectionModel
 from ..funclib.transmission import (
     AttenuatorStage,
     BundleTransmissionChain,
@@ -78,6 +79,7 @@ __all__ = [
     'TransferFunctionStage',
     'TransmissionChain',
     'TransmissionResult',
+    'TransmonReflectionModel',
     'WaveformGenerator',
     'apply_derivative_precorrection',
     'analyze_single_qubit_spectrum',

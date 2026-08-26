@@ -1,6 +1,7 @@
 """Circuit-topology helpers extracted from the legacy qubit base layer."""
 
-from typing import Callable, Sequence, Union
+from dataclasses import dataclass
+from typing import Callable, Literal, Sequence, Union
 
 import numpy as np
 from scipy.constants import e, hbar, pi
@@ -263,3 +264,186 @@ def estimate_drive_line_t1_ns(
 
     total_t1_s = 1.0 / float(np.sum(decay_rates_per_s))
     return total_t1_s * 1e9
+
+
+@dataclass
+class TransmonReflectionModel:
+    """Weak-drive reflection model for a transmon used as a one-port load."""
+
+    resonance_freq_ghz: float
+    external_t1_ns: float
+    internal_t1_ns: float | None = None
+    pure_dephasing_tphi_ns: float | None = None
+    termination: Literal["open", "short"] = "open"
+    extra_phase_rad: float = 0.0
+    name: str = "transmon_load"
+
+    def __post_init__(self) -> None:
+        if self.resonance_freq_ghz <= 0:
+            raise ValueError("resonance_freq_ghz must be positive.")
+        for value, field_name in (
+            (self.external_t1_ns, "external_t1_ns"),
+            (self.internal_t1_ns, "internal_t1_ns"),
+            (self.pure_dephasing_tphi_ns, "pure_dephasing_tphi_ns"),
+        ):
+            if value is not None and value <= 0 and not np.isinf(value):
+                suffix = " when provided" if field_name != "external_t1_ns" else ""
+                raise ValueError(f"{field_name} must be positive or np.inf{suffix}.")
+        if self.termination not in {"open", "short"}:
+            raise ValueError("termination must be 'open' or 'short'.")
+
+    @classmethod
+    def from_qubit(
+        cls,
+        qubit,
+        *,
+        couple_term: Union[float, Sequence[float], np.ndarray],
+        couple_type: DriveCoupleType = "induc",
+        line_impedance_ohm: float = 50.0,
+        internal_t1_ns: float | None = None,
+        pure_dephasing_tphi_ns: float | None = None,
+        resonance_freq_ghz: float | None = None,
+        termination: Literal["auto", "open", "short"] = "auto",
+        name: str = "transmon_load",
+    ) -> "TransmonReflectionModel":
+        """Build a load model from a qubit exposing ``Ec`` and ``qubit_f01``."""
+        if resonance_freq_ghz is None:
+            resonance_freq_ghz = getattr(qubit, "qubit_f01", getattr(qubit, "f01", None))
+        if resonance_freq_ghz is None:
+            raise AttributeError("qubit must expose qubit_f01 or f01 in GHz.")
+        if not hasattr(qubit, "Ec"):
+            raise AttributeError("qubit must expose Ec for capacitance estimation.")
+
+        external_t1_ns = estimate_drive_line_t1_ns(
+            qubit_frequency_ghz=float(resonance_freq_ghz),
+            couple_term=couple_term,
+            couple_type=couple_type,
+            ec=qubit.Ec,
+            line_impedance_ohm=line_impedance_ohm,
+        )
+        normalized_type = str(couple_type).lower().replace("_", "").replace("-", "").replace("+", "")
+        if termination == "auto":
+            resolved_termination = "open" if normalized_type in {"capac", "cap"} else "short"
+        elif termination in {"open", "short"}:
+            resolved_termination = termination
+        else:
+            raise ValueError("termination must be 'auto', 'open', or 'short'.")
+        return cls(
+            resonance_freq_ghz=float(resonance_freq_ghz),
+            external_t1_ns=float(external_t1_ns),
+            internal_t1_ns=internal_t1_ns,
+            pure_dephasing_tphi_ns=pure_dephasing_tphi_ns,
+            termination=resolved_termination,
+            name=name,
+        )
+
+    @property
+    def background_reflection(self) -> complex:
+        """Return the off-resonant reflection coefficient of the line end."""
+        return 1.0 + 0.0j if self.termination == "open" else -1.0 + 0.0j
+
+    @property
+    def external_decay_rate_per_ns(self) -> float:
+        return 0.0 if np.isinf(self.external_t1_ns) else 1.0 / float(self.external_t1_ns)
+
+    @property
+    def internal_decay_rate_per_ns(self) -> float:
+        if self.internal_t1_ns is None or np.isinf(self.internal_t1_ns):
+            return 0.0
+        return 1.0 / float(self.internal_t1_ns)
+
+    @property
+    def pure_dephasing_rate_per_ns(self) -> float:
+        if self.pure_dephasing_tphi_ns is None or np.isinf(self.pure_dephasing_tphi_ns):
+            return 0.0
+        return 1.0 / float(self.pure_dephasing_tphi_ns)
+
+    @property
+    def transverse_decay_rate_per_ns(self) -> float:
+        return (
+            0.5 * (self.external_decay_rate_per_ns + self.internal_decay_rate_per_ns)
+            + self.pure_dephasing_rate_per_ns
+        )
+
+    @property
+    def hwhm_ghz(self) -> float:
+        return float(self.transverse_decay_rate_per_ns / (2.0 * pi))
+
+    @property
+    def fwhm_ghz(self) -> float:
+        return 2.0 * self.hwhm_ghz
+
+    def adaptive_frequency_grid(self, *, span_hwhm: float = 20.0, points: int = 801) -> np.ndarray:
+        """Return a resonance-centered grid that resolves the analytic linewidth."""
+        if span_hwhm <= 0.0:
+            raise ValueError("span_hwhm must be positive.")
+        if points < 3:
+            raise ValueError("points must be at least 3.")
+        half_span = max(float(span_hwhm) * self.hwhm_ghz, np.finfo(float).eps)
+        return np.linspace(
+            float(self.resonance_freq_ghz) - half_span,
+            float(self.resonance_freq_ghz) + half_span,
+            int(points),
+        )
+
+    def reflection_coefficient(
+        self,
+        frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    ) -> np.ndarray:
+        """Evaluate the complex load reflection coefficient on a frequency grid."""
+        freq = np.asarray(frequencies_ghz, dtype=np.float64)
+        delta_omega = 2.0 * pi * (freq - float(self.resonance_freq_ghz))
+        gamma2 = float(self.transverse_decay_rate_per_ns)
+        kappa_ext = float(self.external_decay_rate_per_ns)
+        resonant_factor = np.ones_like(freq, dtype=np.complex128)
+        if kappa_ext != 0.0:
+            resonant_factor -= kappa_ext / (gamma2 - 1j * delta_omega)
+        response = complex(self.background_reflection) * resonant_factor
+        if self.extra_phase_rad != 0.0:
+            response *= np.exp(1j * float(self.extra_phase_rad))
+        return np.asarray(response, dtype=np.complex128).reshape(freq.shape)
+
+    def iq_reflection_coefficient(
+        self,
+        frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    ) -> np.ndarray:
+        """Evaluate the reflection in the IQ convention around the resonance."""
+        freq = np.asarray(frequencies_ghz, dtype=np.float64)
+        return self.reflection_coefficient(2.0 * float(self.resonance_freq_ghz) - freq)
+
+    def filter_scattered_iq(
+        self,
+        values: Union[np.ndarray, Sequence[complex]],
+        *,
+        sample_rate: float,
+        lo_freq_ghz: float,
+    ) -> np.ndarray:
+        """Apply the narrow transmon scattering correction with a causal IIR."""
+        signal = np.asarray(values, dtype=np.complex128)
+        if signal.ndim != 1:
+            raise ValueError("values must be one-dimensional.")
+        if sample_rate <= 0.0:
+            raise ValueError("sample_rate must be positive.")
+        if signal.size == 0 or self.external_decay_rate_per_ns == 0.0:
+            return np.zeros_like(signal, dtype=np.complex128)
+
+        time_ns = np.arange(signal.size, dtype=np.float64) / float(sample_rate)
+        if_ghz = float(self.resonance_freq_ghz) - float(lo_freq_ghz)
+        rotating = signal * np.exp(-2j * pi * if_ghz * time_ns)
+        gamma2 = float(self.transverse_decay_rate_per_ns)
+        dt_ns = 1.0 / float(sample_rate)
+        denominator = 1.0 + 0.5 * gamma2 * dt_ns
+        state_decay = (1.0 - 0.5 * gamma2 * dt_ns) / denominator
+        input_gain = 0.5 * dt_ns / denominator
+        state = 0.0 + 0.0j
+        filtered = np.zeros_like(rotating, dtype=np.complex128)
+        for idx in range(1, rotating.size):
+            state = state_decay * state + input_gain * (rotating[idx] + rotating[idx - 1])
+            filtered[idx] = state
+        scattered_rotating = (
+            -complex(self.background_reflection)
+            * np.exp(1j * float(self.extra_phase_rad))
+            * float(self.external_decay_rate_per_ns)
+            * filtered
+        )
+        return scattered_rotating * np.exp(2j * pi * if_ghz * time_ns)

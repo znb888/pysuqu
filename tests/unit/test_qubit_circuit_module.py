@@ -61,6 +61,72 @@ class QubitCircuitModuleTests(unittest.TestCase):
 
         self.assertAlmostEqual(actual, expected)
 
+    def test_transmon_reflection_model_applies_termination_background(self):
+        frequencies = np.array([4.9, 5.0, 5.1])
+        open_model = circuit.TransmonReflectionModel(
+            resonance_freq_ghz=5.0,
+            external_t1_ns=100.0,
+            termination="open",
+        )
+        short_model = circuit.TransmonReflectionModel(
+            resonance_freq_ghz=5.0,
+            external_t1_ns=100.0,
+            termination="short",
+        )
+
+        self.assertEqual(open_model.background_reflection, 1.0 + 0.0j)
+        self.assertEqual(short_model.background_reflection, -1.0 + 0.0j)
+        np.testing.assert_allclose(
+            short_model.reflection_coefficient(frequencies),
+            -open_model.reflection_coefficient(frequencies),
+        )
+        np.testing.assert_allclose(
+            open_model.iq_reflection_coefficient(np.array([5.0, 4.9])),
+            open_model.reflection_coefficient(np.array([5.0, 5.1])),
+        )
+
+    def test_transmon_reflection_model_iir_matches_small_signal_response(self):
+        model = circuit.TransmonReflectionModel(
+            resonance_freq_ghz=5.0,
+            external_t1_ns=10.0,
+            internal_t1_ns=20.0,
+        )
+        sample_rate = 2.0
+        lo_freq = 4.7
+        signal_freq = 5.05
+        time_ns = np.arange(800, dtype=float) / sample_rate
+        drive = np.exp(2j * np.pi * (signal_freq - lo_freq) * time_ns)
+
+        scattered = model.filter_scattered_iq(
+            drive,
+            sample_rate=sample_rate,
+            lo_freq_ghz=lo_freq,
+        )
+        actual = scattered[-1] / drive[-1]
+        expected = model.iq_reflection_coefficient(np.array([signal_freq]))[0] - model.background_reflection
+
+        self.assertEqual(scattered[0], 0.0)
+        np.testing.assert_allclose(actual, expected, rtol=5e-3, atol=5e-3)
+
+    def test_transmon_reflection_model_builds_from_qubit_and_resolves_grid(self):
+        qubit = type("QubitStub", (), {"qubit_f01": 5.2, "Ec": 2 * np.pi * 0.22})()
+        model = circuit.TransmonReflectionModel.from_qubit(
+            qubit,
+            couple_term=2.5e-15,
+            couple_type="capac",
+        )
+
+        self.assertEqual(model.termination, "open")
+        grid = model.adaptive_frequency_grid(span_hwhm=10.0, points=101)
+        self.assertEqual(grid.shape, (101,))
+        self.assertAlmostEqual(grid[50], model.resonance_freq_ghz)
+        self.assertGreater(model.fwhm_ghz, 0.0)
+
+        with self.assertRaises(ValueError):
+            circuit.TransmonReflectionModel(5.0, 100.0, termination="invalid")
+        with self.assertRaises(ValueError):
+            model.adaptive_frequency_grid(points=2)
+
     def test_estimate_drive_line_t1_ns_matches_legacy_inductive_formula(self):
         qubit_frequency_ghz = 5.2
         ec = 2 * np.pi * 0.22
