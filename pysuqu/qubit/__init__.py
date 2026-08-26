@@ -2,7 +2,11 @@
 
 from .analysis import SingleQubitSpectrum, analyze_single_qubit_spectrum
 from .base import AbstractQubit, ParameterizedQubit, Phi0, pi
-from .circuit import TransmonReflectionModel
+from .circuit import (
+    TransmonReflectionModel,
+    calculate_loaded_single_port_response,
+    resolve_load_reflection_response,
+)
 from ..funclib.transmission import (
     AttenuatorStage,
     BundleTransmissionChain,
@@ -83,10 +87,12 @@ __all__ = [
     'WaveformGenerator',
     'apply_derivative_precorrection',
     'analyze_single_qubit_spectrum',
+    'calculate_loaded_single_port_response',
     'compute_derivative_basis',
     'design_derivative_precorrection',
     'design_inverse_fir_from_touchstone',
     'evaluate_touchstone_response',
     'load_touchstone_network',
     'pi',
+    'resolve_load_reflection_response',
 ]

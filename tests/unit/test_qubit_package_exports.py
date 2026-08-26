@@ -32,7 +32,11 @@ from pysuqu.funclib.transmission import (
 )
 from pysuqu.qubit.analysis import SingleQubitSpectrum, analyze_single_qubit_spectrum
 from pysuqu.qubit.base import AbstractQubit, ParameterizedQubit, Phi0, pi
-from pysuqu.qubit.circuit import TransmonReflectionModel
+from pysuqu.qubit.circuit import (
+    TransmonReflectionModel,
+    calculate_loaded_single_port_response,
+    resolve_load_reflection_response,
+)
 from pysuqu.qubit.gate import (
     ChannelSchedule,
     EnvelopeParams,
@@ -87,6 +91,8 @@ class QubitPackageExportTests(unittest.TestCase):
         self.assertIs(qubit.TransmissionChain, TransmissionChain)
         self.assertIs(qubit.TransmissionResult, TransmissionResult)
         self.assertIs(qubit.TransmonReflectionModel, TransmonReflectionModel)
+        self.assertIs(qubit.calculate_loaded_single_port_response, calculate_loaded_single_port_response)
+        self.assertIs(qubit.resolve_load_reflection_response, resolve_load_reflection_response)
         self.assertIs(qubit.WaveformGenerator, WaveformGenerator)
         self.assertIs(qubit.apply_derivative_precorrection, apply_derivative_precorrection)
         self.assertIs(qubit.analyze_single_qubit_spectrum, analyze_single_qubit_spectrum)
@@ -141,12 +147,14 @@ class QubitPackageExportTests(unittest.TestCase):
                 'WaveformGenerator',
                 'apply_derivative_precorrection',
                 'analyze_single_qubit_spectrum',
+                'calculate_loaded_single_port_response',
                 'compute_derivative_basis',
                 'design_derivative_precorrection',
                 'design_inverse_fir_from_touchstone',
                 'evaluate_touchstone_response',
                 'load_touchstone_network',
                 'pi',
+                'resolve_load_reflection_response',
             ],
         )
 

@@ -447,3 +447,72 @@ class TransmonReflectionModel:
             * filtered
         )
         return scattered_rotating * np.exp(2j * pi * if_ghz * time_ns)
+
+    def input_impedance(
+        self,
+        frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+        *,
+        line_impedance_ohm: float = 50.0,
+    ) -> np.ndarray:
+        """Convert the model reflection coefficient to input impedance."""
+        if line_impedance_ohm <= 0.0:
+            raise ValueError("line_impedance_ohm must be positive.")
+        gamma = self.reflection_coefficient(frequencies_ghz)
+        return line_impedance_ohm * (1.0 + gamma) / (1.0 - gamma)
+
+    def __call__(
+        self,
+        frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    ) -> np.ndarray:
+        """Alias ``reflection_coefficient`` for load-spec compatibility."""
+        return self.reflection_coefficient(frequencies_ghz)
+
+
+LoadReflectionSpec = Union[
+    complex,
+    np.ndarray,
+    Callable[[np.ndarray], Union[np.ndarray, complex]],
+    TransmonReflectionModel,
+]
+
+
+def resolve_load_reflection_response(
+    frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    load_reflection: LoadReflectionSpec,
+) -> np.ndarray:
+    """Evaluate a scalar, array, callable, or model load on one frequency grid."""
+    freq = np.asarray(frequencies_ghz, dtype=np.float64)
+    if hasattr(load_reflection, "reflection_coefficient"):
+        resolved = load_reflection.reflection_coefficient(freq)
+    elif callable(load_reflection):
+        resolved = load_reflection(freq)
+    else:
+        resolved = load_reflection
+
+    resolved_array = np.asarray(resolved, dtype=np.complex128)
+    if resolved_array.ndim == 0:
+        return np.full(freq.shape, resolved_array.item(), dtype=np.complex128)
+    if resolved_array.shape != freq.shape:
+        raise ValueError("Resolved load_reflection must be scalar or match frequencies_ghz shape.")
+    return resolved_array
+
+
+def calculate_loaded_single_port_response(
+    frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    forward_response: Union[complex, np.ndarray, Sequence[complex]],
+    output_reflection_response: Union[complex, np.ndarray, Sequence[complex]],
+    load_reflection: LoadReflectionSpec,
+    round_trip_delay_ns: float = 0.0,
+) -> np.ndarray:
+    """Sum the infinite forward/reflection series seen by a one-port load."""
+    freq = np.asarray(frequencies_ghz, dtype=np.float64)
+    forward = np.asarray(forward_response, dtype=np.complex128)
+    output_reflection = np.asarray(output_reflection_response, dtype=np.complex128)
+    if forward.shape != freq.shape or output_reflection.shape != freq.shape:
+        raise ValueError("forward_response and output_reflection_response must match frequencies_ghz shape.")
+
+    gamma_load = resolve_load_reflection_response(freq, load_reflection)
+    loop_delay = np.exp(-2j * pi * freq * float(round_trip_delay_ns))
+    loop_gain = output_reflection * gamma_load * loop_delay
+    return forward / (1.0 - loop_gain)

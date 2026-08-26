@@ -108,6 +108,60 @@ class QubitCircuitModuleTests(unittest.TestCase):
         self.assertEqual(scattered[0], 0.0)
         np.testing.assert_allclose(actual, expected, rtol=5e-3, atol=5e-3)
 
+    def test_load_reflection_resolver_accepts_model_callable_and_arrays(self):
+        frequencies = np.array([4.9, 5.1])
+        model = circuit.TransmonReflectionModel(5.0, 100.0)
+        model_response = model.reflection_coefficient(frequencies)
+
+        np.testing.assert_allclose(model(frequencies), model_response)
+        np.testing.assert_allclose(
+            model.input_impedance(frequencies),
+            50.0 * (1.0 + model_response) / (1.0 - model_response),
+        )
+        with self.assertRaises(ValueError):
+            model.input_impedance(frequencies, line_impedance_ohm=0.0)
+
+        np.testing.assert_allclose(
+            circuit.resolve_load_reflection_response(frequencies, model),
+            model_response,
+        )
+        np.testing.assert_allclose(
+            circuit.resolve_load_reflection_response(frequencies, lambda f: 0.2 + 0.01 * f),
+            0.2 + 0.01 * frequencies,
+        )
+        np.testing.assert_allclose(
+            circuit.resolve_load_reflection_response(frequencies, 0.35),
+            np.full(frequencies.shape, 0.35),
+        )
+        with self.assertRaises(ValueError):
+            circuit.resolve_load_reflection_response(frequencies, np.ones(3))
+
+    def test_loaded_single_port_response_matches_geometric_series(self):
+        frequencies = np.array([5.0, 5.1, 5.2])
+        forward = np.array([0.8 + 0.1j, 0.7 - 0.2j, 0.6 + 0.05j])
+        output_reflection = np.array([0.20 - 0.05j, 0.18 + 0.02j, 0.16 - 0.01j])
+        load_reflection = 0.35 + 0.10j
+        round_trip_delay_ns = 0.4
+
+        actual = circuit.calculate_loaded_single_port_response(
+            frequencies,
+            forward_response=forward,
+            output_reflection_response=output_reflection,
+            load_reflection=load_reflection,
+            round_trip_delay_ns=round_trip_delay_ns,
+        )
+        loop = output_reflection * load_reflection * np.exp(
+            -2j * np.pi * frequencies * round_trip_delay_ns
+        )
+        np.testing.assert_allclose(actual, forward / (1.0 - loop))
+        with self.assertRaises(ValueError):
+            circuit.calculate_loaded_single_port_response(
+                frequencies,
+                forward_response=forward[:2],
+                output_reflection_response=output_reflection,
+                load_reflection=load_reflection,
+            )
+
     def test_transmon_reflection_model_builds_from_qubit_and_resolves_grid(self):
         qubit = type("QubitStub", (), {"qubit_f01": 5.2, "Ec": 2 * np.pi * 0.22})()
         model = circuit.TransmonReflectionModel.from_qubit(
