@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from tests.support import install_test_stubs
 
@@ -177,6 +178,74 @@ class GateFidelityProjectionTests(unittest.TestCase):
         self.assertAlmostEqual(metrics["process_fidelity"], 1.0, places=9)
         self.assertAlmostEqual(metrics["average_gate_fidelity"], 1.0, places=9)
         np.testing.assert_allclose(metrics["unitary"].full(), np.eye(2), atol=1e-12)
+
+    def test_trace_channel_identity_accepts_explicit_empty_collapse_operators(self):
+        gate = self._make_gate()
+        trace = SimpleNamespace(
+            t_axis=np.array([0.0, 1.0]),
+            values=np.array([0.0, 0.0]),
+            domain="rf_real",
+            lo_freq=0.0,
+        )
+        gate._get_c_ops = lambda: (_ for _ in ()).throw(AssertionError("must not be called"))
+
+        metrics = gate.calculate_trace_channel_fidelity(
+            trace,
+            target_unitary=np.eye(2),
+            frame="lab",
+            c_ops=[],
+        )
+
+        self.assertAlmostEqual(metrics["average_gate_fidelity"], 1.0, places=9)
+        self.assertAlmostEqual(metrics["entanglement_fidelity"], 1.0, places=9)
+        self.assertAlmostEqual(metrics["survival_probability"], 1.0, places=9)
+        self.assertAlmostEqual(metrics["trace_effect_max_eigenvalue"], 1.0, places=9)
+        self.assertFalse(metrics["physicality_warning"])
+
+    def test_trace_channel_physicality_flags_trace_increasing_map(self):
+        gate = self._make_gate()
+        kraus = np.diag([np.sqrt(1.2), np.sqrt(0.5)]).astype(np.complex128)
+        basis_outputs = (
+            (
+                kraus @ np.array([[1.0, 0.0], [0.0, 0.0]]) @ kraus.conj().T,
+                kraus @ np.array([[0.0, 1.0], [0.0, 0.0]]) @ kraus.conj().T,
+            ),
+            (
+                kraus @ np.array([[0.0, 0.0], [1.0, 0.0]]) @ kraus.conj().T,
+                kraus @ np.array([[0.0, 0.0], [0.0, 1.0]]) @ kraus.conj().T,
+            ),
+        )
+
+        metrics = gate.score_trace_channel_payload(
+            {
+                "basis_operator_outputs": basis_outputs,
+                "survival_probability": 0.85,
+            },
+            target_unitary=np.eye(2),
+        )
+
+        self.assertAlmostEqual(metrics["trace_effect_max_eigenvalue"], 1.2)
+        self.assertAlmostEqual(metrics["trace_nonincreasing_violation"], 0.2)
+        self.assertTrue(metrics["physicality_warning"])
+
+    def test_trace_unitary_extraction_can_skip_trajectory_storage(self):
+        gate = self._make_gate()
+        trace = SimpleNamespace(
+            t_axis=np.array([0.0, 1.0]),
+            values=np.array([0.0, 0.0]),
+            domain="rf_real",
+            lo_freq=0.0,
+        )
+
+        with patch("pysuqu.qubit.gate.qt.mesolve") as mesolve:
+            mesolve.side_effect = lambda *args, **kwargs: qt.Result(
+                states=[args[1]],
+                times=list(args[2]),
+            )
+            gate.extract_trace_unitary(trace, store_trajectories=False)
+
+        self.assertFalse(mesolve.call_args.kwargs["options"]["store_states"])
+        self.assertTrue(mesolve.call_args.kwargs["options"]["store_final_state"])
 
     def test_resolve_target_unitary_rejects_non_unitary_matrix(self):
         gate = self._make_gate()

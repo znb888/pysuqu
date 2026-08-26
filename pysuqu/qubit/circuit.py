@@ -1,11 +1,20 @@
 """Circuit-topology helpers extracted from the legacy qubit base layer."""
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Literal, Sequence, Union
 
 import numpy as np
 from scipy.constants import e, hbar, pi
 from scipy.linalg import block_diag
+
+from ..funclib.transmission import (
+    OutOfBandPolicy,
+    TouchstoneInterpolation,
+    TouchstoneNetwork,
+    evaluate_touchstone_response,
+    load_touchstone_network,
+)
 
 
 def build_retain_nodes(struct: Sequence[int]) -> list[int]:
@@ -474,6 +483,11 @@ LoadReflectionSpec = Union[
     Callable[[np.ndarray], Union[np.ndarray, complex]],
     TransmonReflectionModel,
 ]
+MultiLoadReflectionSpec = Union[
+    LoadReflectionSpec,
+    Sequence[LoadReflectionSpec],
+    np.ndarray,
+]
 
 
 def resolve_load_reflection_response(
@@ -516,3 +530,325 @@ def calculate_loaded_single_port_response(
     loop_delay = np.exp(-2j * pi * freq * float(round_trip_delay_ns))
     loop_gain = output_reflection * gamma_load * loop_delay
     return forward / (1.0 - loop_gain)
+
+
+@dataclass(frozen=True)
+class LoadedMultiportWaveResponse:
+    """Traveling-wave and local-field responses for terminated output ports."""
+
+    port_outgoing: np.ndarray
+    load_incident: np.ndarray
+    load_reflected: np.ndarray
+    local_voltage: np.ndarray
+    local_current_equivalent_voltage: np.ndarray
+    source_operator: np.ndarray
+    return_operator: np.ndarray
+    load_reflections: np.ndarray
+    one_way_phase: np.ndarray
+    loop_spectral_radius: np.ndarray
+    system_condition_number: np.ndarray
+    system_min_singular_value: np.ndarray
+
+
+def _normalize_output_ports(output_ports: Sequence[int]) -> tuple[int, ...]:
+    """Normalize and validate one-based output-port indices."""
+    ports = tuple(int(port) for port in output_ports)
+    if not ports:
+        raise ValueError("output_ports must contain at least one port.")
+    if len(set(ports)) != len(ports):
+        raise ValueError("output_ports must not contain duplicates.")
+    if any(port <= 0 for port in ports):
+        raise ValueError("output_ports must contain one-based positive port indices.")
+    return ports
+
+
+def _normalize_per_output_values(
+    values: Union[float, Sequence[float], np.ndarray],
+    *,
+    num_outputs: int,
+    name: str,
+) -> np.ndarray:
+    """Broadcast one scalar or validate one value per output port."""
+    values_array = np.asarray(values, dtype=np.float64)
+    if values_array.ndim == 0:
+        return np.full(num_outputs, float(values_array), dtype=np.float64)
+    flat_values = values_array.reshape(-1)
+    if len(flat_values) != num_outputs:
+        raise ValueError(f"{name} must be scalar or contain one value per output port.")
+    return np.asarray(flat_values, dtype=np.float64)
+
+
+def resolve_multi_load_reflection_response(
+    frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    load_reflections: MultiLoadReflectionSpec,
+    num_outputs: int,
+) -> np.ndarray:
+    """Resolve one load-reflection specification per output port."""
+    if num_outputs <= 0:
+        raise ValueError("num_outputs must be positive.")
+
+    freq = np.asarray(frequencies_ghz, dtype=np.float64)
+    response_shape = (num_outputs,) + freq.shape
+    if isinstance(load_reflections, np.ndarray):
+        resolved_array = np.asarray(load_reflections, dtype=np.complex128)
+        if resolved_array.ndim == 0:
+            return np.full(response_shape, resolved_array.item(), dtype=np.complex128)
+        if resolved_array.shape == freq.shape:
+            return np.broadcast_to(resolved_array, response_shape).astype(np.complex128, copy=True)
+        if resolved_array.shape == response_shape:
+            return np.array(resolved_array, dtype=np.complex128, copy=True)
+        raise ValueError(
+            "load_reflections ndarray must be scalar, match frequencies_ghz shape, "
+            "or have shape (num_outputs, *frequencies_ghz.shape)."
+        )
+
+    if isinstance(load_reflections, (list, tuple)):
+        if len(load_reflections) != num_outputs:
+            raise ValueError("load_reflections must contain one specification per output port.")
+        resolved_rows = [
+            resolve_load_reflection_response(freq, load_reflection)
+            for load_reflection in load_reflections
+        ]
+        return np.stack(resolved_rows, axis=0).astype(np.complex128, copy=False)
+
+    resolved = resolve_load_reflection_response(freq, load_reflections)
+    return np.broadcast_to(resolved, response_shape).astype(np.complex128, copy=True)
+
+
+def calculate_loaded_multiport_response(
+    frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    forward_responses: np.ndarray,
+    output_reflection_matrix: np.ndarray,
+    load_reflections: MultiLoadReflectionSpec,
+    round_trip_delays_ns: Union[float, Sequence[float], np.ndarray] = 0.0,
+) -> np.ndarray:
+    """Solve the terminated multi-output forward response ``(I-S_LL Gamma)^-1 S_Ls``."""
+    freq = np.asarray(frequencies_ghz, dtype=np.float64)
+    forward = np.asarray(forward_responses, dtype=np.complex128)
+    s_ll = np.asarray(output_reflection_matrix, dtype=np.complex128)
+    if forward.ndim < 1:
+        raise ValueError("forward_responses must include an output-port axis.")
+
+    num_outputs = int(forward.shape[0])
+    expected_forward_shape = (num_outputs,) + freq.shape
+    expected_matrix_shape = (num_outputs, num_outputs) + freq.shape
+    if forward.shape != expected_forward_shape:
+        raise ValueError(
+            "forward_responses must have shape (n_outputs, *frequencies_ghz.shape)."
+        )
+    if s_ll.shape != expected_matrix_shape:
+        raise ValueError(
+            "output_reflection_matrix must have shape "
+            "(n_outputs, n_outputs, *frequencies_ghz.shape)."
+        )
+
+    delays_ns = _normalize_per_output_values(
+        round_trip_delays_ns,
+        num_outputs=num_outputs,
+        name="round_trip_delays_ns",
+    )
+    gamma = resolve_multi_load_reflection_response(
+        freq,
+        load_reflections=load_reflections,
+        num_outputs=num_outputs,
+    )
+    gamma_eff = gamma * np.exp(
+        -2j * pi * delays_ns.reshape((num_outputs,) + (1,) * freq.ndim) * freq
+    )
+    forward_flat = forward.reshape(num_outputs, -1)
+    s_ll_flat = s_ll.reshape(num_outputs, num_outputs, -1)
+    gamma_flat = gamma_eff.reshape(num_outputs, -1)
+    loop_matrix = s_ll_flat * gamma_flat[np.newaxis, :, :]
+    system = np.moveaxis(
+        np.eye(num_outputs, dtype=np.complex128)[:, :, np.newaxis] - loop_matrix,
+        -1,
+        0,
+    )
+    rhs = np.moveaxis(forward_flat, -1, 0)[:, :, np.newaxis]
+    loaded = np.linalg.solve(system, rhs)[:, :, 0]
+    return np.moveaxis(loaded, 0, -1).reshape(expected_forward_shape)
+
+
+def calculate_loaded_multiport_wave_response(
+    frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    forward_responses: np.ndarray,
+    output_reflection_matrix: np.ndarray,
+    load_reflections: MultiLoadReflectionSpec,
+    round_trip_delays_ns: Union[float, Sequence[float], np.ndarray] = 0.0,
+    return_coupling: Literal["full", "diagonal"] = "full",
+) -> LoadedMultiportWaveResponse:
+    """Solve terminated port waves and convert them to load-plane voltage/current."""
+    freq = np.asarray(frequencies_ghz, dtype=np.float64)
+    forward = np.asarray(forward_responses, dtype=np.complex128)
+    s_ll = np.asarray(output_reflection_matrix, dtype=np.complex128)
+    if forward.ndim < 1:
+        raise ValueError("forward_responses must include an output-port axis.")
+    num_outputs = int(forward.shape[0])
+    expected_forward_shape = (num_outputs,) + freq.shape
+    expected_matrix_shape = (num_outputs, num_outputs) + freq.shape
+    if forward.shape != expected_forward_shape:
+        raise ValueError(
+            "forward_responses must have shape (n_outputs, *frequencies_ghz.shape)."
+        )
+    if s_ll.shape != expected_matrix_shape:
+        raise ValueError(
+            "output_reflection_matrix must have shape "
+            "(n_outputs, n_outputs, *frequencies_ghz.shape)."
+        )
+    if return_coupling not in {"full", "diagonal"}:
+        raise ValueError("return_coupling must be 'full' or 'diagonal'.")
+
+    gamma = resolve_multi_load_reflection_response(
+        freq,
+        load_reflections=load_reflections,
+        num_outputs=num_outputs,
+    )
+    delays_ns = _normalize_per_output_values(
+        round_trip_delays_ns,
+        num_outputs=num_outputs,
+        name="round_trip_delays_ns",
+    )
+    one_way_phase = np.exp(
+        -1j * pi * delays_ns.reshape((num_outputs,) + (1,) * freq.ndim) * freq
+    )
+
+    forward_flat = forward.reshape(num_outputs, -1)
+    s_ll_flat = s_ll.reshape(num_outputs, num_outputs, -1)
+    gamma_flat = gamma.reshape(num_outputs, -1)
+    phase_flat = one_way_phase.reshape(num_outputs, -1)
+    gamma_eff_flat = gamma_flat * phase_flat**2
+    loop_matrix = s_ll_flat * gamma_eff_flat[np.newaxis, :, :]
+    system = np.moveaxis(
+        np.eye(num_outputs, dtype=np.complex128)[:, :, np.newaxis] - loop_matrix,
+        -1,
+        0,
+    )
+    rhs_source = np.moveaxis(forward_flat, -1, 0)[:, :, np.newaxis]
+    port_outgoing_flat = np.linalg.solve(system, rhs_source)[:, :, 0]
+    port_outgoing = np.moveaxis(port_outgoing_flat, 0, -1).reshape(expected_forward_shape)
+    load_incident = one_way_phase * port_outgoing
+    load_reflected = gamma * load_incident
+
+    rhs_return = s_ll_flat * phase_flat[np.newaxis, :, :]
+    rhs_return = np.moveaxis(rhs_return, -1, 0)
+    return_flat = np.linalg.solve(system, rhs_return)
+    return_flat = return_flat * phase_flat.T[:, :, np.newaxis]
+    return_operator = np.moveaxis(return_flat, 0, -1).reshape(expected_matrix_shape)
+    if return_coupling == "diagonal":
+        mask = np.eye(num_outputs, dtype=bool).reshape(
+            (num_outputs, num_outputs) + (1,) * freq.ndim
+        )
+        return_operator = np.where(mask, return_operator, 0.0)
+
+    singular_values = np.linalg.svd(system, compute_uv=False)
+    min_singular = singular_values[:, -1]
+    condition = np.divide(
+        singular_values[:, 0],
+        min_singular,
+        out=np.full_like(min_singular, np.inf, dtype=np.float64),
+        where=min_singular > 0.0,
+    )
+    spectral_radius = np.max(
+        np.abs(np.linalg.eigvals(np.moveaxis(loop_matrix, -1, 0))),
+        axis=-1,
+    )
+    diagnostic_shape = freq.shape
+
+    return LoadedMultiportWaveResponse(
+        port_outgoing=port_outgoing,
+        load_incident=load_incident,
+        load_reflected=load_reflected,
+        local_voltage=(1.0 + gamma) * load_incident,
+        local_current_equivalent_voltage=(1.0 - gamma) * load_incident,
+        source_operator=load_incident,
+        return_operator=return_operator,
+        load_reflections=gamma,
+        one_way_phase=one_way_phase,
+        loop_spectral_radius=np.asarray(spectral_radius).reshape(diagnostic_shape),
+        system_condition_number=np.asarray(condition).reshape(diagnostic_shape),
+        system_min_singular_value=np.asarray(min_singular).reshape(diagnostic_shape),
+    )
+
+
+def evaluate_touchstone_multiport_output_block(
+    query_frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    output_ports: Sequence[int],
+    file_path: Union[str, Path, None] = None,
+    network: TouchstoneNetwork | None = None,
+    input_port: int = 1,
+    interpolation: TouchstoneInterpolation = "polar",
+    out_of_band: OutOfBandPolicy = "edge",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Evaluate ``S[L,s]`` and ``S[L,L]`` for an ordered output-port set."""
+    ports = _normalize_output_ports(output_ports)
+    if network is None:
+        if file_path is None:
+            raise ValueError("evaluate_touchstone_multiport_output_block requires either file_path or network.")
+        network = load_touchstone_network(file_path)
+    elif not isinstance(network, TouchstoneNetwork):
+        raise TypeError("network must be a TouchstoneNetwork instance.")
+
+    freq = np.asarray(query_frequencies_ghz, dtype=np.float64)
+    forward = np.stack(
+        [
+            evaluate_touchstone_response(
+                freq,
+                network=network,
+                input_port=input_port,
+                output_port=port,
+                interpolation=interpolation,
+                out_of_band=out_of_band,
+            )
+            for port in ports
+        ],
+        axis=0,
+    )
+    s_ll = np.empty((len(ports), len(ports)) + freq.shape, dtype=np.complex128)
+    for out_idx, output_port in enumerate(ports):
+        for in_idx, reflection_port in enumerate(ports):
+            s_ll[out_idx, in_idx] = evaluate_touchstone_response(
+                freq,
+                network=network,
+                input_port=reflection_port,
+                output_port=output_port,
+                interpolation=interpolation,
+                out_of_band=out_of_band,
+            )
+    return forward, s_ll
+
+
+def evaluate_loaded_touchstone_multiport_wave_response(
+    query_frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    output_ports: Sequence[int],
+    load_reflections: MultiLoadReflectionSpec = 1.0 + 0.0j,
+    round_trip_delays_ns: Union[float, Sequence[float], np.ndarray] = 0.0,
+    return_coupling: Literal["full", "diagonal"] = "full",
+    file_path: Union[str, Path, None] = None,
+    network: TouchstoneNetwork | None = None,
+    input_port: int = 1,
+    interpolation: TouchstoneInterpolation = "polar",
+    out_of_band: OutOfBandPolicy = "edge",
+) -> LoadedMultiportWaveResponse:
+    """Evaluate terminated port waves and load-plane fields from Touchstone data."""
+    forward, s_ll = evaluate_touchstone_multiport_output_block(
+        query_frequencies_ghz,
+        output_ports=output_ports,
+        file_path=file_path,
+        network=network,
+        input_port=input_port,
+        interpolation=interpolation,
+        out_of_band=out_of_band,
+    )
+    return calculate_loaded_multiport_wave_response(
+        query_frequencies_ghz,
+        forward_responses=forward,
+        output_reflection_matrix=s_ll,
+        load_reflections=load_reflections,
+        round_trip_delays_ns=round_trip_delays_ns,
+        return_coupling=return_coupling,
+    )

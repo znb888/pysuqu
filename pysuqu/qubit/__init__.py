@@ -3,8 +3,14 @@
 from .analysis import SingleQubitSpectrum, analyze_single_qubit_spectrum
 from .base import AbstractQubit, ParameterizedQubit, Phi0, pi
 from .circuit import (
+    LoadedMultiportWaveResponse,
     TransmonReflectionModel,
+    calculate_loaded_multiport_response,
+    calculate_loaded_multiport_wave_response,
     calculate_loaded_single_port_response,
+    evaluate_loaded_touchstone_multiport_wave_response,
+    evaluate_touchstone_multiport_output_block,
+    resolve_multi_load_reflection_response,
     resolve_load_reflection_response,
 )
 from ..funclib.transmission import (
@@ -65,6 +71,7 @@ __all__ = [
     'GroundedTransmon',
     'HamiltonianEvo',
     'IIRFilterStage',
+    'LoadedMultiportWaveResponse',
     'MIMOTouchstoneStage',
     'MixerParams',
     'ParameterizedQubit',
@@ -87,12 +94,17 @@ __all__ = [
     'WaveformGenerator',
     'apply_derivative_precorrection',
     'analyze_single_qubit_spectrum',
+    'calculate_loaded_multiport_response',
+    'calculate_loaded_multiport_wave_response',
     'calculate_loaded_single_port_response',
     'compute_derivative_basis',
     'design_derivative_precorrection',
     'design_inverse_fir_from_touchstone',
+    'evaluate_loaded_touchstone_multiport_wave_response',
+    'evaluate_touchstone_multiport_output_block',
     'evaluate_touchstone_response',
     'load_touchstone_network',
     'pi',
+    'resolve_multi_load_reflection_response',
     'resolve_load_reflection_response',
 ]

@@ -10,6 +10,7 @@ install_test_stubs()
 
 import pysuqu.qubit.base as base_module
 from pysuqu.qubit import circuit
+from pysuqu.funclib.transmission import TouchstoneNetwork
 from pysuqu.qubit.base import ParameterizedQubit
 
 
@@ -161,6 +162,109 @@ class QubitCircuitModuleTests(unittest.TestCase):
                 output_reflection_response=output_reflection,
                 load_reflection=load_reflection,
             )
+
+    def test_loaded_multiport_wave_response_exposes_boundary_fields_and_diagnostics(self):
+        frequencies = np.array([5.0])
+        forward = np.array([[0.5 + 0.0j]])
+        s_ll = np.zeros((1, 1, 1), dtype=np.complex128)
+
+        shorted = circuit.calculate_loaded_multiport_wave_response(
+            frequencies,
+            forward_responses=forward,
+            output_reflection_matrix=s_ll,
+            load_reflections=-1.0,
+            round_trip_delays_ns=0.1,
+        )
+        expected_incident = 0.5 * np.exp(-1j * np.pi * frequencies * 0.1)
+        np.testing.assert_allclose(shorted.port_outgoing[0], forward[0])
+        np.testing.assert_allclose(shorted.load_incident[0], expected_incident)
+        np.testing.assert_allclose(shorted.local_voltage[0], 0.0)
+        np.testing.assert_allclose(shorted.local_current_equivalent_voltage[0], 2.0 * expected_incident)
+        np.testing.assert_allclose(shorted.source_operator, shorted.load_incident)
+        np.testing.assert_allclose(shorted.return_operator, 0.0)
+        np.testing.assert_allclose(shorted.loop_spectral_radius, 0.0)
+        np.testing.assert_allclose(shorted.system_condition_number, 1.0)
+        np.testing.assert_allclose(shorted.system_min_singular_value, 1.0)
+
+        opened = circuit.calculate_loaded_multiport_wave_response(
+            frequencies,
+            forward_responses=forward,
+            output_reflection_matrix=s_ll,
+            load_reflections=1.0,
+            round_trip_delays_ns=0.1,
+        )
+        np.testing.assert_allclose(opened.local_voltage[0], 2.0 * expected_incident)
+        np.testing.assert_allclose(opened.local_current_equivalent_voltage[0], 0.0)
+
+    def test_loaded_multiport_wave_response_handles_return_coupling_modes(self):
+        frequencies = np.array([5.0])
+        forward = np.zeros((2, 1), dtype=np.complex128)
+        s_ll = np.array(
+            [
+                [[0.10 + 0.0j], [0.04 + 0.02j]],
+                [[0.03 - 0.01j], [0.12 + 0.0j]],
+            ]
+        )
+        kwargs = dict(
+            frequencies_ghz=frequencies,
+            forward_responses=forward,
+            output_reflection_matrix=s_ll,
+            load_reflections=(-1.0, -1.0),
+        )
+
+        full = circuit.calculate_loaded_multiport_wave_response(**kwargs, return_coupling="full")
+        diagonal = circuit.calculate_loaded_multiport_wave_response(**kwargs, return_coupling="diagonal")
+        self.assertGreater(abs(full.return_operator[0, 1, 0]), 0.0)
+        np.testing.assert_allclose(diagonal.return_operator[0, 1, 0], 0.0)
+        np.testing.assert_allclose(diagonal.return_operator[1, 0, 0], 0.0)
+
+    def test_loaded_multiport_response_matches_direct_matrix_solution(self):
+        frequencies = np.array([5.0, 5.1])
+        forward = np.array([[0.5 + 0.1j, 0.4 - 0.2j], [0.2 - 0.1j, 0.3 + 0.05j]])
+        s_ll = np.zeros((2, 2, 2), dtype=np.complex128)
+        s_ll[0, 0] = [0.1, 0.12]
+        s_ll[1, 1] = [0.2, 0.18]
+        s_ll[0, 1] = [0.03, 0.02]
+        s_ll[1, 0] = [0.04, 0.01]
+        loads = (0.5 + 0.1j, -0.2 + 0.05j)
+        delays = np.array([0.1, 0.2])
+
+        actual = circuit.calculate_loaded_multiport_response(
+            frequencies,
+            forward_responses=forward,
+            output_reflection_matrix=s_ll,
+            load_reflections=loads,
+            round_trip_delays_ns=delays,
+        )
+        expected = np.empty_like(forward)
+        for idx, frequency in enumerate(frequencies):
+            gamma_eff = loads * np.exp(-2j * np.pi * delays * frequency)
+            expected[:, idx] = np.linalg.solve(
+                np.eye(2) - s_ll[:, :, idx] * gamma_eff[np.newaxis, :],
+                forward[:, idx],
+            )
+        np.testing.assert_allclose(actual, expected)
+
+    def test_loaded_touchstone_multiport_wave_wrapper_uses_network_paths(self):
+        frequencies = np.array([4.8, 5.0, 5.2])
+        s_parameters = np.zeros((3, 3, 3), dtype=np.complex128)
+        s_parameters[:, 1, 0] = [0.8, 0.7, 0.75]
+        s_parameters[:, 2, 0] = [0.5, 0.55, 0.6]
+        s_parameters[:, 1, 1] = [0.2, 0.18, 0.16]
+        s_parameters[:, 2, 2] = [0.1, 0.12, 0.11]
+        network = TouchstoneNetwork(frequencies=frequencies, s_parameters=s_parameters)
+
+        result = circuit.evaluate_loaded_touchstone_multiport_wave_response(
+            frequencies,
+            output_ports=[2, 3],
+            network=network,
+            load_reflections=(-1.0, 1.0),
+        )
+        self.assertEqual(result.port_outgoing.shape, (2, 3))
+        self.assertEqual(result.load_incident.shape, (2, 3))
+        self.assertEqual(result.return_operator.shape, (2, 2, 3))
+        np.testing.assert_allclose(result.load_reflections[0], -1.0)
+        np.testing.assert_allclose(result.load_reflections[1], 1.0)
 
     def test_transmon_reflection_model_builds_from_qubit_and_resolves_grid(self):
         qubit = type("QubitStub", (), {"qubit_f01": 5.2, "Ec": 2 * np.pi * 0.22})()

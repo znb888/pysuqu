@@ -12,7 +12,7 @@ energy is in gigahertz (GHz).
 # import
 import numpy as np
 import qutip as qt
-from typing import Any, Union, List, Tuple, Dict, Optional, Literal
+from typing import Any, Union, List, Tuple, Dict, Optional, Literal, Sequence
 from dataclasses import replace
 from tqdm import tqdm
 from copy import copy
@@ -449,8 +449,10 @@ class SingleQubitGate(GateBase):
 
         return c_ops
 
-    def _parse_initial_state(self, state_input: Union[int, List[complex]]) -> qt.Qobj:
+    def _parse_initial_state(self, state_input: Union[qt.Qobj, int, List[complex]]) -> qt.Qobj:
         """Helper: Convert index or coeff list to Qobj state vector."""
+        if isinstance(state_input, qt.Qobj):
+            return state_input
         if isinstance(state_input, int):
             return self.qubit.get_eigenstate(state_input)
         
@@ -519,8 +521,9 @@ class SingleQubitGate(GateBase):
     def run_simulation(
         self, 
         channel: Union[ChannelSchedule, None] = None,
-        initial_state_input: Union[int, List[complex]] = 0,
+        initial_state_input: Union[qt.Qobj, int, List[complex]] = 0,
         transmission_chain: Optional[TransmissionChain] = None,
+        c_ops: Optional[Sequence[qt.Qobj]] = None,
         **kwargs
     ) -> qt.Result:
         """
@@ -554,28 +557,29 @@ class SingleQubitGate(GateBase):
             induc_phi_model=induc_phi_model,
         )
         drive_func = self.awg.get_qutip_func(channel, chain=active_chain)
-        c_ops = self._get_c_ops()
+        resolved_c_ops = self._get_c_ops() if c_ops is None else list(c_ops)
         
         H_total = [H_static, [H_drive, drive_func]]
         opts = self._default_solver_options()
         solver_args = self._default_solver_args()
         
         result = qt.mesolve(
-            H_total, psi0, self.awg.t_axis, 
-            c_ops=c_ops, e_ops=[], options=opts, args=solver_args
+            H_total, psi0, self.awg.t_axis,
+            c_ops=resolved_c_ops, e_ops=[], options=opts, args=solver_args
         )
         return result
 
     def run_trace_simulation(
         self,
         trace,
-        initial_state_input: Union[int, List[complex]] = 0,
+        initial_state_input: Union[qt.Qobj, int, List[complex]] = 0,
         *,
         couple_term: float = 0.5e-12,
         couple_type: Literal['induc', 'capac'] = 'induc',
         options: Optional[Dict[str, Any]] = None,
         args: Optional[Dict[str, Any]] = None,
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
+        c_ops: Optional[Sequence[qt.Qobj]] = None,
     ) -> qt.Result:
         """
         Evolve the qubit directly under one solver-facing waveform trace.
@@ -584,6 +588,38 @@ class SingleQubitGate(GateBase):
         ``domain``. ``rf_real`` traces are interpolated directly; ``iq_complex``
         traces are analytically mixed to RF using ``trace.lo_freq``.
         """
+        H_total, t_axis, resolved_options, resolved_args = self._prepare_trace_simulation(
+            trace,
+            couple_term=couple_term,
+            couple_type=couple_type,
+            options=options,
+            args=args,
+            induc_phi_model=induc_phi_model,
+        )
+        psi0 = self._parse_initial_state(initial_state_input)
+        resolved_c_ops = self._get_c_ops() if c_ops is None else list(c_ops)
+
+        return qt.mesolve(
+            H_total,
+            psi0,
+            t_axis,
+            c_ops=resolved_c_ops,
+            e_ops=[],
+            options=resolved_options,
+            args=resolved_args,
+        )
+
+    def _prepare_trace_simulation(
+        self,
+        trace,
+        *,
+        couple_term: float,
+        couple_type: Literal['induc', 'capac'],
+        options: Optional[Dict[str, Any]],
+        args: Optional[Dict[str, Any]],
+        induc_phi_model: Literal['exact', 'linear'],
+    ) -> tuple[list[Any], np.ndarray, Dict[str, Any], Dict[str, Any]]:
+        """Prepare one trace-dependent solver context reusable across initial states."""
         trace_domain = getattr(trace, 'domain', None)
         if trace_domain not in {'rf_real', 'iq_complex'}:
             raise ValueError(
@@ -591,7 +627,6 @@ class SingleQubitGate(GateBase):
                 "Use a trace with t_axis, values, domain, and optional lo_freq first."
             )
 
-        psi0 = self._parse_initial_state(initial_state_input)
         H_static = self.qubit.get_hamiltonian()
         H_drive = self.get_drive_hamiltonian(
             couple_term=couple_term,
@@ -602,19 +637,25 @@ class SingleQubitGate(GateBase):
             drive_func = self.awg.trace_to_qutip_rf_func(trace)
         else:
             drive_func = self.awg.trace_to_qutip_func(trace)
-        c_ops = self._get_c_ops()
         resolved_options = self._default_solver_options(options)
         resolved_args = self._default_solver_args(args)
-
-        return qt.mesolve(
+        return (
             [H_static, [H_drive, drive_func]],
-            psi0,
             np.asarray(trace.t_axis, dtype=np.float64),
-            c_ops=c_ops,
-            e_ops=[],
-            options=resolved_options,
-            args=resolved_args,
+            resolved_options,
+            resolved_args,
         )
+
+    @staticmethod
+    def _result_final_state(result: qt.Result) -> qt.Qobj:
+        """Return the final state from full-trajectory or final-state-only results."""
+        final_state = getattr(result, 'final_state', None)
+        if final_state is not None:
+            return final_state
+        states = getattr(result, 'states', None)
+        if states:
+            return states[-1]
+        raise ValueError("Solver result does not contain a final state.")
 
     def plot_bloch_evolution(self, result: qt.Result, rotation_omega: float) -> None:
         """
@@ -899,6 +940,7 @@ class SingleQubitGate(GateBase):
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
         unitarize: bool = False,
         make_su2: bool = False,
+        store_trajectories: bool = True,
     ) -> Dict[str, Any]:
         """Extract the projected 2x2 process matrix and diagnostics for one pulse schedule."""
         if channel is None:
@@ -922,8 +964,11 @@ class SingleQubitGate(GateBase):
         )
         drive_func = self.awg.get_qutip_func(channel, chain=active_chain)
         H_total = [H_static, [H_drive, drive_func]]
-        resolved_options = self._default_solver_options(options)
-        resolved_args = dict(args or {})
+        solver_options = dict(options or {})
+        if not store_trajectories:
+            solver_options.update(store_states=False, store_final_state=True)
+        resolved_options = self._default_solver_options(solver_options)
+        resolved_args = self._default_solver_args(args)
 
         columns = []
         leakages = []
@@ -939,7 +984,10 @@ class SingleQubitGate(GateBase):
                 args=resolved_args,
             )
             results.append(result)
-            coeffs = self._project_ket_to_qubit_coefficients(result.states[-1], basis_states)
+            coeffs = self._project_ket_to_qubit_coefficients(
+                self._result_final_state(result),
+                basis_states,
+            )
             columns.append(coeffs)
             subspace_probability = float(np.real(np.vdot(coeffs, coeffs)))
             leakages.append(max(0.0, 1.0 - subspace_probability))
@@ -986,6 +1034,7 @@ class SingleQubitGate(GateBase):
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
         unitarize: bool = False,
         make_su2: bool = False,
+        store_trajectories: bool = True,
     ) -> Dict[str, Any]:
         """Extract a projected 2x2 process matrix from one solver-facing waveform trace."""
         if frame not in {'rotating', 'lab'}:
@@ -996,19 +1045,33 @@ class SingleQubitGate(GateBase):
         columns = []
         leakages = []
         results = []
+        solver_options = dict(options or {})
+        if not store_trajectories:
+            solver_options.update(store_states=False, store_final_state=True)
+        H_total, t_axis, resolved_options, resolved_args = self._prepare_trace_simulation(
+            trace,
+            couple_term=couple_term,
+            couple_type=couple_type,
+            options=solver_options,
+            args=args,
+            induc_phi_model=induc_phi_model,
+        )
 
         for initial_state_input in basis_inputs:
-            result = self.run_trace_simulation(
-                trace,
-                initial_state_input=initial_state_input,
-                couple_term=couple_term,
-                couple_type=couple_type,
-                options=options,
-                args=args,
-                induc_phi_model=induc_phi_model,
+            result = qt.mesolve(
+                H_total,
+                self._parse_initial_state(initial_state_input),
+                t_axis,
+                c_ops=[],
+                e_ops=[],
+                options=resolved_options,
+                args=resolved_args,
             )
             results.append(result)
-            coeffs = self._project_ket_to_qubit_coefficients(result.states[-1], basis_states)
+            coeffs = self._project_ket_to_qubit_coefficients(
+                self._result_final_state(result),
+                basis_states,
+            )
             columns.append(coeffs)
             subspace_probability = float(np.real(np.vdot(coeffs, coeffs)))
             leakages.append(max(0.0, 1.0 - subspace_probability))
@@ -1041,6 +1104,192 @@ class SingleQubitGate(GateBase):
             "unitarity_error": unitarity_error,
             "frame": frame,
             "basis_results": results,
+        }
+
+    def extract_trace_channel_payload(
+        self,
+        trace,
+        *,
+        couple_term: float = 0.5e-12,
+        couple_type: Literal['induc', 'capac'] = 'induc',
+        frame: Literal['rotating', 'lab'] = 'rotating',
+        c_ops: Optional[Sequence[qt.Qobj]] = None,
+        options: Optional[Dict[str, Any]] = None,
+        args: Optional[Dict[str, Any]] = None,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
+        store_trajectories: bool = True,
+    ) -> Dict[str, Any]:
+        """Reconstruct the projected computational channel from four physical inputs."""
+        if frame not in {'rotating', 'lab'}:
+            raise ValueError("frame must be either 'rotating' or 'lab'.")
+        basis_states = self._computational_basis_states()
+        input_coefficients = (
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [1.0, 1.0j],
+        )
+        projected_outputs: list[np.ndarray] = []
+        results = []
+        solver_options = dict(options or {})
+        if not store_trajectories:
+            solver_options.update(store_states=False, store_final_state=True)
+        H_total, t_axis, resolved_options, resolved_args = self._prepare_trace_simulation(
+            trace,
+            couple_term=couple_term,
+            couple_type=couple_type,
+            options=solver_options,
+            args=args,
+            induc_phi_model=induc_phi_model,
+        )
+        resolved_c_ops = [] if c_ops is None else list(c_ops)
+        for coefficients in input_coefficients:
+            result = qt.mesolve(
+                H_total,
+                self._parse_initial_state(coefficients),
+                t_axis,
+                c_ops=resolved_c_ops,
+                e_ops=[],
+                options=resolved_options,
+                args=resolved_args,
+            )
+            results.append(result)
+            final_state = self._result_final_state(result)
+            final_density = final_state * final_state.dag() if final_state.isket else final_state
+            projected = self._project_operator_to_qubit_subspace(final_density, basis_states)
+            if frame == 'rotating':
+                t_final = float(result.times[-1])
+                rotation = np.diag([1.0, np.exp(2j * pi * self.qubit.qubit_f01 * t_final)])
+                projected = rotation @ projected @ rotation.conj().T
+            projected_outputs.append(np.asarray(projected, dtype=np.complex128))
+
+        e00, e11, eplus, eplus_i = projected_outputs
+        symmetric = 2.0 * eplus - e00 - e11
+        antisymmetric = 2.0 * eplus_i - e00 - e11
+        e01 = 0.5 * (symmetric + 1j * antisymmetric)
+        e10 = 0.5 * (symmetric - 1j * antisymmetric)
+        survival_probability = float(np.real(np.trace(e00) + np.trace(e11)) / 2.0)
+        return {
+            "basis_operator_outputs": ((e00, e01), (e10, e11)),
+            "survival_probability": survival_probability,
+            "frame": frame,
+            "input_results": results,
+        }
+
+    def score_trace_channel_payload(
+        self,
+        payload: Dict[str, Any],
+        *,
+        target_unitary: Union[qt.Qobj, np.ndarray, List[List[complex]], None],
+    ) -> Dict[str, float]:
+        """Score a projected trace-decreasing channel against one target unitary."""
+        target = np.asarray(
+            self._resolve_target_qubit_unitary(target_unitary).full(),
+            dtype=np.complex128,
+        )
+        outputs = payload["basis_operator_outputs"]
+        entanglement_sum = 0.0 + 0.0j
+        for row in range(2):
+            for column in range(2):
+                target_row = target[:, row]
+                target_column = target[:, column]
+                entanglement_sum += np.vdot(
+                    target_row,
+                    np.asarray(outputs[row][column], dtype=np.complex128) @ target_column,
+                )
+        raw_entanglement_fidelity = float(np.real(entanglement_sum) / 4.0)
+        raw_survival = float(payload["survival_probability"])
+        raw_average_fidelity = float(
+            (2.0 * raw_entanglement_fidelity + raw_survival) / 3.0
+        )
+        entanglement_fidelity = min(max(raw_entanglement_fidelity, 0.0), 1.0)
+        survival = min(max(raw_survival, 0.0), 1.0)
+        average_fidelity = min(max(raw_average_fidelity, 0.0), 1.0)
+        choi = np.block(
+            [
+                [np.asarray(outputs[0][0]), np.asarray(outputs[0][1])],
+                [np.asarray(outputs[1][0]), np.asarray(outputs[1][1])],
+            ]
+        )
+        choi_hermiticity_error = float(np.linalg.norm(choi - choi.conj().T))
+        choi_min_eigenvalue = float(
+            np.min(np.linalg.eigvalsh(0.5 * (choi + choi.conj().T)))
+        )
+        trace_effect = np.asarray(
+            [
+                [np.trace(outputs[0][0]), np.trace(outputs[1][0])],
+                [np.trace(outputs[0][1]), np.trace(outputs[1][1])],
+            ],
+            dtype=np.complex128,
+        )
+        trace_effect_hermiticity_error = float(
+            np.linalg.norm(trace_effect - trace_effect.conj().T)
+        )
+        trace_effect_eigenvalues = np.linalg.eigvalsh(
+            0.5 * (trace_effect + trace_effect.conj().T)
+        )
+        trace_effect_min_eigenvalue = float(np.min(trace_effect_eigenvalues))
+        trace_effect_max_eigenvalue = float(np.max(trace_effect_eigenvalues))
+        trace_nonincreasing_violation = max(0.0, trace_effect_max_eigenvalue - 1.0)
+        physicality_warning = bool(
+            choi_hermiticity_error > 1e-8
+            or choi_min_eigenvalue < -1e-8
+            or trace_effect_hermiticity_error > 1e-8
+            or trace_effect_min_eigenvalue < -1e-8
+            or trace_nonincreasing_violation > 1e-8
+            or raw_survival < -1e-8
+            or raw_survival > 1.0 + 1e-8
+            or raw_entanglement_fidelity < -1e-8
+            or raw_entanglement_fidelity > 1.0 + 1e-8
+            or raw_average_fidelity < -1e-8
+            or raw_average_fidelity > 1.0 + 1e-8
+        )
+        return {
+            "average_gate_fidelity": average_fidelity,
+            "entanglement_fidelity": entanglement_fidelity,
+            "survival_probability": survival,
+            "average_leakage": max(0.0, 1.0 - survival),
+            "raw_average_gate_fidelity": raw_average_fidelity,
+            "raw_entanglement_fidelity": raw_entanglement_fidelity,
+            "raw_survival_probability": raw_survival,
+            "choi_hermiticity_error": choi_hermiticity_error,
+            "choi_min_eigenvalue": choi_min_eigenvalue,
+            "trace_effect_hermiticity_error": trace_effect_hermiticity_error,
+            "trace_effect_min_eigenvalue": trace_effect_min_eigenvalue,
+            "trace_effect_max_eigenvalue": trace_effect_max_eigenvalue,
+            "trace_nonincreasing_violation": trace_nonincreasing_violation,
+            "physicality_warning": physicality_warning,
+        }
+
+    def calculate_trace_channel_fidelity(
+        self,
+        trace,
+        *,
+        target_unitary: Union[qt.Qobj, np.ndarray, List[List[complex]], None],
+        couple_term: float = 0.5e-12,
+        couple_type: Literal['induc', 'capac'] = 'induc',
+        frame: Literal['rotating', 'lab'] = 'rotating',
+        c_ops: Optional[Sequence[qt.Qobj]] = None,
+        options: Optional[Dict[str, Any]] = None,
+        args: Optional[Dict[str, Any]] = None,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
+        store_trajectories: bool = True,
+    ) -> Dict[str, Any]:
+        """Reconstruct and score a dissipative trace channel."""
+        payload = self.extract_trace_channel_payload(
+            trace,
+            couple_term=couple_term,
+            couple_type=couple_type,
+            frame=frame,
+            c_ops=c_ops,
+            options=options,
+            args=args,
+            induc_phi_model=induc_phi_model,
+            store_trajectories=store_trajectories,
+        )
+        return {
+            **self.score_trace_channel_payload(payload, target_unitary=target_unitary),
+            "channel_payload": payload,
         }
 
     def _score_unitary_fidelity(
@@ -1130,6 +1379,7 @@ class SingleQubitGate(GateBase):
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
         unitarize: bool = False,
         make_su2: bool = False,
+        store_trajectories: bool = True,
     ) -> qt.Qobj:
         """
         Extract the 2x2 evolution matrix projected onto the computational eigenstate subspace.
@@ -1150,6 +1400,7 @@ class SingleQubitGate(GateBase):
             induc_phi_model=induc_phi_model,
             unitarize=unitarize,
             make_su2=make_su2,
+            store_trajectories=store_trajectories,
         )
         return payload["unitary"]
 
@@ -1165,6 +1416,7 @@ class SingleQubitGate(GateBase):
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
         unitarize: bool = False,
         make_su2: bool = False,
+        store_trajectories: bool = True,
     ) -> qt.Qobj:
         """
         Extract the 2x2 computational-subspace process matrix from a drive trace.
@@ -1183,6 +1435,7 @@ class SingleQubitGate(GateBase):
             induc_phi_model=induc_phi_model,
             unitarize=unitarize,
             make_su2=make_su2,
+            store_trajectories=store_trajectories,
         )
         return payload["unitary"]
 
@@ -1201,6 +1454,7 @@ class SingleQubitGate(GateBase):
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
         unitarize: bool = False,
         make_su2: bool = False,
+        store_trajectories: bool = True,
         is_print: bool = True,
     ) -> Dict[str, Any]:
         """
@@ -1243,6 +1497,7 @@ class SingleQubitGate(GateBase):
                 induc_phi_model=induc_phi_model,
                 unitarize=unitarize,
                 make_su2=make_su2,
+                store_trajectories=store_trajectories,
             )
             actual_unitary = payload["unitary"]
             raw_unitary = payload["raw_unitary"]
@@ -1284,6 +1539,7 @@ class SingleQubitGate(GateBase):
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
         unitarize: bool = False,
         make_su2: bool = False,
+        store_trajectories: bool = True,
         is_print: bool = True,
     ) -> Dict[str, Any]:
         """
@@ -1308,6 +1564,7 @@ class SingleQubitGate(GateBase):
                 induc_phi_model=induc_phi_model,
                 unitarize=unitarize,
                 make_su2=make_su2,
+                store_trajectories=store_trajectories,
             )
             actual_unitary = payload["unitary"]
             raw_unitary = payload["raw_unitary"]
@@ -1516,4 +1773,3 @@ class SingleQubitGate(GateBase):
             fig.show()
         
         return best_val, max_fid
-

@@ -33,8 +33,14 @@ from pysuqu.funclib.transmission import (
 from pysuqu.qubit.analysis import SingleQubitSpectrum, analyze_single_qubit_spectrum
 from pysuqu.qubit.base import AbstractQubit, ParameterizedQubit, Phi0, pi
 from pysuqu.qubit.circuit import (
+    LoadedMultiportWaveResponse,
     TransmonReflectionModel,
+    calculate_loaded_multiport_response,
+    calculate_loaded_multiport_wave_response,
     calculate_loaded_single_port_response,
+    evaluate_loaded_touchstone_multiport_wave_response,
+    evaluate_touchstone_multiport_output_block,
+    resolve_multi_load_reflection_response,
     resolve_load_reflection_response,
 )
 from pysuqu.qubit.gate import (
@@ -72,6 +78,7 @@ class QubitPackageExportTests(unittest.TestCase):
         self.assertIs(qubit.GroundedTransmon, GroundedTransmon)
         self.assertIs(qubit.HamiltonianEvo, HamiltonianEvo)
         self.assertIs(qubit.IIRFilterStage, IIRFilterStage)
+        self.assertIs(qubit.LoadedMultiportWaveResponse, LoadedMultiportWaveResponse)
         self.assertIs(qubit.MIMOTouchstoneStage, MIMOTouchstoneStage)
         self.assertIs(qubit.MixerParams, MixerParams)
         self.assertIs(qubit.ParameterizedQubit, ParameterizedQubit)
@@ -92,6 +99,11 @@ class QubitPackageExportTests(unittest.TestCase):
         self.assertIs(qubit.TransmissionResult, TransmissionResult)
         self.assertIs(qubit.TransmonReflectionModel, TransmonReflectionModel)
         self.assertIs(qubit.calculate_loaded_single_port_response, calculate_loaded_single_port_response)
+        self.assertIs(qubit.calculate_loaded_multiport_response, calculate_loaded_multiport_response)
+        self.assertIs(qubit.calculate_loaded_multiport_wave_response, calculate_loaded_multiport_wave_response)
+        self.assertIs(qubit.evaluate_loaded_touchstone_multiport_wave_response, evaluate_loaded_touchstone_multiport_wave_response)
+        self.assertIs(qubit.evaluate_touchstone_multiport_output_block, evaluate_touchstone_multiport_output_block)
+        self.assertIs(qubit.resolve_multi_load_reflection_response, resolve_multi_load_reflection_response)
         self.assertIs(qubit.resolve_load_reflection_response, resolve_load_reflection_response)
         self.assertIs(qubit.WaveformGenerator, WaveformGenerator)
         self.assertIs(qubit.apply_derivative_precorrection, apply_derivative_precorrection)
@@ -125,6 +137,7 @@ class QubitPackageExportTests(unittest.TestCase):
                 'GroundedTransmon',
                 'HamiltonianEvo',
                 'IIRFilterStage',
+                'LoadedMultiportWaveResponse',
                 'MIMOTouchstoneStage',
                 'MixerParams',
                 'ParameterizedQubit',
@@ -147,13 +160,18 @@ class QubitPackageExportTests(unittest.TestCase):
                 'WaveformGenerator',
                 'apply_derivative_precorrection',
                 'analyze_single_qubit_spectrum',
+                'calculate_loaded_multiport_response',
+                'calculate_loaded_multiport_wave_response',
                 'calculate_loaded_single_port_response',
                 'compute_derivative_basis',
                 'design_derivative_precorrection',
                 'design_inverse_fir_from_touchstone',
+                'evaluate_loaded_touchstone_multiport_wave_response',
+                'evaluate_touchstone_multiport_output_block',
                 'evaluate_touchstone_response',
                 'load_touchstone_network',
                 'pi',
+                'resolve_multi_load_reflection_response',
                 'resolve_load_reflection_response',
             ],
         )
