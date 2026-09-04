@@ -170,6 +170,106 @@ class ZNoiseDecoherenceTphi1AnalyzerBoundaryTests(unittest.TestCase):
         self.assertIs(analyzer_calls[0]['noise_output'], z_noise.noise.output_stage)
         self.assertEqual(analyzer_calls[0]['sensitivity'], 1.23)
 
+    def test_cal_coupler_tphi1_combined_adds_gate_and_off_rates(self):
+        z_noise = self._construct()
+        calls = []
+
+        def single_tphi(*, sensitivity, sensitivity_unit, is_print):
+            calls.append((sensitivity, sensitivity_unit, is_print))
+            return {0.031: 2e-6, 0.007: 10e-6}[sensitivity]
+
+        with patch.object(z_noise, 'cal_coupler_tphi1', side_effect=single_tphi):
+            result = z_noise.cal_coupler_tphi1_combined(
+                gate_sensitivity=0.031,
+                off_sensitivity=0.007,
+                couplers_per_qubit=4,
+                is_print=False,
+            )
+
+        expected_rate = 1 / 2e-6 + 3 / 10e-6
+        self.assertAlmostEqual(result.value, 1 / expected_rate)
+        self.assertEqual(result.fit_diagnostics['tphi_gate_s'], 2e-6)
+        self.assertEqual(result.fit_diagnostics['tphi_off_s'], 10e-6)
+        self.assertAlmostEqual(result.fit_diagnostics['gamma_gate_s_inv'], 1 / 2e-6)
+        self.assertAlmostEqual(result.fit_diagnostics['gamma_off_s_inv'], 1 / 10e-6)
+        self.assertAlmostEqual(result.fit_diagnostics['gamma_total_s_inv'], expected_rate)
+        self.assertEqual(result.fit_diagnostics['tphi_total_s'], result.value)
+        self.assertEqual(result.metadata['gate_coupler_count'], 1)
+        self.assertEqual(result.metadata['off_coupler_count'], 3)
+        self.assertEqual(
+            calls,
+            [
+                (0.031, 'GHz/Phi0', False),
+                (0.007, 'GHz/Phi0', False),
+            ],
+        )
+        self.assertIs(z_noise.coupler_tphi1_combined_result, result)
+
+    def test_cal_coupler_tphi1_combined_n1_is_gate_tphi(self):
+        z_noise = self._construct()
+        with patch.object(
+            z_noise,
+            'cal_coupler_tphi1',
+            side_effect=[2e-6, 10e-6],
+        ):
+            result = z_noise.cal_coupler_tphi1_combined(
+                gate_sensitivity=0.031,
+                off_sensitivity=0.007,
+                couplers_per_qubit=1,
+                is_print=False,
+            )
+
+        self.assertAlmostEqual(result.value, 2e-6)
+
+    def test_cal_coupler_tphi1_combined_equal_values_scales_by_count(self):
+        z_noise = self._construct()
+        with patch.object(z_noise, 'cal_coupler_tphi1', return_value=12e-6):
+            result = z_noise.cal_coupler_tphi1_combined(
+                gate_sensitivity=0.031,
+                off_sensitivity=0.031,
+                couplers_per_qubit=4,
+                is_print=False,
+            )
+
+        self.assertAlmostEqual(result.value, 12e-6 / 4)
+
+    def test_cal_coupler_tphi1_combined_rejects_invalid_count(self):
+        z_noise = self._construct()
+        for value in (0, -1, 1.5, True, np.int64(0)):
+            with self.subTest(couplers_per_qubit=value):
+                with self.assertRaises(ValueError):
+                    z_noise.cal_coupler_tphi1_combined(
+                        gate_sensitivity=0.031,
+                        off_sensitivity=0.007,
+                        couplers_per_qubit=value,
+                        is_print=False,
+                    )
+
+    def test_cal_coupler_tphi1_combined_zero_sensitivity_gives_infinite_tphi(self):
+        z_noise = self._construct()
+        with patch.object(z_noise, 'cal_coupler_tphi1', return_value=np.inf):
+            result = z_noise.cal_coupler_tphi1_combined(
+                gate_sensitivity=0.0,
+                off_sensitivity=0.0,
+                couplers_per_qubit=4,
+                is_print=False,
+            )
+
+        self.assertTrue(np.isinf(result.value))
+        self.assertEqual(result.fit_diagnostics['gamma_total_s_inv'], 0.0)
+
+    def test_cal_coupler_tphi1_combined_rejects_invalid_sensitivities(self):
+        z_noise = self._construct()
+        for value in ([], [0.031, 0.007], np.nan, np.inf, -np.inf):
+            with self.subTest(sensitivity=value):
+                with self.assertRaises(ValueError):
+                    z_noise.cal_coupler_tphi1_combined(
+                        gate_sensitivity=value,
+                        off_sensitivity=0.007,
+                        couplers_per_qubit=4,
+                        is_print=False,
+                    )
+
 
 if __name__ == '__main__':
     unittest.main()

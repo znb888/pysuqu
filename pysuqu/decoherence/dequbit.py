@@ -523,6 +523,125 @@ class ZNoiseDecoherence(Decoherence):
 
         return self.coupler_tphi1
 
+    def cal_coupler_tphi1_combined(
+        self,
+        *,
+        gate_sensitivity,
+        off_sensitivity,
+        couplers_per_qubit: int,
+        sensitivity_unit: str = 'GHz/Phi0',
+        is_print: bool = True,
+    ) -> TphiResult:
+        """Combine gate/off coupler Tphi limits by adding independent rates.
+
+        One coupler uses ``gate_sensitivity`` and the remaining
+        ``couplers_per_qubit - 1`` couplers use ``off_sensitivity``. Each
+        single-coupler Tphi is evaluated through :meth:`cal_coupler_tphi1`.
+        """
+        if isinstance(couplers_per_qubit, (bool, np.bool_)) or not isinstance(
+            couplers_per_qubit,
+            (int, np.integer),
+        ):
+            raise ValueError('couplers_per_qubit must be a positive integer.')
+        couplers_per_qubit = int(couplers_per_qubit)
+        if couplers_per_qubit <= 0:
+            raise ValueError('couplers_per_qubit must be a positive integer.')
+
+        # A zero sensitivity is valid and maps to an infinite single-coupler
+        # Tphi, while NaN/infinite sensitivity would make the result meaningless.
+        for label, sensitivity_value in (
+            ('gate_sensitivity', gate_sensitivity),
+            ('off_sensitivity', off_sensitivity),
+        ):
+            try:
+                sensitivity_value = float(
+                    self._extract_frequency_sensitivity_ghz_per_phi0(
+                        sensitivity_value
+                    )
+                )
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f'{label} must be a finite scalar.') from exc
+            if not np.isfinite(sensitivity_value):
+                raise ValueError(f'{label} must be a finite scalar.')
+
+        gate_sensitivity_ghz_per_phi0 = self._rad_per_wb_to_ghz_per_phi0(
+            self._frequency_sensitivity_to_rad_per_wb(
+                gate_sensitivity,
+                unit=sensitivity_unit,
+            )
+        )
+        off_sensitivity_ghz_per_phi0 = self._rad_per_wb_to_ghz_per_phi0(
+            self._frequency_sensitivity_to_rad_per_wb(
+                off_sensitivity,
+                unit=sensitivity_unit,
+            )
+        )
+
+        tphi_gate_s = self.cal_coupler_tphi1(
+            sensitivity=gate_sensitivity,
+            sensitivity_unit=sensitivity_unit,
+            is_print=False,
+        )
+        tphi_off_s = self.cal_coupler_tphi1(
+            sensitivity=off_sensitivity,
+            sensitivity_unit=sensitivity_unit,
+            is_print=False,
+        )
+
+        try:
+            tphi_gate_s = float(tphi_gate_s)
+            tphi_off_s = float(tphi_off_s)
+        except (TypeError, ValueError) as exc:
+            raise ValueError('computed gate/off Tphi values must be numeric.') from exc
+        if any(np.isnan(value) or value <= 0 for value in (tphi_gate_s, tphi_off_s)):
+            raise ValueError('computed gate/off Tphi values must be positive.')
+        if any(np.isinf(value) and value < 0 for value in (tphi_gate_s, tphi_off_s)):
+            raise ValueError('computed gate/off Tphi values must not be negative infinity.')
+
+        gamma_gate_s_inv = 1 / tphi_gate_s
+        gamma_off_s_inv = 1 / tphi_off_s
+        gamma_total_s_inv = gamma_gate_s_inv + (
+            couplers_per_qubit - 1
+        ) * gamma_off_s_inv
+        tphi_total_s = np.inf if gamma_total_s_inv == 0 else 1 / gamma_total_s_inv
+        result = TphiResult(
+            value=tphi_total_s,
+            metadata={
+                'method': 'inverse_rate_sum',
+                'source': 'coupler-flux',
+                'assumption': 'one_gate_and_remaining_off_couplers',
+                'couplers_per_qubit': couplers_per_qubit,
+                'gate_coupler_count': 1,
+                'off_coupler_count': couplers_per_qubit - 1,
+                'gate_sensitivity': gate_sensitivity_ghz_per_phi0,
+                'off_sensitivity': off_sensitivity_ghz_per_phi0,
+                'gate_sensitivity_ghz_per_phi0': gate_sensitivity_ghz_per_phi0,
+                'off_sensitivity_ghz_per_phi0': off_sensitivity_ghz_per_phi0,
+                'sensitivity_unit': sensitivity_unit,
+            },
+            fit_diagnostics={
+                'tphi_gate_s': tphi_gate_s,
+                'tphi_off_s': tphi_off_s,
+                'gamma_gate_s_inv': gamma_gate_s_inv,
+                'gamma_off_s_inv': gamma_off_s_inv,
+                'gamma_total_s_inv': gamma_total_s_inv,
+                'rate_gate_s_inv': gamma_gate_s_inv,
+                'rate_off_s_inv': gamma_off_s_inv,
+                'rate_total_s_inv': gamma_total_s_inv,
+                'tphi_total_s': tphi_total_s,
+            },
+        )
+        self.coupler_tphi1_combined_result = result
+        if is_print:
+            print(
+                'Coupler mixed-state Tphi1: '
+                f'{tphi_total_s * 1e6:.6f} us '
+                f'(gate={tphi_gate_s * 1e6:.6f} us, '
+                f'off={tphi_off_s * 1e6:.6f} us, '
+                f'N={couplers_per_qubit})'
+            )
+        return result
+
     def cal_bias_current_voltage(
         self,
         phi_fraction: float = 0.25,
@@ -1099,7 +1218,14 @@ class RNoiseDecoherence(Decoherence):
     def _build_r_analyzer(self):
         return self._r_analyzer_builder(couple_term=self.couple_term)
 
-    def cal_nbar(self, kappa:float=None, chi:float=None, read_freq:float=6.5e9, is_print:bool=True) -> float:
+    def cal_nbar(
+        self,
+        kappa: float = None,
+        chi: float = None,
+        read_freq: float = 6.5e9,
+        is_print: bool = True,
+        heat_temperature_k: Optional[float] = None,
+    ) -> float:
         """
         Calculate the photon number n_bar in the readout cavity.
         
@@ -1107,6 +1233,9 @@ class RNoiseDecoherence(Decoherence):
             kappa (float): Cavity linewidth [rad/s] (required)
             chi (float): Dispersive shift [rad/s] (required)
             read_freq (float): Readout frequency [Hz] (required)
+            heat_temperature_k (float, optional): Additional heat-source
+                temperature combined with the chain PSD by equal-weight
+                spectral averaging.
         
         Returns:
             float: The photon number n_bar in the readout cavity.
@@ -1116,9 +1245,14 @@ class RNoiseDecoherence(Decoherence):
         if chi is None:
             chi = self.chi
 
+        nbar_kwargs = {
+            'noise_output': self.noise.output_stage,
+            'read_freq': read_freq,
+        }
+        if heat_temperature_k is not None:
+            nbar_kwargs['heat_temperature_k'] = heat_temperature_k
         self.n_bar = self.r_analyzer.calculate_nbar(
-            noise_output=self.noise.output_stage,
-            read_freq=read_freq,
+            **nbar_kwargs,
         )
         if is_print:
             self._emit_report(
@@ -1225,7 +1359,8 @@ class RNoiseDecoherence(Decoherence):
                       experiment: str = 'Ramsey', 
                       delay_list: np.ndarray = np.linspace(10, 10e3, 100)*1e-9, 
                       N: int = 100, len_pi: float = 100e-9,
-                      p0: Optional[np.ndarray] = [100e-6, 3e-6, 1., 0.],bounds=([0, 0, 0, -1], [np.inf, np.inf, 2, 1]), is_plot: bool = True, is_print: bool = True) -> TphiResult:
+                      p0: Optional[np.ndarray] = [100e-6, 3e-6, 1., 0.],bounds=([0, 0, 0, -1], [np.inf, np.inf, 2, 1]), is_plot: bool = True, is_print: bool = True,
+                      heat_temperature_k: Optional[float] = None) -> TphiResult:
         """
         Calculate dephasing time Tphi limited by readout cavity thermal photons.
         
@@ -1243,6 +1378,9 @@ class RNoiseDecoherence(Decoherence):
             bounds (tuple, optional): The bounds for fitting. Defaults to ([0, 0, 0, -1], [np.inf, np.inf, 2, 1]).
             is_plot (bool, optional): Whether to plot the results. Defaults to True.
             is_print (bool, optional): Whether to print the results. Defaults to True.
+            heat_temperature_k (float, optional): Additional heat-source
+                temperature used to refresh the thermal photon number before
+                calculating Tphi.
         
         Returns:
             TphiResult: The calculated dephasing time Tphi in [s].
@@ -1252,6 +1390,13 @@ class RNoiseDecoherence(Decoherence):
         kappa_hz = self.kappa if kappa is None else kappa
         chi = chi_hz * 2*pi
         kappa = kappa_hz * 2*pi
+
+        if heat_temperature_k is not None:
+            self.cal_nbar(
+                read_freq=read_freq,
+                is_print=False,
+                heat_temperature_k=heat_temperature_k,
+            )
 
         if method == 'cal':
             self.tphi_rc = self.r_analyzer.calculate_tphi_cal(

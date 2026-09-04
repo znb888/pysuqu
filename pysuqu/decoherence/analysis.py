@@ -4,13 +4,127 @@ from __future__ import annotations
 
 import numpy as np
 
-from .electronics import Sii_D2S, T2Sii_Double
-from .results import BiasCurrentVoltageResult, XYCurrentVoltageResult
+from .electronics import Sii_D2S, Sii2T_Double, T2Sii_Double
+from .results import BiasCurrentVoltageResult, T1Result, XYCurrentVoltageResult
 from ..funclib.mathlib import temp2nbar
 from ..qubit.base import Phi0, e
 from ..qubit.circuit import _normalize_drive_couplings, estimate_drive_line_t1_ns
 
 EULER_GAMMA = 0.577216
+
+
+def estimate_coupler_limited_qubit_t1(
+    *,
+    coupler_t1_s: float,
+    coupler_participation: float,
+    coupler_count: int = 1,
+) -> T1Result:
+    """Estimate the qubit T1 limit from identical independent coupler losses.
+
+    ``coupler_participation`` is the dressed-qubit energy participation of one
+    coupler. Independent decay rates add as
+    ``gamma_total = coupler_count * coupler_participation / coupler_t1_s``.
+    """
+    coupler_t1_s = float(coupler_t1_s)
+    coupler_participation = float(coupler_participation)
+
+    if not np.isfinite(coupler_t1_s) or coupler_t1_s <= 0:
+        raise ValueError('coupler_t1_s must be a finite positive number.')
+    if not np.isfinite(coupler_participation) or not 0 <= coupler_participation <= 1:
+        raise ValueError('coupler_participation must be finite and within [0, 1].')
+    if isinstance(coupler_count, (bool, np.bool_)) or not isinstance(
+        coupler_count,
+        (int, np.integer),
+    ):
+        raise ValueError('coupler_count must be a positive integer.')
+
+    coupler_count = int(coupler_count)
+    if coupler_count <= 0:
+        raise ValueError('coupler_count must be a positive integer.')
+
+    gamma_single_s_inv = coupler_participation / coupler_t1_s
+    gamma_total_s_inv = coupler_count * gamma_single_s_inv
+    qubit_t1_s = np.inf if gamma_total_s_inv == 0 else 1 / gamma_total_s_inv
+
+    return T1Result(
+        value=qubit_t1_s,
+        metadata={
+            'source': 'coupler_loss',
+            'assumption': 'independent_identical_couplers',
+            'coupler_t1_s': coupler_t1_s,
+            'coupler_participation': coupler_participation,
+            'coupler_count': coupler_count,
+        },
+        fit_diagnostics={
+            'gamma_single_s_inv': gamma_single_s_inv,
+            'gamma_total_s_inv': gamma_total_s_inv,
+        },
+    )
+
+
+def estimate_coupler_limited_qubit_t1_combined(
+    *,
+    t1_gate_s: float,
+    t1_off_s: float,
+    couplers_per_qubit: int,
+) -> T1Result:
+    """Combine gate/off coupler T1 limits by adding independent rates.
+
+    One coupler is assumed to be at the gate operating point and the remaining
+    ``couplers_per_qubit - 1`` couplers are at the coupling-off operating point:
+    ``gamma_total = 1 / t1_gate_s + (N - 1) / t1_off_s``.
+    Infinite single-coupler T1 values contribute zero rate.
+    """
+    try:
+        t1_gate_s = float(t1_gate_s)
+        t1_off_s = float(t1_off_s)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('t1_gate_s and t1_off_s must be numeric.') from exc
+    if any(np.isnan(value) or value <= 0 for value in (t1_gate_s, t1_off_s)):
+        raise ValueError('t1_gate_s and t1_off_s must be positive numbers.')
+    if any(np.isinf(value) and value < 0 for value in (t1_gate_s, t1_off_s)):
+        raise ValueError('t1_gate_s and t1_off_s must not be negative infinity.')
+    if isinstance(couplers_per_qubit, (bool, np.bool_)) or not isinstance(
+        couplers_per_qubit,
+        (int, np.integer),
+    ):
+        raise ValueError('couplers_per_qubit must be a positive integer.')
+
+    couplers_per_qubit = int(couplers_per_qubit)
+    if couplers_per_qubit <= 0:
+        raise ValueError('couplers_per_qubit must be a positive integer.')
+
+    gamma_gate_s_inv = 1 / t1_gate_s
+    gamma_off_s_inv = 1 / t1_off_s
+    gamma_total_s_inv = gamma_gate_s_inv + (
+        couplers_per_qubit - 1
+    ) * gamma_off_s_inv
+    qubit_t1_s = np.inf if gamma_total_s_inv == 0 else 1 / gamma_total_s_inv
+
+    return T1Result(
+        value=qubit_t1_s,
+        metadata={
+            'source': 'coupler_loss',
+            'assumption': 'one_gate_and_remaining_off_couplers',
+            'couplers_per_qubit': couplers_per_qubit,
+            'gate_coupler_count': 1,
+            'off_coupler_count': couplers_per_qubit - 1,
+            't1_gate_s': t1_gate_s,
+            't1_off_s': t1_off_s,
+        },
+        fit_diagnostics={
+            'gamma_gate_s_inv': gamma_gate_s_inv,
+            'gamma_off_s_inv': gamma_off_s_inv,
+            'gamma_total_s_inv': gamma_total_s_inv,
+            'rate_gate_s_inv': gamma_gate_s_inv,
+            'rate_off_s_inv': gamma_off_s_inv,
+            'rate_total_s_inv': gamma_total_s_inv,
+            't1_gate_s': t1_gate_s,
+            't1_off_s': t1_off_s,
+            't1_total_s': qubit_t1_s,
+            'qubit_t1_s': qubit_t1_s,
+        },
+    )
 
 
 class ZDephasingAnalyzer:
@@ -207,7 +321,7 @@ class XYRelaxationAnalyzer:
     ) -> tuple[float, float]:
         gamma_t1 = 1 / (t1_us * 1e-6)
         return (
-            gamma_up / gamma_t1,
+gamma_up / (gamma_up + gamma_down_actual+gamma_down),
             gamma_up / (gamma_up + gamma_down),
         )
 
@@ -252,8 +366,26 @@ class ReadoutCavityAnalyzer:
     def __init__(self, *, couple_term: float):
         self.couple_term = couple_term
 
-    def calculate_nbar(self, *, noise_output, read_freq: float) -> float:
-        return temp2nbar(noise_output.white_noise_temperature, read_freq)
+    def calculate_nbar(
+        self,
+        *,
+        noise_output,
+        read_freq: float,
+        heat_temperature_k: float | None = None,
+    ) -> float:
+        chain_temperature_k = float(noise_output.white_noise_temperature)
+        if heat_temperature_k is None:
+            effective_temperature_k = chain_temperature_k
+        else:
+            heat_temperature_k = float(heat_temperature_k)
+            if not np.isfinite(heat_temperature_k) or heat_temperature_k < 0:
+                raise ValueError('heat_temperature_k must be finite and non-negative.')
+            chain_psd = T2Sii_Double(chain_temperature_k, read_freq)
+            heat_psd = T2Sii_Double(heat_temperature_k, read_freq)
+            effective_temperature_k = float(
+                Sii2T_Double(0.5 * (chain_psd + heat_psd), read_freq)
+            )
+        return temp2nbar(effective_temperature_k, read_freq)
 
     def calculate_tphi_cal(self, *, n_bar: float, kappa: float, chi: float) -> float:
         eta = kappa**2 / (kappa**2 + 4 * chi**2)
@@ -370,4 +502,10 @@ class ReadoutCavityAnalyzer:
         raise ValueError(f"Unknown experiment type: {experiment}")
 
 
-__all__ = ['ReadoutCavityAnalyzer', 'ZDephasingAnalyzer', 'XYRelaxationAnalyzer']
+__all__ = [
+    'ReadoutCavityAnalyzer',
+    'XYRelaxationAnalyzer',
+    'ZDephasingAnalyzer',
+    'estimate_coupler_limited_qubit_t1',
+    'estimate_coupler_limited_qubit_t1_combined',
+]

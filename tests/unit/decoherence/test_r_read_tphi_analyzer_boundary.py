@@ -12,6 +12,7 @@ install_test_stubs()
 from pysuqu.decoherence.analysis import ReadoutCavityAnalyzer
 from pysuqu.decoherence.dequbit import RNoiseDecoherence
 from pysuqu.funclib.mathlib import temp2nbar
+from pysuqu.funclib.noisemodel import Sii2T_Double, T2Sii_Double
 
 
 class RNoiseDecoherenceReadTphiAnalyzerBoundaryTests(unittest.TestCase):
@@ -52,6 +53,112 @@ class RNoiseDecoherenceReadTphiAnalyzerBoundaryTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(actual_tphi, expected_tphi)
+
+    def test_readout_cavity_analyzer_combines_chain_and_heat_temperature_by_psd(self):
+        analyzer = ReadoutCavityAnalyzer(couple_term=1.0e6)
+        noise_output = type("NoiseOutput", (), {"white_noise_temperature": 0.03277252715495531})()
+        read_freq = 6.18e9
+        heat_temperature_k = 0.0342
+
+        chain_psd = T2Sii_Double(noise_output.white_noise_temperature, read_freq)
+        heat_psd = T2Sii_Double(heat_temperature_k, read_freq)
+        effective_temperature = Sii2T_Double(
+            0.5 * (chain_psd + heat_psd),
+            read_freq,
+        )
+        expected_n_bar = temp2nbar(effective_temperature, read_freq)
+
+        actual_n_bar = analyzer.calculate_nbar(
+            noise_output=noise_output,
+            read_freq=read_freq,
+            heat_temperature_k=heat_temperature_k,
+        )
+
+        self.assertAlmostEqual(actual_n_bar, expected_n_bar)
+        self.assertAlmostEqual(effective_temperature, 0.033538178451180393)
+
+    def test_readout_cavity_analyzer_rejects_invalid_heat_temperature(self):
+        analyzer = ReadoutCavityAnalyzer(couple_term=1.0e6)
+        noise_output = type("NoiseOutput", (), {"white_noise_temperature": 0.03})()
+
+        for heat_temperature_k in (-1.0, np.nan, np.inf):
+            with self.subTest(heat_temperature_k=heat_temperature_k):
+                with self.assertRaises(ValueError):
+                    analyzer.calculate_nbar(
+                        noise_output=noise_output,
+                        read_freq=6.18e9,
+                        heat_temperature_k=heat_temperature_k,
+                    )
+
+    def test_r_facade_refreshes_nbar_for_cal_tphi_when_heat_is_provided(self):
+        r_noise = self._construct()
+        refresh_calls = []
+
+        def refresh_nbar(*, read_freq, is_print, heat_temperature_k):
+            refresh_calls.append(
+                {
+                    "read_freq": read_freq,
+                    "is_print": is_print,
+                    "heat_temperature_k": heat_temperature_k,
+                }
+            )
+            r_noise.n_bar = 0.5
+            return r_noise.n_bar
+
+        r_noise.cal_nbar = refresh_nbar
+        with patch.object(r_noise.r_analyzer, "calculate_tphi_cal", return_value=1.23e-6) as tphi_cal:
+            actual = r_noise.cal_read_tphi(
+                method="cal",
+                chi=1.7e6,
+                kappa=4.2e6,
+                read_freq=6.5e9,
+                heat_temperature_k=0.0342,
+                is_print=False,
+                is_plot=False,
+            )
+
+        self.assertEqual(
+            refresh_calls,
+            [{"read_freq": 6.5e9, "is_print": False, "heat_temperature_k": 0.0342}],
+        )
+        tphi_cal.assert_called_once_with(
+            n_bar=0.5,
+            kappa=4.2e6 * 2 * np.pi,
+            chi=1.7e6 * 2 * np.pi,
+        )
+        self.assertEqual(actual.value, 1.23e-6)
+
+    def test_r_facade_refreshes_nbar_for_fit_tphi_when_heat_is_provided(self):
+        r_noise = self._construct()
+        refresh_calls = []
+
+        def refresh_nbar(*, read_freq, is_print, heat_temperature_k):
+            refresh_calls.append((read_freq, is_print, heat_temperature_k))
+            r_noise.n_bar = 0.5
+            return r_noise.n_bar
+
+        r_noise.cal_nbar = refresh_nbar
+        popt = np.array([4.0e-6, 9.0e-6, 1.0, 0.0])
+        pcov = np.diag([0.25e-12, 0.49e-12, 1.0e-4, 1.0e-4])
+        with patch.object(r_noise, "cal_readcavity_psd") as readcavity_psd, patch.object(
+            r_noise,
+            "cal_read_dephase",
+            return_value=np.array([0.97, 0.88, 0.81]),
+        ), patch("pysuqu.decoherence.dequbit.fit_decay", return_value=(popt, pcov)):
+            actual = r_noise.cal_read_tphi(
+                method="fit",
+                chi=1.7e6,
+                kappa=4.2e6,
+                read_freq=6.5e9,
+                delay_list=np.array([1.0e-6, 2.0e-6, 3.0e-6]),
+                heat_temperature_k=0.0342,
+                is_print=False,
+                is_plot=False,
+            )
+
+        self.assertEqual(refresh_calls, [(6.5e9, False, 0.0342)])
+        readcavity_psd.assert_called_once()
+        self.assertEqual(actual.value, popt[0])
 
     def test_readout_cavity_analyzer_keeps_existing_psd_and_ramsey_dephase_formulas(self):
         analyzer = ReadoutCavityAnalyzer(couple_term=1.0e6)
