@@ -61,6 +61,33 @@ class NativePropagationTests(unittest.TestCase):
         ).propagate(qt.basis(2, 0)) for backend in ('qutip', 'cpp')]
         self.assertLess((results[0].final_state - results[1].final_state).norm(), 2e-6)
 
+    def test_csr_propagation_matches_an_independent_sparse_exponential(self):
+        from scipy.sparse import diags
+        from scipy.sparse.linalg import expm_multiply
+
+        rng = np.random.default_rng(514937)
+        dimension = 48
+        diagonal = rng.uniform(-0.3, 0.3, dimension)
+        coupling = rng.uniform(0.01, 0.08, dimension - 1)
+        matrix = diags([coupling, diagonal, coupling], [-1, 0, 1], dtype=complex)
+        prepared = PreparedPropagation(
+            qt.Qobj(matrix), [], self.times, backend='cpp',
+            options={**self.options, 'matrix_format': 'csr'},
+        )
+        for index in (0, dimension - 1):
+            initial = qt.basis(dimension, index)
+            result = prepared.propagate(initial)
+            expected = expm_multiply(-1j * matrix * self.times[-1], initial.full()[:, 0])
+            np.testing.assert_allclose(result.final_state.full()[:, 0], expected, atol=2e-7)
+            self.assertEqual(result.stats['matrix_format'], 'csr')
+
+    def test_unnormalized_inputs_retain_their_norm(self):
+        initial = 2.7 * qt.basis(2, 0)
+        result = PreparedPropagation(
+            self.h0, [], self.times, backend='cpp', options=self.options,
+        ).propagate(initial)
+        self.assertAlmostEqual(result.final_state.norm(), initial.norm(), places=7)
+
 
 if __name__ == '__main__':
     unittest.main()
