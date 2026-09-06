@@ -64,7 +64,7 @@ class PropagationOptionsTests(unittest.TestCase):
         options = PropagationOptions.from_mapping({
             'backend': 'cpp', 'active_levels': 4, 'frame': 'auto',
             'matrix_format': 'csr', 'parallel': 'on', 'native_max_steps': 7000,
-            'rwa_max_discarded_ratio': 0.2, 'normalize_output': False,
+            'rwa_max_discarded_ratio': 0.2,
         })
         self.assertEqual(options.qutip_options(), PropagationOptions().qutip_options())
 

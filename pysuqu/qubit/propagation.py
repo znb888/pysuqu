@@ -23,7 +23,6 @@ _INTERNAL_OPTION_KEYS = {
     "sparse_expm",
     "parallel",
     "native_max_steps",
-    "normalize_output",
     "rwa_max_discarded_ratio",
 }
 

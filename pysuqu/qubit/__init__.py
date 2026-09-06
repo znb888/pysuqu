@@ -48,6 +48,17 @@ from .gate import (
     WaveformGenerator,
 )
 from .multi import FGF1V1Coupling, FGF2V7Coupling, QCRFGRModel
+from .propagation import (
+    BackendUnavailable,
+    BatchPropagationResult,
+    DriveTerm,
+    PreparedPropagation,
+    PropagationOptions,
+    UnsupportedBackendError,
+    clear_native_plan_cache,
+    native_backend_available,
+    native_plan_cache_info,
+)
 from .solver import HamiltonianEvo
 from .single import FloatingTransmon, GroundedTransmon, SingleQubitBase
 from .types import FluxSpec, SpectrumResult
@@ -55,12 +66,15 @@ from .types import FluxSpec, SpectrumResult
 __all__ = [
     'AbstractQubit',
     'AttenuatorStage',
+    'BackendUnavailable',
+    'BatchPropagationResult',
     'BundleTransmissionChain',
     'BundleTransmissionResult',
     'ChannelSchedule',
     'DelayStage',
     'DerivativePrecorrectionDesign',
     'DerivativePrecorrectionStage',
+    'DriveTerm',
     'EnvelopeParams',
     'FGF1V1Coupling',
     'FGF2V7Coupling',
@@ -76,6 +90,8 @@ __all__ = [
     'MixerParams',
     'ParameterizedQubit',
     'Phi0',
+    'PreparedPropagation',
+    'PropagationOptions',
     'PulseEvent',
     'QCRFGRModel',
     'SOSFilterStage',
@@ -91,12 +107,14 @@ __all__ = [
     'TransmissionChain',
     'TransmissionResult',
     'TransmonReflectionModel',
+    'UnsupportedBackendError',
     'WaveformGenerator',
     'apply_derivative_precorrection',
     'analyze_single_qubit_spectrum',
     'calculate_loaded_multiport_response',
     'calculate_loaded_multiport_wave_response',
     'calculate_loaded_single_port_response',
+    'clear_native_plan_cache',
     'compute_derivative_basis',
     'design_derivative_precorrection',
     'design_inverse_fir_from_touchstone',
@@ -104,6 +122,8 @@ __all__ = [
     'evaluate_touchstone_multiport_output_block',
     'evaluate_touchstone_response',
     'load_touchstone_network',
+    'native_backend_available',
+    'native_plan_cache_info',
     'pi',
     'resolve_multi_load_reflection_response',
     'resolve_load_reflection_response',

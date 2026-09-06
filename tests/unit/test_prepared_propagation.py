@@ -42,6 +42,17 @@ class PreparedPropagationTests(unittest.TestCase):
         ).propagate(qt.basis(2, 0)) for backend in ('qutip', 'qutip_compiled')]
         self.assertLess((results[0].final_state - results[1].final_state).norm(), 1e-7)
 
+    def test_disabled_normalization_preserves_nonunitary_amplitudes(self):
+        initial = qt.basis(2, 0)
+        expected = np.exp(-self.angular_rate * self.times[-1]) * initial
+        for backend in ('qutip', 'qutip_compiled'):
+            with self.subTest(backend=backend):
+                result = PreparedPropagation(
+                    -1j * self.angular_rate * qt.qeye(2), [], self.times, backend=backend,
+                    options={**self.options, 'normalize_output': False},
+                ).propagate(initial)
+                self.assertLess((result.final_state - expected).norm(), 1e-7)
+
     def test_reusable_solver_and_batch_keep_initial_states_independent(self):
         prepared = PreparedPropagation(
             self.h0, [], self.times,

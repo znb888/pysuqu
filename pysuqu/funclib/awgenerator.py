@@ -1623,7 +1623,7 @@ class WaveformGenerator:
             real_values = np.asarray(np.real(values), dtype=np.float64)
             imag_values = np.asarray(np.imag(values), dtype=np.float64)
 
-            def qutip_drive_func(t: float, args=None):
+            def qutip_drive_func(t: float, *args, **kwargs):
                 i_val = np.interp(t, t_axis, real_values, left=0.0, right=0.0)
                 q_val = np.interp(t, t_axis, imag_values, left=0.0, right=0.0)
                 return i_val + 1j * q_val
@@ -1632,7 +1632,7 @@ class WaveformGenerator:
 
         real_values = np.asarray(values, dtype=np.float64)
 
-        def qutip_drive_func(t: float, args=None):
+        def qutip_drive_func(t: float, *args, **kwargs):
             return np.interp(t, t_axis, real_values, left=0.0, right=0.0)
 
         return qutip_drive_func
@@ -1659,7 +1659,7 @@ class WaveformGenerator:
         imag_values = np.asarray(np.imag(values), dtype=np.float64)
         lo_freq = float(getattr(trace, 'lo_freq', 0.0))
 
-        def qutip_drive_func(t: float, args=None):
+        def qutip_drive_func(t: float, *args, **kwargs):
             i_val = np.interp(t, t_axis, real_values, left=0.0, right=0.0)
             q_val = np.interp(t, t_axis, imag_values, left=0.0, right=0.0)
             carrier_phase = 2 * np.pi * lo_freq * t
