@@ -321,7 +321,7 @@ class XYRelaxationAnalyzer:
     ) -> tuple[float, float]:
         gamma_t1 = 1 / (t1_us * 1e-6)
         return (
-gamma_up / (gamma_up + gamma_down_actual+gamma_down),
+            gamma_up / gamma_t1,
             gamma_up / (gamma_up + gamma_down),
         )
 
