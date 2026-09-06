@@ -3,20 +3,28 @@
 #include <Python.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
+#include <functional>
 #include <limits>
+#include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
 namespace {
 
 using cdouble = std::complex<double>;
+using Matrix = std::vector<cdouble>;
 constexpr double kPi = 3.141592653589793238462643383279502884;
 // Pade exponentials materialize an n-by-n propagator and perform dense
 // matrix products.  Above this bound a sparse RHS is both cheaper and more
@@ -46,6 +54,14 @@ inline cdouble exp_minus_i(cdouble phase) {
         return cdouble(cosine, sine);
     }
     return std::exp(cdouble(0.0, -1.0) * phase);
+}
+
+inline cdouble exp_complex(cdouble value) {
+    const double scale = std::exp(value.real());
+    double sine = 0.0;
+    double cosine = 0.0;
+    sine_cosine(value.imag(), sine, cosine);
+    return cdouble(scale * cosine, scale * sine);
 }
 
 struct BufferView {
@@ -93,6 +109,39 @@ struct SparseMatrixView {
     bool diagonal_single{false};
 };
 
+struct OwnedSparseMatrix {
+    std::vector<cdouble> data;
+    std::vector<std::int64_t> indices;
+    std::vector<std::int64_t> indptr;
+    bool diagonal{false};
+    bool diagonal_single{false};
+
+    SparseMatrixView view() const {
+        return {
+            data.empty() ? nullptr : data.data(),
+            indices.empty() ? nullptr : indices.data(),
+            indptr.empty() ? nullptr : indptr.data(),
+            static_cast<std::int64_t>(data.size()),
+            diagonal,
+            diagonal_single,
+        };
+    }
+};
+
+struct LindbladJumpEntry {
+    int row{0};
+    int column{0};
+    int source_row{0};
+    int source_column{0};
+    cdouble value{0.0, 0.0};
+};
+
+struct LindbladJumpPattern {
+    std::vector<LindbladJumpEntry> entries;
+    std::vector<std::int64_t> row_ptr;
+    bool ready{false};
+};
+
 // A banded operator stores one contiguous row vector for each exact diagonal
 // offset.  This is the natural representation for oscillator/ladder
 // Hamiltonians and avoids CSR column-index indirection in the hot loop.
@@ -107,6 +156,98 @@ struct BandedEntry {
     int column{0};
     int band{0};
     std::size_t value_index{0};
+};
+
+// A solve-local pool amortizes worker startup across all Lindblad RK stages.
+// Tasks only touch disjoint output rows and execute without the Python GIL.
+class RowWorkerPool {
+public:
+    explicit RowWorkerPool(int worker_count) : worker_count_(worker_count) {
+        try {
+            workers_.reserve(static_cast<std::size_t>(worker_count_));
+            for (int index = 0; index < worker_count_; ++index) {
+                workers_.emplace_back([this, index]() { worker_loop(index); });
+            }
+        } catch (...) {
+            stop();
+            throw;
+        }
+    }
+
+    ~RowWorkerPool() { stop(); }
+    RowWorkerPool(const RowWorkerPool&) = delete;
+    RowWorkerPool& operator=(const RowWorkerPool&) = delete;
+
+    int size() const { return worker_count_; }
+
+    void execute(std::function<void(int)> task) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        task_ = std::move(task);
+        remaining_ = worker_count_;
+        failure_ = nullptr;
+        ++generation_;
+        wake_.notify_all();
+        completed_.wait(lock, [this]() { return remaining_ == 0; });
+        task_ = nullptr;
+        const std::exception_ptr failure = failure_;
+        lock.unlock();
+        if (failure) {
+            std::rethrow_exception(failure);
+        }
+    }
+
+private:
+    void worker_loop(int index) {
+        std::size_t observed_generation = 0;
+        std::unique_lock<std::mutex> lock(mutex_);
+        for (;;) {
+            wake_.wait(lock, [this, observed_generation]() {
+                return stopping_ || generation_ != observed_generation;
+            });
+            if (stopping_) {
+                return;
+            }
+            observed_generation = generation_;
+            lock.unlock();
+            std::exception_ptr failure;
+            try {
+                task_(index);
+            } catch (...) {
+                failure = std::current_exception();
+            }
+            lock.lock();
+            if (failure && !failure_) {
+                failure_ = failure;
+            }
+            if (--remaining_ == 0) {
+                completed_.notify_one();
+            }
+        }
+    }
+
+    void stop() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        wake_.notify_all();
+        for (std::thread& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    int worker_count_{1};
+    int remaining_{0};
+    bool stopping_{false};
+    std::size_t generation_{0};
+    std::vector<std::thread> workers_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::condition_variable completed_;
+    std::function<void(int)> task_;
+    std::exception_ptr failure_;
 };
 
 // The adaptive integrator reuses these buffers for every accepted and rejected
@@ -128,6 +269,7 @@ struct Workspace {
     std::vector<cdouble> interaction_row_phases;
     std::vector<cdouble> interaction_rotated_state;
     std::vector<cdouble> carrier_phases;
+    std::unique_ptr<RowWorkerPool> row_workers;
     bool scales_valid{false};
     double scales_time{0.0};
     bool carrier_phase_valid{false};
@@ -170,6 +312,77 @@ struct Workspace {
     }
 };
 
+// Reusable dense scratch for the small projected matrix exponential.  A
+// Krylov worker owns one instance, avoiding repeated heap traffic while its
+// Arnoldi basis grows from one checked dimension to the next.
+struct MatrixExponentialWorkspace {
+    Matrix a;
+    Matrix a2;
+    Matrix a4;
+    Matrix a6;
+    Matrix identity;
+    Matrix tmp;
+    Matrix u_inner;
+    Matrix v;
+    Matrix v_inner;
+    Matrix u;
+    Matrix lhs;
+    Matrix rhs;
+    Matrix squared;
+};
+
+// Scratch storage for one scalar Arnoldi action.  A worker owns one instance
+// and reuses its allocations across all intervals and batch columns.
+struct KrylovWorkspace {
+    std::vector<cdouble> basis;
+    std::vector<cdouble> hessenberg;
+    std::vector<cdouble> work;
+    std::vector<cdouble> previous;
+    std::vector<cdouble> candidate;
+    std::vector<cdouble> small_matrix;
+    std::vector<cdouble> small_exponential;
+    MatrixExponentialWorkspace exponential_workspace;
+
+    void prepare(int n, int max_dimension) {
+        // Every Arnoldi column is overwritten before it is read and every
+        // Hessenberg entry used by the projected exponential is written while
+        // that column is generated.  Resize without value-initialising the
+        // large work arrays; this removes an O(n*m) memset for every action
+        // while retaining the same arithmetic and residual checks.
+        basis.resize(
+            static_cast<std::size_t>(max_dimension + 1)
+                * static_cast<std::size_t>(n));
+        hessenberg.resize(
+            static_cast<std::size_t>(max_dimension + 1)
+                * static_cast<std::size_t>(max_dimension));
+        // Entries below the active upper-Hessenberg band are copied into the
+        // projected matrix while it grows, so they must be reset for every
+        // action.  This is only O(m^2) (m <= 96), unlike clearing the O(n*m)
+        // Arnoldi basis.
+        std::fill(hessenberg.begin(), hessenberg.end(), cdouble(0.0, 0.0));
+        work.resize(static_cast<std::size_t>(n));
+        previous.resize(static_cast<std::size_t>(n));
+        candidate.resize(static_cast<std::size_t>(n));
+        small_matrix.reserve(static_cast<std::size_t>(max_dimension) * max_dimension);
+        small_exponential.reserve(static_cast<std::size_t>(max_dimension) * max_dimension);
+        const std::size_t projected_size =
+            static_cast<std::size_t>(max_dimension) * max_dimension;
+        exponential_workspace.a.reserve(projected_size);
+        exponential_workspace.a2.reserve(projected_size);
+        exponential_workspace.a4.reserve(projected_size);
+        exponential_workspace.a6.reserve(projected_size);
+        exponential_workspace.identity.reserve(projected_size);
+        exponential_workspace.tmp.reserve(projected_size);
+        exponential_workspace.u_inner.reserve(projected_size);
+        exponential_workspace.v.reserve(projected_size);
+        exponential_workspace.v_inner.reserve(projected_size);
+        exponential_workspace.u.reserve(projected_size);
+        exponential_workspace.lhs.reserve(projected_size);
+        exponential_workspace.rhs.reserve(projected_size);
+        exponential_workspace.squared.reserve(projected_size);
+    }
+};
+
 struct Problem {
     const cdouble* h0{nullptr};
     const cdouble* controls{nullptr};
@@ -195,14 +408,20 @@ struct Problem {
     std::int64_t krylov_evaluations{0};
     std::int64_t krylov_iterations{0};
     bool krylov_used{false};
+    bool piecewise_krylov_used{false};
     // 0=off, 1=automatic for high-dimensional sparse problems, 2=explicit.
     int sparse_expm_mode{1};
+    // 0=off, 1=automatic, 2=explicit.  This is an execution policy only;
+    // it never changes the represented differential equation.
+    int parallel_mode{1};
+    std::int64_t parallel_workers{1};
     std::int64_t diagonal_interval_evaluations{0};
     std::int64_t zero_interval_evaluations{0};
     bool whole_trace_exponential{false};
     bool interval_exponential{false};
     double max_error{0.0};
     double max_trial_error{0.0};
+    double integration_seconds{0.0};
     double source_dt{0.0};
     double inv_source_dt{0.0};
     double t0{0.0};
@@ -228,6 +447,23 @@ struct Problem {
     bool fused_sparse{false};
     bool interaction_picture{false};
     bool interaction_dense{false};
+    bool lindblad{false};
+    bool lindblad_diagonal_only{false};
+    bool lindblad_diagonal_exact{false};
+    int lindblad_collapse_count{0};
+    std::vector<OwnedSparseMatrix> lindblad_collapse;
+    std::vector<OwnedSparseMatrix> lindblad_products;
+    std::vector<LindbladJumpPattern> lindblad_jump_patterns;
+    std::vector<cdouble> lindblad_collapse_diagonal;
+    std::vector<cdouble> lindblad_product_diagonal;
+    // Immutable operator values prepared once for a globally constant sparse
+    // Hamiltonian.  The entries retain the original term order (including
+    // duplicate columns), so the cached action is mathematically identical to
+    // the uncached h0-plus-controls traversal.
+    OwnedSparseMatrix constant_sparse;
+    std::vector<cdouble> constant_banded_values;
+    std::vector<cdouble> constant_fused_values;
+    bool constant_operator_ready{false};
     bool diagonal_only{false};
     bool h0_diagonal_only{false};
     std::vector<cdouble> h0_diagonal_values;
@@ -270,6 +506,21 @@ struct Problem {
             }
         }
         return false;
+    }
+
+    // The coherent kernels operate on ket vectors while the direct Lindblad
+    // kernel operates on column-major density matrices.  Keeping this in one
+    // helper lets the checked Krylov action reuse its workspace for either
+    // physical state representation without constructing a Liouvillian.
+    int state_dimension() const {
+        if (lindblad) {
+            const std::size_t dimension = static_cast<std::size_t>(n) * n;
+            if (dimension > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+                return 0;
+            }
+            return static_cast<int>(dimension);
+        }
+        return n;
     }
 
     void prepare_frequency_cache() {
@@ -387,6 +638,56 @@ struct Problem {
         }
         if (!h0_diagonal_only) {
             h0_diagonal_values.clear();
+        }
+    }
+
+    void detect_lindblad_diagonal() {
+        lindblad_diagonal_only = lindblad && diagonal_only;
+        if (!lindblad_diagonal_only) {
+            lindblad_collapse_diagonal.clear();
+            lindblad_product_diagonal.clear();
+            return;
+        }
+        for (const OwnedSparseMatrix& collapse : lindblad_collapse) {
+            if (!collapse.diagonal) {
+                lindblad_diagonal_only = false;
+                break;
+            }
+        }
+        if (!lindblad_diagonal_only) {
+            lindblad_collapse_diagonal.clear();
+            lindblad_product_diagonal.clear();
+            return;
+        }
+        lindblad_collapse_diagonal.assign(
+            static_cast<std::size_t>(lindblad_collapse_count) * n,
+            cdouble(0.0, 0.0));
+        lindblad_product_diagonal.assign(
+            static_cast<std::size_t>(lindblad_collapse_count) * n,
+            cdouble(0.0, 0.0));
+        for (int collapse_index = 0;
+             collapse_index < lindblad_collapse_count;
+             ++collapse_index) {
+            const OwnedSparseMatrix& collapse = lindblad_collapse[
+                static_cast<std::size_t>(collapse_index)];
+            const OwnedSparseMatrix& product = lindblad_products[
+                static_cast<std::size_t>(collapse_index)];
+            for (int row = 0; row < n; ++row) {
+                for (std::int64_t entry = collapse.indptr[static_cast<std::size_t>(row)];
+                     entry < collapse.indptr[static_cast<std::size_t>(row) + 1];
+                     ++entry) {
+                    lindblad_collapse_diagonal[
+                        static_cast<std::size_t>(collapse_index) * n + row] +=
+                        collapse.data[static_cast<std::size_t>(entry)];
+                }
+                for (std::int64_t entry = product.indptr[static_cast<std::size_t>(row)];
+                     entry < product.indptr[static_cast<std::size_t>(row) + 1];
+                     ++entry) {
+                    lindblad_product_diagonal[
+                        static_cast<std::size_t>(collapse_index) * n + row] +=
+                        product.data[static_cast<std::size_t>(entry)];
+                }
+            }
         }
     }
 
@@ -949,6 +1250,86 @@ struct Problem {
         }
     }
 
+    void prepare_constant_operator(const std::vector<cdouble>& scales) {
+        constant_operator_ready = false;
+        constant_sparse = OwnedSparseMatrix();
+        constant_banded_values.clear();
+        constant_fused_values.clear();
+        if (!(sparse || banded || fused_sparse)) {
+            return;
+        }
+        if (sparse) {
+            constant_sparse.indptr.resize(static_cast<std::size_t>(n) + 1);
+            std::size_t estimated_nnz = static_cast<std::size_t>(h0_sparse.nnz);
+            for (int control = 0; control < control_count; ++control) {
+                if (scales[static_cast<std::size_t>(control)] != cdouble(0.0, 0.0)) {
+                    estimated_nnz += static_cast<std::size_t>(
+                        controls_sparse[static_cast<std::size_t>(control)].nnz);
+                }
+            }
+            constant_sparse.data.reserve(estimated_nnz);
+            constant_sparse.indices.reserve(estimated_nnz);
+            for (int row = 0; row < n; ++row) {
+                auto& data = constant_sparse.data;
+                auto& indices = constant_sparse.indices;
+                for (std::int64_t entry = h0_sparse.indptr[row];
+                     entry < h0_sparse.indptr[row + 1]; ++entry) {
+                    data.push_back(h0_sparse.data[entry]);
+                    indices.push_back(h0_sparse.indices[entry]);
+                }
+                for (int control = 0; control < control_count; ++control) {
+                    const cdouble scale = scales[static_cast<std::size_t>(control)];
+                    if (scale == cdouble(0.0, 0.0)) {
+                        continue;
+                    }
+                    const SparseMatrixView& source = controls_sparse[
+                        static_cast<std::size_t>(control)];
+                    for (std::int64_t entry = source.indptr[row];
+                         entry < source.indptr[row + 1]; ++entry) {
+                        data.push_back(scale * source.data[entry]);
+                        indices.push_back(source.indices[entry]);
+                    }
+                }
+                constant_sparse.indptr[static_cast<std::size_t>(row + 1)] =
+                    static_cast<std::int64_t>(data.size());
+            }
+            constant_sparse.diagonal = false;
+            constant_sparse.diagonal_single = false;
+        } else if (banded) {
+            constant_banded_values.resize(banded_entries.size(), cdouble(0.0, 0.0));
+            for (std::size_t index = 0; index < banded_entries.size(); ++index) {
+                const BandedEntry& entry = banded_entries[index];
+                cdouble value = h0_banded[entry.value_index];
+                for (int control = 0; control < control_count; ++control) {
+                    const cdouble scale = scales[static_cast<std::size_t>(control)];
+                    if (scale != cdouble(0.0, 0.0)) {
+                        value += scale * controls_banded[
+                            (static_cast<std::size_t>(control) * band_count + entry.band)
+                                * n + entry.row];
+                    }
+                }
+                constant_banded_values[index] = value;
+            }
+        } else {
+            constant_fused_values.resize(static_cast<std::size_t>(fused_nnz));
+            for (int row = 0; row < n; ++row) {
+                for (std::int64_t entry = fused_indptr[row];
+                     entry < fused_indptr[row + 1]; ++entry) {
+                    cdouble value = fused_static[entry];
+                    for (int control = 0; control < control_count; ++control) {
+                        const cdouble scale = scales[static_cast<std::size_t>(control)];
+                        if (scale != cdouble(0.0, 0.0)) {
+                            value += scale * fused_controls[
+                                static_cast<std::size_t>(control) * fused_nnz + entry];
+                        }
+                    }
+                    constant_fused_values[static_cast<std::size_t>(entry)] = value;
+                }
+            }
+        }
+        constant_operator_ready = true;
+    }
+
     // Apply the constant Hamiltonian to one vector without materialising a
     // dense matrix.  This is used by the high-dimensional Krylov exponential
     // action and preserves the exact CSR/banded/fused arithmetic order.
@@ -957,6 +1338,35 @@ struct Problem {
         cdouble* output,
         const std::vector<cdouble>& scales) const {
         std::fill(output, output + n, cdouble(0.0, 0.0));
+        if (constant_operator_ready) {
+            if (sparse) {
+                for (int row = 0; row < n; ++row) {
+                    for (std::int64_t entry = constant_sparse.indptr[row];
+                         entry < constant_sparse.indptr[row + 1]; ++entry) {
+                        output[row] += constant_sparse.data[entry]
+                            * input[static_cast<int>(constant_sparse.indices[entry])];
+                    }
+                }
+            } else if (banded) {
+                for (std::size_t index = 0; index < banded_entries.size(); ++index) {
+                    const BandedEntry& entry = banded_entries[index];
+                    output[entry.row] += constant_banded_values[index]
+                        * input[entry.column];
+                }
+            } else if (fused_sparse) {
+                for (int row = 0; row < n; ++row) {
+                    for (std::int64_t entry = fused_indptr[row];
+                         entry < fused_indptr[row + 1]; ++entry) {
+                        output[row] += constant_fused_values[static_cast<std::size_t>(entry)]
+                            * input[static_cast<int>(fused_indices[entry])];
+                    }
+                }
+            }
+            for (int row = 0; row < n; ++row) {
+                output[row] *= cdouble(0.0, -1.0);
+            }
+            return;
+        }
         if (!sparse && !banded && !fused_sparse) {
             for (int row = 0; row < n; ++row) {
                 cdouble value(0.0, 0.0);
@@ -1031,6 +1441,121 @@ struct Problem {
         }
         for (int row = 0; row < n; ++row) {
             output[row] *= cdouble(0.0, -1.0);
+        }
+    }
+
+    // Apply a constant physical Lindblad generator to one vectorized density
+    // matrix.  The storage is rho[row + column*n], matching the Python
+    // column-major flattening.  No Kronecker product is formed and every
+    // summation follows the same CSR row order as rhs_lindblad_rows().
+    void apply_lindblad_constant_single(
+        const cdouble* input,
+        cdouble* output,
+        const std::vector<cdouble>& scales) const {
+        const std::size_t density_size = static_cast<std::size_t>(n) * n;
+        std::fill(output, output + density_size, cdouble(0.0, 0.0));
+        auto add_left = [&](const SparseMatrixView& matrix, cdouble coefficient) {
+            if (coefficient == cdouble(0.0, 0.0)) {
+                return;
+            }
+            for (int row = 0; row < n; ++row) {
+                for (std::int64_t entry = matrix.indptr[row];
+                     entry < matrix.indptr[row + 1]; ++entry) {
+                    const int source_row = static_cast<int>(matrix.indices[entry]);
+                    const cdouble value = coefficient * matrix.data[entry];
+                    for (int column = 0; column < n; ++column) {
+                        output[static_cast<std::size_t>(row)
+                               + static_cast<std::size_t>(column) * n] += value
+                            * input[static_cast<std::size_t>(source_row)
+                                    + static_cast<std::size_t>(column) * n];
+                    }
+                }
+            }
+        };
+        auto add_right_adjoint = [&](const SparseMatrixView& matrix, cdouble coefficient) {
+            if (coefficient == cdouble(0.0, 0.0)) {
+                return;
+            }
+            for (int column = 0; column < n; ++column) {
+                for (std::int64_t entry = matrix.indptr[column];
+                     entry < matrix.indptr[column + 1]; ++entry) {
+                    const int source_column = static_cast<int>(matrix.indices[entry]);
+                    const cdouble value = coefficient * std::conj(matrix.data[entry]);
+                    for (int row = 0; row < n; ++row) {
+                        output[static_cast<std::size_t>(row)
+                               + static_cast<std::size_t>(column) * n] += value
+                            * input[static_cast<std::size_t>(row)
+                                    + static_cast<std::size_t>(source_column) * n];
+                    }
+                }
+            }
+        };
+        auto add_jump = [&](const SparseMatrixView& collapse) {
+            for (int row = 0; row < n; ++row) {
+                for (int column = 0; column < n; ++column) {
+                    const std::size_t target = static_cast<std::size_t>(row)
+                        + static_cast<std::size_t>(column) * n;
+                    for (std::int64_t left_entry = collapse.indptr[row];
+                         left_entry < collapse.indptr[row + 1]; ++left_entry) {
+                        const int source_row = static_cast<int>(collapse.indices[left_entry]);
+                        const cdouble left_value = collapse.data[left_entry];
+                        for (std::int64_t right_entry = collapse.indptr[column];
+                             right_entry < collapse.indptr[column + 1]; ++right_entry) {
+                            const int source_column = static_cast<int>(collapse.indices[right_entry]);
+                            const cdouble value = left_value
+                                * std::conj(collapse.data[right_entry]);
+                            output[target] += value * input[
+                                static_cast<std::size_t>(source_row)
+                                + static_cast<std::size_t>(source_column) * n];
+                        }
+                    }
+                }
+            }
+        };
+        auto add_jump_pattern = [&](const LindbladJumpPattern& pattern) {
+            if (!pattern.ready) {
+                return;
+            }
+            for (const LindbladJumpEntry& item : pattern.entries) {
+                output[static_cast<std::size_t>(item.row)
+                       + static_cast<std::size_t>(item.column) * n] += item.value
+                    * input[static_cast<std::size_t>(item.source_row)
+                            + static_cast<std::size_t>(item.source_column) * n];
+            }
+        };
+
+        const cdouble minus_i(0.0, -1.0);
+        if (constant_operator_ready && sparse) {
+            // The constant sparse bundle keeps static entries followed by
+            // controls in their original order, so combining the two passes
+            // removes repeated scale checks without changing accumulation.
+            const SparseMatrixView matrix = constant_sparse.view();
+            add_left(matrix, minus_i);
+            add_right_adjoint(matrix, -minus_i);
+        } else {
+            add_left(h0_sparse, minus_i);
+            add_right_adjoint(h0_sparse, -minus_i);
+            for (int control = 0; control < control_count; ++control) {
+                const cdouble scale = scales[static_cast<std::size_t>(control)];
+                if (scale == cdouble(0.0, 0.0)) {
+                    continue;
+                }
+                const SparseMatrixView& matrix = controls_sparse[static_cast<std::size_t>(control)];
+                add_left(matrix, minus_i * scale);
+                add_right_adjoint(matrix, minus_i * (-std::conj(scale)));
+            }
+        }
+        for (std::size_t collapse_index = 0;
+             collapse_index < lindblad_collapse.size(); ++collapse_index) {
+            const LindbladJumpPattern& pattern = lindblad_jump_patterns[
+                collapse_index];
+            if (pattern.ready) {
+                add_jump_pattern(pattern);
+            } else {
+                add_jump(lindblad_collapse[collapse_index].view());
+            }
+            add_left(lindblad_products[collapse_index].view(), cdouble(-0.5, 0.0));
+            add_right_adjoint(lindblad_products[collapse_index].view(), cdouble(-0.5, 0.0));
         }
     }
 
@@ -1572,12 +2097,280 @@ struct Problem {
         }
     }
 
+    // The matrix-free Lindblad path keeps rho as an n-by-n column-major
+    // matrix (with batch columns interleaved in the final dimension).  These
+    // helpers apply sparse operators from the left or right without forming a
+    // Kronecker-product Liouvillian of dimension n^2 by n^2.
+    void add_lindblad_left(
+        const SparseMatrixView& operator_view,
+        const std::vector<cdouble>& state,
+        std::vector<cdouble>& derivative,
+        cdouble coefficient,
+        int row_begin = 0,
+        int row_end = -1) const {
+        if (coefficient == cdouble(0.0, 0.0)) {
+            return;
+        }
+        row_end = row_end < 0 ? n : row_end;
+        const std::size_t batch_stride = static_cast<std::size_t>(batch_count);
+        for (int row = row_begin; row < row_end; ++row) {
+            for (std::int64_t entry = operator_view.indptr[row];
+                 entry < operator_view.indptr[row + 1]; ++entry) {
+                const int source_row =
+                    static_cast<int>(operator_view.indices[entry]);
+                const cdouble value = coefficient * operator_view.data[entry];
+                for (int column = 0; column < n; ++column) {
+                    const std::size_t target_base =
+                        (static_cast<std::size_t>(row)
+                         + static_cast<std::size_t>(column) * n) * batch_stride;
+                    const std::size_t source_base =
+                        (static_cast<std::size_t>(source_row)
+                         + static_cast<std::size_t>(column) * n) * batch_stride;
+                    for (std::size_t batch = 0; batch < batch_stride; ++batch) {
+                        derivative[target_base + batch] +=
+                            value * state[source_base + batch];
+                    }
+                }
+            }
+        }
+    }
+
+    void add_lindblad_right_adjoint(
+        const SparseMatrixView& operator_view,
+        const std::vector<cdouble>& state,
+        std::vector<cdouble>& derivative,
+        cdouble coefficient,
+        int row_begin = 0,
+        int row_end = -1) const {
+        if (coefficient == cdouble(0.0, 0.0)) {
+            return;
+        }
+        row_end = row_end < 0 ? n : row_end;
+        const std::size_t batch_stride = static_cast<std::size_t>(batch_count);
+        for (int column = 0; column < n; ++column) {
+            for (std::int64_t entry = operator_view.indptr[column];
+                 entry < operator_view.indptr[column + 1]; ++entry) {
+                const int source_column =
+                    static_cast<int>(operator_view.indices[entry]);
+                const cdouble value = coefficient
+                    * std::conj(operator_view.data[entry]);
+                for (int row = row_begin; row < row_end; ++row) {
+                    const std::size_t target_base =
+                        (static_cast<std::size_t>(row)
+                         + static_cast<std::size_t>(column) * n) * batch_stride;
+                    const std::size_t source_base =
+                        (static_cast<std::size_t>(row)
+                         + static_cast<std::size_t>(source_column) * n)
+                        * batch_stride;
+                    for (std::size_t batch = 0; batch < batch_stride; ++batch) {
+                        derivative[target_base + batch] +=
+                            value * state[source_base + batch];
+                    }
+                }
+            }
+        }
+    }
+
+    void add_lindblad_jump(
+        const SparseMatrixView& collapse,
+        const std::vector<cdouble>& state,
+        std::vector<cdouble>& derivative,
+        int row_begin = 0,
+        int row_end = -1) const {
+        row_end = row_end < 0 ? n : row_end;
+        const std::size_t batch_stride = static_cast<std::size_t>(batch_count);
+        for (int row = row_begin; row < row_end; ++row) {
+            for (int column = 0; column < n; ++column) {
+                const std::size_t target_base =
+                    (static_cast<std::size_t>(row)
+                     + static_cast<std::size_t>(column) * n) * batch_stride;
+                for (std::int64_t left_entry = collapse.indptr[row];
+                     left_entry < collapse.indptr[row + 1]; ++left_entry) {
+                    const int source_row =
+                        static_cast<int>(collapse.indices[left_entry]);
+                    const cdouble left_value = collapse.data[left_entry];
+                    for (std::int64_t right_entry = collapse.indptr[column];
+                         right_entry < collapse.indptr[column + 1];
+                         ++right_entry) {
+                        const int source_column =
+                            static_cast<int>(collapse.indices[right_entry]);
+                        const cdouble value =
+                            left_value * std::conj(collapse.data[right_entry]);
+                        const std::size_t source_base =
+                            (static_cast<std::size_t>(source_row)
+                             + static_cast<std::size_t>(source_column) * n)
+                            * batch_stride;
+                        for (std::size_t batch = 0; batch < batch_stride; ++batch) {
+                            derivative[target_base + batch] +=
+                                value * state[source_base + batch];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void add_lindblad_jump(
+        const LindbladJumpPattern& pattern,
+        const std::vector<cdouble>& state,
+        std::vector<cdouble>& derivative,
+        int row_begin = 0,
+        int row_end = -1) const {
+        if (!pattern.ready) {
+            return;
+        }
+        row_end = row_end < 0 ? n : row_end;
+        const std::size_t batch_stride = static_cast<std::size_t>(batch_count);
+        for (int row = row_begin; row < row_end; ++row) {
+            const std::int64_t begin = pattern.row_ptr[static_cast<std::size_t>(row)];
+            const std::int64_t end = pattern.row_ptr[static_cast<std::size_t>(row) + 1];
+            for (std::int64_t entry = begin; entry < end; ++entry) {
+                const LindbladJumpEntry& item = pattern.entries[
+                    static_cast<std::size_t>(entry)];
+                const std::size_t target_base = (
+                    static_cast<std::size_t>(item.row)
+                    + static_cast<std::size_t>(item.column) * n) * batch_stride;
+                const std::size_t source_base = (
+                    static_cast<std::size_t>(item.source_row)
+                    + static_cast<std::size_t>(item.source_column) * n) * batch_stride;
+                for (std::size_t batch = 0; batch < batch_stride; ++batch) {
+                    derivative[target_base + batch] += item.value
+                        * state[source_base + batch];
+                }
+            }
+        }
+    }
+
+    void rhs_lindblad_rows(
+        const std::vector<cdouble>& state,
+        std::vector<cdouble>& derivative,
+        const Workspace& workspace,
+        int row_begin,
+        int row_end) const {
+        const cdouble minus_i(0.0, -1.0);
+
+        // Directly accumulate -i(H rho - rho H^dagger).
+        add_lindblad_left(
+            h0_sparse, state, derivative, minus_i, row_begin, row_end);
+        add_lindblad_right_adjoint(
+            h0_sparse, state, derivative, -minus_i, row_begin, row_end);
+        for (int control = 0; control < control_count; ++control) {
+            const cdouble scale = workspace.scales[
+                static_cast<std::size_t>(control)];
+            if (scale == cdouble(0.0, 0.0)) {
+                continue;
+            }
+            const SparseMatrixView& operator_view = controls_sparse[
+                static_cast<std::size_t>(control)];
+            add_lindblad_left(
+                operator_view,
+                state,
+                derivative,
+                minus_i * scale,
+                row_begin,
+                row_end);
+            add_lindblad_right_adjoint(
+                operator_view,
+                state,
+                derivative,
+                minus_i * (-std::conj(scale)),
+                row_begin,
+                row_end);
+        }
+
+        // C rho C^dagger - 1/2 {C^dagger C, rho}; products are precomputed
+        // once during parsing and all three contributions stream into the
+        // same output buffer.
+        for (std::size_t collapse_index = 0;
+             collapse_index < lindblad_collapse.size();
+             ++collapse_index) {
+            const SparseMatrixView collapse =
+                lindblad_collapse[collapse_index].view();
+            const SparseMatrixView product =
+                lindblad_products[collapse_index].view();
+            const LindbladJumpPattern& jump_pattern = lindblad_jump_patterns[
+                collapse_index];
+            if (jump_pattern.ready) {
+                add_lindblad_jump(
+                    jump_pattern, state, derivative, row_begin, row_end);
+            } else {
+                add_lindblad_jump(
+                    collapse, state, derivative, row_begin, row_end);
+            }
+            add_lindblad_left(
+                product,
+                state,
+                derivative,
+                cdouble(-0.5, 0.0),
+                row_begin,
+                row_end);
+            add_lindblad_right_adjoint(
+                product,
+                state,
+                derivative,
+                cdouble(-0.5, 0.0),
+                row_begin,
+                row_end);
+        }
+    }
+
+    void rhs_lindblad(
+        double t,
+        const std::vector<cdouble>& state,
+        std::vector<cdouble>& derivative,
+        Workspace& workspace) {
+        std::fill(derivative.begin(), derivative.end(), cdouble(0.0, 0.0));
+        fill_scales(t, workspace);
+
+        int worker_count = 1;
+        const std::size_t work_size =
+            static_cast<std::size_t>(n) * n * batch_count;
+        if (parallel_mode != 0
+            && batch_count > 1
+            && n >= 64
+            && work_size >= 4096
+            && (parallel_mode == 2 || batch_count >= 16)) {
+            unsigned int hardware = std::thread::hardware_concurrency();
+            if (hardware == 0) {
+                hardware = 2;
+            }
+            worker_count = std::min(
+                std::min(batch_count, static_cast<int>(hardware)),
+                8);
+        }
+        parallel_workers = std::max(
+            parallel_workers,
+            static_cast<std::int64_t>(worker_count));
+        if (worker_count == 1) {
+            rhs_lindblad_rows(state, derivative, workspace, 0, n);
+            return;
+        }
+
+        const int rows_per_worker = (n + worker_count - 1) / worker_count;
+        if (workspace.row_workers == nullptr
+            || workspace.row_workers->size() != worker_count) {
+            workspace.row_workers = std::make_unique<RowWorkerPool>(worker_count);
+        }
+        workspace.row_workers->execute(
+            [this, &state, &derivative, &workspace, rows_per_worker](int worker_index) {
+                const int row_begin = std::min(n, worker_index * rows_per_worker);
+                const int row_end = std::min(n, row_begin + rows_per_worker);
+                    rhs_lindblad_rows(
+                        state, derivative, workspace, row_begin, row_end);
+            });
+    }
+
+
     void rhs(
         double t,
         const std::vector<cdouble>& state,
         std::vector<cdouble>& derivative,
         Workspace& workspace) {
         ++rhs_evaluations;
+        if (lindblad) {
+            rhs_lindblad(t, state, derivative, workspace);
+            return;
+        }
         if (interaction_picture) {
             if (interaction_dense) {
                 rhs_interaction_dense(t, state, derivative, workspace);
@@ -1655,10 +2448,9 @@ struct Problem {
     }
 };
 
-using Matrix = std::vector<cdouble>;
-
 void matrix_identity(int n, Matrix& result) {
-    result.assign(static_cast<std::size_t>(n) * n, cdouble(0.0, 0.0));
+    result.resize(static_cast<std::size_t>(n) * n);
+    std::fill(result.begin(), result.end(), cdouble(0.0, 0.0));
     for (int index = 0; index < n; ++index) {
         result[static_cast<std::size_t>(index) * n + index] = cdouble(1.0, 0.0);
     }
@@ -1676,7 +2468,8 @@ void matrix_add_scaled(
 }
 
 void matrix_multiply(const Matrix& left, const Matrix& right, int n, Matrix& result) {
-    result.assign(static_cast<std::size_t>(n) * n, cdouble(0.0, 0.0));
+    result.resize(static_cast<std::size_t>(n) * n);
+    std::fill(result.begin(), result.end(), cdouble(0.0, 0.0));
     for (int row = 0; row < n; ++row) {
         for (int pivot = 0; pivot < n; ++pivot) {
             const cdouble value = left[static_cast<std::size_t>(row) * n + pivot];
@@ -1764,7 +2557,11 @@ bool solve_linear_system(Matrix lhs, Matrix& rhs, int n) {
     return true;
 }
 
-bool matrix_exponential(const Matrix& input, int n, Matrix& result) {
+bool matrix_exponential(
+    const Matrix& input,
+    int n,
+    Matrix& result,
+    MatrixExponentialWorkspace* reusable = nullptr) {
     if (n < 1 || input.size() != static_cast<std::size_t>(n) * n) {
         return false;
     }
@@ -1790,13 +2587,27 @@ bool matrix_exponential(const Matrix& input, int n, Matrix& result) {
         return false;
     }
     const double scale = std::ldexp(1.0, -squarings);
-    Matrix a(input.size());
+    MatrixExponentialWorkspace local_workspace;
+    MatrixExponentialWorkspace& workspace = reusable != nullptr
+        ? *reusable
+        : local_workspace;
+    Matrix& a = workspace.a;
+    Matrix& a2 = workspace.a2;
+    Matrix& a4 = workspace.a4;
+    Matrix& a6 = workspace.a6;
+    Matrix& identity = workspace.identity;
+    Matrix& tmp = workspace.tmp;
+    Matrix& u_inner = workspace.u_inner;
+    Matrix& v = workspace.v;
+    Matrix& v_inner = workspace.v_inner;
+    Matrix& u = workspace.u;
+    Matrix& lhs = workspace.lhs;
+    Matrix& rhs = workspace.rhs;
+    Matrix& squared = workspace.squared;
+    a.resize(input.size());
     for (std::size_t index = 0; index < input.size(); ++index) {
         a[index] = input[index] * scale;
     }
-    Matrix a2;
-    Matrix a4;
-    Matrix a6;
     matrix_multiply(a, a, n, a2);
     matrix_multiply(a2, a2, n, a4);
     matrix_multiply(a4, a2, n, a6);
@@ -1816,13 +2627,7 @@ bool matrix_exponential(const Matrix& input, int n, Matrix& result) {
     constexpr double b12 = 182.0;
     constexpr double b13 = 1.0;
 
-    Matrix identity;
     matrix_identity(n, identity);
-    Matrix tmp;
-    Matrix u_inner;
-    Matrix v;
-    Matrix v_inner;
-    Matrix u;
     u_inner.resize(a6.size());
     for (std::size_t index = 0; index < a6.size(); ++index) {
         u_inner[index] = b13 * a6[index] + b11 * a4[index] + b9 * a2[index];
@@ -1843,15 +2648,14 @@ bool matrix_exponential(const Matrix& input, int n, Matrix& result) {
         v[index] += b6 * a6[index] + b4 * a4[index] + b2 * a2[index]
             + b0 * identity[index];
     }
-    Matrix lhs;
-    Matrix rhs;
     matrix_add_scaled(v, u, cdouble(-1.0, 0.0), lhs);
     matrix_add_scaled(v, u, cdouble(1.0, 0.0), rhs);
     if (!solve_linear_system(lhs, rhs, n)) {
         return false;
     }
+    // All callers pass an output vector distinct from the workspace RHS, so
+    // swap avoids copying the projected matrix before the squaring phase.
     result.swap(rhs);
-    Matrix squared;
     for (int index = 0; index < squarings; ++index) {
         matrix_multiply(result, result, n, squared);
         result.swap(squared);
@@ -1898,12 +2702,13 @@ bool krylov_exponential_action(
     int max_dimension,
     std::vector<cdouble>& output,
     int& used_dimension,
-    double& residual) {
-    const int n = problem.n;
-    output.assign(static_cast<std::size_t>(n), cdouble(0.0, 0.0));
+    double& residual,
+    KrylovWorkspace* reusable_workspace = nullptr) {
+    const int n = problem.state_dimension();
+    output.assign(static_cast<std::size_t>(std::max(0, n)), cdouble(0.0, 0.0));
     used_dimension = 0;
     residual = std::numeric_limits<double>::infinity();
-    if (input.size() != static_cast<std::size_t>(n)
+    if (n < 1 || input.size() != static_cast<std::size_t>(n)
         || !std::isfinite(dt)
         || !std::isfinite(tolerance)
         || tolerance <= 0.0
@@ -1921,30 +2726,38 @@ bool krylov_exponential_action(
         return true;
     }
     max_dimension = std::min(max_dimension, n);
+    KrylovWorkspace local_workspace;
+    KrylovWorkspace& scratch = reusable_workspace != nullptr
+        ? *reusable_workspace
+        : local_workspace;
+    scratch.prepare(n, max_dimension);
     const std::size_t basis_stride = static_cast<std::size_t>(n);
-    std::vector<cdouble> basis(
-        static_cast<std::size_t>(max_dimension + 1) * basis_stride,
-        cdouble(0.0, 0.0));
+    auto& basis = scratch.basis;
     for (int index = 0; index < n; ++index) {
         basis[static_cast<std::size_t>(index)] =
             input[static_cast<std::size_t>(index)] / input_norm;
     }
-    Matrix hessenberg(
-        static_cast<std::size_t>(max_dimension + 1) * max_dimension,
-        cdouble(0.0, 0.0));
-    std::vector<cdouble> work(static_cast<std::size_t>(n));
-    std::vector<cdouble> previous(static_cast<std::size_t>(n));
-    std::vector<cdouble> candidate(static_cast<std::size_t>(n));
+    auto& hessenberg = scratch.hessenberg;
+    auto& work = scratch.work;
+    auto& previous = scratch.previous;
+    auto& candidate = scratch.candidate;
     bool have_previous = false;
     const double scaled_tolerance = std::max(
         tolerance + problem.rtol * input_norm,
         32.0 * std::numeric_limits<double>::epsilon() * input_norm);
 
     for (int column = 0; column < max_dimension; ++column) {
-        problem.apply_constant_single(
-            basis.data() + static_cast<std::size_t>(column) * basis_stride,
-            work.data(),
-            scales);
+        if (problem.lindblad) {
+            problem.apply_lindblad_constant_single(
+                basis.data() + static_cast<std::size_t>(column) * basis_stride,
+                work.data(),
+                scales);
+        } else {
+            problem.apply_constant_single(
+                basis.data() + static_cast<std::size_t>(column) * basis_stride,
+                work.data(),
+                scales);
+        }
         for (int pass = 0; pass < 2; ++pass) {
             for (int row = 0; row <= column; ++row) {
                 const cdouble coefficient = vector_inner_product(
@@ -1968,10 +2781,27 @@ bool krylov_exponential_action(
         hessenberg[static_cast<std::size_t>(column + 1) * max_dimension + column] =
             cdouble(subdiagonal, 0.0);
         const int dimension = column + 1;
+        const bool breakdown = subdiagonal <=
+            64.0 * std::numeric_limits<double>::epsilon();
 
-        Matrix small_matrix(
-            static_cast<std::size_t>(dimension) * dimension,
-            cdouble(0.0, 0.0));
+        // The residual acceptance rule requires at least four basis vectors,
+        // so projected exponentials for dimensions 1-3 cannot accept an
+        // action unless the Krylov space has already broken down.  Generate
+        // those vectors without paying for three guaranteed-unused Pade
+        // evaluations.
+        if (dimension < 4 && !breakdown) {
+            if (subdiagonal <= 0.0 || !std::isfinite(subdiagonal)) {
+                return false;
+            }
+            for (int index = 0; index < n; ++index) {
+                basis[static_cast<std::size_t>(dimension) * basis_stride + index] =
+                    work[static_cast<std::size_t>(index)] / subdiagonal;
+            }
+            continue;
+        }
+
+        auto& small_matrix = scratch.small_matrix;
+        small_matrix.resize(static_cast<std::size_t>(dimension) * dimension);
         for (int row = 0; row < dimension; ++row) {
             for (int col = 0; col < dimension; ++col) {
                 small_matrix[static_cast<std::size_t>(row) * dimension + col] =
@@ -1979,8 +2809,12 @@ bool krylov_exponential_action(
                     * dt;
             }
         }
-        Matrix small_exponential;
-        if (!matrix_exponential(small_matrix, dimension, small_exponential)) {
+        auto& small_exponential = scratch.small_exponential;
+        if (!matrix_exponential(
+                small_matrix,
+                dimension,
+                small_exponential,
+                &scratch.exponential_workspace)) {
             return false;
         }
         for (int index = 0; index < n; ++index) {
@@ -2006,8 +2840,6 @@ bool krylov_exponential_action(
         }
         // A tiny subdiagonal is an exact Krylov breakdown: the generated
         // subspace is invariant and the current exponential is complete.
-        const bool breakdown = subdiagonal <=
-            64.0 * std::numeric_limits<double>::epsilon();
         if (breakdown || (dimension >= 4
                           && residual <= scaled_tolerance
                           && (!have_previous || difference <= scaled_tolerance))) {
@@ -2028,6 +2860,52 @@ bool krylov_exponential_action(
     return false;
 }
 
+int choose_parallel_workers(
+    const Problem& problem,
+    int task_count,
+    int action_count = 1) {
+    if (task_count < 2 || problem.parallel_mode == 0) {
+        return 1;
+    }
+    unsigned int hardware = std::thread::hardware_concurrency();
+    if (hardware == 0) {
+        hardware = 2;
+    }
+    int workers = std::min(task_count, static_cast<int>(hardware));
+    const int state_dimension = std::max(1, problem.state_dimension());
+    // Automatic mode avoids thread and cache contention for small batches.  An
+    // explicit ``parallel='on'`` request still uses all available workers.
+    if (problem.parallel_mode == 1) {
+        // Thread creation and per-worker scratch dominate small Krylov
+        // batches.  Use a conservative work estimate so ``auto`` cannot turn
+        // a short final-state request into a slowdown; explicit ``on`` keeps
+        // the reproducible all-workers override for benchmarking.
+        const std::size_t estimated_work =
+            static_cast<std::size_t>(std::max(1, state_dimension))
+            * static_cast<std::size_t>(std::max(1, task_count))
+            * static_cast<std::size_t>(std::max(1, action_count));
+        if (task_count < 16 || estimated_work < 1'000'000u) {
+            return 1;
+        }
+    }
+    // Each worker owns an Arnoldi basis.  Keep aggregate scratch bounded for
+    // very large Hilbert spaces instead of trading a speedup for paging or
+    // allocation failure.
+    constexpr std::size_t kMaxParallelScratchBytes = 256u * 1024u * 1024u;
+    const std::size_t per_worker = (
+        static_cast<std::size_t>(std::min(state_dimension, 96) + 1)
+            * static_cast<std::size_t>(state_dimension)
+        + 96u * 96u
+        + 4u * static_cast<std::size_t>(state_dimension))
+        * sizeof(cdouble);
+    if (per_worker > 0) {
+        const int memory_workers = static_cast<int>(
+            std::max<std::size_t>(1, kMaxParallelScratchBytes / per_worker));
+        workers = std::min(workers, memory_workers);
+    }
+    return std::max(1, workers);
+}
+
 void apply_matrix_to_state(
     const Matrix& matrix,
     int n,
@@ -2035,13 +2913,24 @@ void apply_matrix_to_state(
     const std::vector<cdouble>& state,
     std::vector<cdouble>& next) {
     for (int row = 0; row < n; ++row) {
-        for (int batch = 0; batch < batch_count; ++batch) {
-            cdouble value(0.0, 0.0);
-            for (int column = 0; column < n; ++column) {
-                value += matrix[static_cast<std::size_t>(row) * n + column]
-                    * state[static_cast<std::size_t>(column) * batch_count + batch];
+        const std::size_t row_base = static_cast<std::size_t>(row) * batch_count;
+        std::fill(
+            next.begin() + static_cast<std::ptrdiff_t>(row_base),
+            next.begin() + static_cast<std::ptrdiff_t>(row_base + batch_count),
+            cdouble(0.0, 0.0));
+        // Keep the column summation order unchanged for every batch state,
+        // but move the independent batch loop innermost so each propagator
+        // element is loaded once and reused across contiguous states.
+        for (int column = 0; column < n; ++column) {
+            const cdouble value = matrix[static_cast<std::size_t>(row) * n + column];
+            if (value == cdouble(0.0, 0.0)) {
+                continue;
             }
-            next[static_cast<std::size_t>(row) * batch_count + batch] = value;
+            const std::size_t source_base = static_cast<std::size_t>(column) * batch_count;
+            for (int batch = 0; batch < batch_count; ++batch) {
+                next[row_base + static_cast<std::size_t>(batch)] += value
+                    * state[source_base + static_cast<std::size_t>(batch)];
+            }
         }
     }
 }
@@ -2484,6 +3373,262 @@ bool run_diagonal_integration(
     return true;
 }
 
+bool run_lindblad_diagonal_integration(
+    Problem& problem,
+    std::vector<cdouble>& state,
+    bool store_trajectory,
+    std::vector<cdouble>& trajectory,
+    std::string& error_message) {
+    (void)error_message;
+    if (!problem.lindblad_diagonal_only) {
+        return false;
+    }
+    const std::size_t state_size = state.size();
+    const int interval_count = std::max(0, problem.sample_count - 1);
+    const std::size_t pair_count =
+        static_cast<std::size_t>(problem.n) * problem.n;
+    std::vector<cdouble> dissipative_rates(pair_count, cdouble(0.0, 0.0));
+    for (int row = 0; row < problem.n; ++row) {
+        for (int column = 0; column < problem.n; ++column) {
+            cdouble rate(0.0, 0.0);
+            for (int collapse = 0;
+                 collapse < problem.lindblad_collapse_count;
+                 ++collapse) {
+                const std::size_t base =
+                    static_cast<std::size_t>(collapse) * problem.n;
+                rate +=
+                    problem.lindblad_collapse_diagonal[base + row]
+                        * std::conj(problem.lindblad_collapse_diagonal[base + column])
+                    - cdouble(0.5, 0.0) * (
+                        problem.lindblad_product_diagonal[base + row]
+                        + std::conj(problem.lindblad_product_diagonal[base + column]));
+            }
+            dissipative_rates[static_cast<std::size_t>(row)
+                + static_cast<std::size_t>(column) * problem.n] = rate;
+        }
+    }
+
+    std::vector<cdouble> integrals(
+        static_cast<std::size_t>(problem.control_count), cdouble(0.0, 0.0));
+    std::vector<cdouble> interval_left(
+        static_cast<std::size_t>(problem.n), cdouble(0.0, 0.0));
+    std::vector<cdouble> interval_right(
+        static_cast<std::size_t>(problem.n), cdouble(0.0, 0.0));
+    std::vector<cdouble> cumulative_left(
+        static_cast<std::size_t>(problem.n), cdouble(0.0, 0.0));
+    std::vector<cdouble> cumulative_right(
+        static_cast<std::size_t>(problem.n), cdouble(0.0, 0.0));
+    std::vector<cdouble> working = state;
+    std::vector<cdouble> local_trajectory;
+    if (store_trajectory) {
+        local_trajectory.reserve(
+            static_cast<std::size_t>(problem.sample_count) * state_size);
+        local_trajectory.insert(
+            local_trajectory.end(), working.begin(), working.end());
+    }
+
+    auto fill_level_phases = [&](int sample, double start, double end) -> bool {
+        const double dt = end - start;
+        if (!(dt > 0.0) || !std::isfinite(dt)) {
+            return false;
+        }
+        for (int control = 0; control < problem.control_count; ++control) {
+            integrals[static_cast<std::size_t>(control)] =
+                integrate_control_interval(problem, control, sample, start, end);
+        }
+        for (int level = 0; level < problem.n; ++level) {
+            cdouble left = problem.diagonal_h0[static_cast<std::size_t>(level)] * dt;
+            cdouble right = std::conj(
+                problem.diagonal_h0[static_cast<std::size_t>(level)]) * dt;
+            for (int control = 0; control < problem.control_count; ++control) {
+                const std::size_t base =
+                    static_cast<std::size_t>(control) * problem.n;
+                const cdouble contribution =
+                    problem.diagonal_controls[base + level]
+                    * integrals[static_cast<std::size_t>(control)];
+                left += contribution;
+                right += std::conj(contribution);
+            }
+            interval_left[static_cast<std::size_t>(level)] = left;
+            interval_right[static_cast<std::size_t>(level)] = right;
+        }
+        return true;
+    };
+
+    bool success = true;
+    Py_BEGIN_ALLOW_THREADS
+    try {
+        if (!store_trajectory) {
+            double total_duration = 0.0;
+            for (int sample = 0; sample < interval_count; ++sample) {
+                const double start = problem.t_axis[sample];
+                const double end = problem.t_axis[sample + 1];
+                if (!fill_level_phases(sample, start, end)) {
+                    success = false;
+                    break;
+                }
+                const double dt = end - start;
+                total_duration += dt;
+                for (int level = 0; level < problem.n; ++level) {
+                    cumulative_left[static_cast<std::size_t>(level)] +=
+                        interval_left[static_cast<std::size_t>(level)];
+                    cumulative_right[static_cast<std::size_t>(level)] +=
+                        interval_right[static_cast<std::size_t>(level)];
+                }
+            }
+            if (success) {
+                int worker_count = 1;
+                if (problem.parallel_mode != 0
+                    && problem.n >= 128
+                    && pair_count * static_cast<std::size_t>(problem.batch_count) >= 16384
+                    && (problem.parallel_mode == 2 || problem.batch_count >= 16)) {
+                    unsigned int hardware = std::thread::hardware_concurrency();
+                    if (hardware == 0) {
+                        hardware = 2;
+                    }
+                    worker_count = std::min(
+                        std::min(problem.n, static_cast<int>(hardware)),
+                        8);
+                }
+                problem.parallel_workers = std::max(
+                    problem.parallel_workers,
+                    static_cast<std::int64_t>(worker_count));
+                std::atomic<bool> factor_failed(false);
+                auto apply_rows = [&](int row_begin, int row_end) {
+                    for (int row = row_begin;
+                         row < row_end
+                             && !factor_failed.load(std::memory_order_relaxed);
+                         ++row) {
+                        for (int column = 0; column < problem.n; ++column) {
+                            const std::size_t state_base = (
+                                static_cast<std::size_t>(row)
+                                + static_cast<std::size_t>(column) * problem.n)
+                                * static_cast<std::size_t>(problem.batch_count);
+                            bool nonzero = false;
+                            for (int batch = 0; batch < problem.batch_count; ++batch) {
+                                if (working[state_base + static_cast<std::size_t>(batch)]
+                                    != cdouble(0.0, 0.0)) {
+                                    nonzero = true;
+                                    break;
+                                }
+                            }
+                            if (!nonzero) {
+                                continue;
+                            }
+                            const std::size_t pair_index =
+                                static_cast<std::size_t>(row)
+                                + static_cast<std::size_t>(column) * problem.n;
+                            const cdouble exponent = cdouble(0.0, -1.0) * (
+                                cumulative_left[static_cast<std::size_t>(row)]
+                                - cumulative_right[static_cast<std::size_t>(column)])
+                                + dissipative_rates[pair_index] * total_duration;
+                            const cdouble factor = exp_complex(exponent);
+                            if (!finite_value(factor)) {
+                                factor_failed.store(true, std::memory_order_relaxed);
+                                break;
+                            }
+                            for (int batch = 0; batch < problem.batch_count; ++batch) {
+                                working[state_base + static_cast<std::size_t>(batch)] *= factor;
+                            }
+                        }
+                    }
+                };
+                if (worker_count == 1) {
+                    apply_rows(0, problem.n);
+                } else {
+                    std::vector<std::thread> workers;
+                    workers.reserve(static_cast<std::size_t>(worker_count));
+                    const int rows_per_worker =
+                        (problem.n + worker_count - 1) / worker_count;
+                    for (int worker_index = 0; worker_index < worker_count; ++worker_index) {
+                        const int row_begin = std::min(
+                            problem.n, worker_index * rows_per_worker);
+                        const int row_end = std::min(
+                            problem.n, row_begin + rows_per_worker);
+                        workers.emplace_back(
+                            apply_rows, row_begin, row_end);
+                    }
+                    for (std::thread& thread : workers) {
+                        thread.join();
+                    }
+                }
+                if (factor_failed.load(std::memory_order_relaxed)) {
+                    success = false;
+                }
+            }
+        } else {
+            for (int sample = 0; sample < interval_count; ++sample) {
+                const double start = problem.t_axis[sample];
+                const double end = problem.t_axis[sample + 1];
+                if (!fill_level_phases(sample, start, end)) {
+                    success = false;
+                    break;
+                }
+                const double dt = end - start;
+                for (int row = 0; row < problem.n; ++row) {
+                    for (int column = 0; column < problem.n; ++column) {
+                        const std::size_t state_base = (
+                            static_cast<std::size_t>(row)
+                            + static_cast<std::size_t>(column) * problem.n)
+                            * static_cast<std::size_t>(problem.batch_count);
+                        bool nonzero = false;
+                        for (int batch = 0; batch < problem.batch_count; ++batch) {
+                            if (working[state_base + static_cast<std::size_t>(batch)]
+                                != cdouble(0.0, 0.0)) {
+                                nonzero = true;
+                                break;
+                            }
+                        }
+                        if (!nonzero) {
+                            continue;
+                        }
+                        const std::size_t pair_index =
+                            static_cast<std::size_t>(row)
+                            + static_cast<std::size_t>(column) * problem.n;
+                        const cdouble exponent = cdouble(0.0, -1.0) * (
+                            interval_left[static_cast<std::size_t>(row)]
+                            - interval_right[static_cast<std::size_t>(column)])
+                            + dissipative_rates[pair_index] * dt;
+                        const cdouble factor = exp_complex(exponent);
+                        if (!finite_value(factor)) {
+                            success = false;
+                            break;
+                        }
+                        for (int batch = 0; batch < problem.batch_count; ++batch) {
+                            working[state_base + static_cast<std::size_t>(batch)] *= factor;
+                        }
+                    }
+                    if (!success) {
+                        break;
+                    }
+                }
+                if (!success) {
+                    break;
+                }
+                local_trajectory.insert(
+                    local_trajectory.end(), working.begin(), working.end());
+            }
+        }
+    } catch (...) {
+        success = false;
+    }
+    Py_END_ALLOW_THREADS
+    if (!success) {
+        return false;
+    }
+    state.swap(working);
+    if (store_trajectory) {
+        trajectory.swap(local_trajectory);
+    }
+    problem.lindblad_diagonal_exact = true;
+    problem.attempted_steps = static_cast<std::int64_t>(interval_count);
+    problem.rhs_evaluations = 0;
+    problem.max_error = 0.0;
+    problem.max_trial_error = 0.0;
+    return true;
+}
+
+
 bool run_constant_exponential(
     Problem& problem,
     std::vector<cdouble>& state,
@@ -2494,27 +3639,37 @@ bool run_constant_exponential(
     if (problem.n > kMaxDenseExponentialDimension) {
         return false;
     }
-    if (problem.sample_count > 1) {
-        const double dt = problem.t_axis[1] - problem.t_axis[0];
-        // Reusing one step exponential is exact only when every interval has
-        // the same representable width.  A merely close width changes the
-        // requested propagator, so leave such grids to the general path.
-        for (int sample = 2; sample < problem.sample_count; ++sample) {
-            const double current_dt = problem.t_axis[sample] - problem.t_axis[sample - 1];
-            if (current_dt != dt) {
-                return false;
-            }
-        }
-    }
-
     Matrix hamiltonian;
     problem.build_constant_hamiltonian(hamiltonian);
     Matrix propagator;
     if (problem.sample_count > 1) {
-        const double dt = problem.t_axis[1] - problem.t_axis[0];
+        const double first_dt = problem.t_axis[1] - problem.t_axis[0];
+        const double total_dt = problem.t_axis[problem.sample_count - 1]
+            - problem.t_axis[0];
+        bool equal_intervals = true;
+        for (int sample = 2; sample < problem.sample_count; ++sample) {
+            const double current_dt = problem.t_axis[sample] - problem.t_axis[sample - 1];
+            if (current_dt != first_dt) {
+                equal_intervals = false;
+                break;
+            }
+        }
+        if (store_trajectory && !equal_intervals) {
+            return false;
+        }
+        // For a final-state-only request, exp(A t_k) factors through the
+        // same constant generator for every interval.  Applying exp(A T)
+        // once is exactly equivalent to all interval applications, including
+        // nonuniform output grids.
+        const double propagation_dt = store_trajectory || equal_intervals
+            ? first_dt
+            : total_dt;
+        if (!(propagation_dt > 0.0) || !std::isfinite(propagation_dt)) {
+            return false;
+        }
         Matrix scaled(hamiltonian.size());
         for (std::size_t index = 0; index < hamiltonian.size(); ++index) {
-            scaled[index] = cdouble(0.0, -dt) * hamiltonian[index];
+            scaled[index] = cdouble(0.0, -propagation_dt) * hamiltonian[index];
         }
         if (!matrix_exponential(scaled, problem.n, propagator)) {
             return false;
@@ -2533,7 +3688,10 @@ bool run_constant_exponential(
     }
     std::vector<cdouble> next(state.size(), cdouble(0.0, 0.0));
     Py_BEGIN_ALLOW_THREADS
-    for (int sample = 0; sample + 1 < problem.sample_count; ++sample) {
+    const int application_count = store_trajectory
+        ? std::max(0, problem.sample_count - 1)
+        : (problem.sample_count > 1 ? 1 : 0);
+    for (int sample = 0; sample < application_count; ++sample) {
         for (int row = 0; row < problem.n; ++row) {
             for (int batch = 0; batch < problem.batch_count; ++batch) {
                 cdouble value(0.0, 0.0);
@@ -2557,17 +3715,186 @@ bool run_constant_exponential(
     return true;
 }
 
+bool run_krylov_batch_intervals(
+    Problem& problem,
+    const std::vector<std::vector<cdouble>>* interval_scales,
+    const std::vector<cdouble>& constant_scales,
+    std::vector<cdouble>& state,
+    bool store_trajectory,
+    std::vector<cdouble>& trajectory,
+    std::string& error_message) {
+    (void)error_message;
+    constexpr int kMaxKrylovDimension = 96;
+    const int interval_count = std::max(0, problem.sample_count - 1);
+    const bool collapse_constant_intervals =
+        interval_scales == nullptr && !store_trajectory && interval_count > 1;
+    const int action_count = collapse_constant_intervals ? 1 : interval_count;
+    std::vector<double> interval_durations(
+        static_cast<std::size_t>(action_count), 0.0);
+    if (collapse_constant_intervals) {
+        const double total_dt = problem.t_axis[problem.sample_count - 1]
+            - problem.t_axis[0];
+        if (!(total_dt > 0.0) || !std::isfinite(total_dt)) {
+            return false;
+        }
+        interval_durations[0] = total_dt;
+    } else {
+        for (int sample = 0; sample < interval_count; ++sample) {
+            const double dt = problem.t_axis[sample + 1] - problem.t_axis[sample];
+            if (!(dt > 0.0) || !std::isfinite(dt)) {
+                return false;
+            }
+            interval_durations[static_cast<std::size_t>(sample)] = dt;
+        }
+    }
+
+    const int worker_count = choose_parallel_workers(
+        problem,
+        problem.batch_count,
+        action_count);
+    problem.parallel_workers = worker_count;
+    std::vector<cdouble> result(state.size(), cdouble(0.0, 0.0));
+    std::vector<cdouble> local_trajectory;
+    if (store_trajectory) {
+        local_trajectory.resize(
+            static_cast<std::size_t>(problem.sample_count) * state.size());
+        std::copy(state.begin(), state.end(), local_trajectory.begin());
+    }
+
+    std::vector<std::int64_t> worker_evaluations(
+        static_cast<std::size_t>(worker_count), 0);
+    std::vector<std::int64_t> worker_iterations(
+        static_cast<std::size_t>(worker_count), 0);
+    std::atomic<bool> worker_failed(false);
+    bool success = true;
+
+    // Each batch column is independent.  Keep one worker per assigned set of
+    // columns for the entire call, so interval propagation never recreates
+    // threads and no synchronization is needed between columns.
+    Py_BEGIN_ALLOW_THREADS
+    try {
+        auto worker = [&](int worker_index) {
+            const int state_dimension = problem.state_dimension();
+            std::vector<cdouble> input(static_cast<std::size_t>(state_dimension));
+            std::vector<cdouble> output(static_cast<std::size_t>(state_dimension));
+            KrylovWorkspace krylov_scratch;
+            for (int batch = worker_index;
+                 batch < problem.batch_count
+                     && !worker_failed.load(std::memory_order_relaxed);
+                 batch += worker_count) {
+                for (int row = 0; row < state_dimension; ++row) {
+                    input[static_cast<std::size_t>(row)] = state[
+                        static_cast<std::size_t>(row) * problem.batch_count + batch];
+                }
+                for (int sample = 0;
+                     sample < action_count
+                         && !worker_failed.load(std::memory_order_relaxed);
+                     ++sample) {
+                    const std::vector<cdouble>& scales =
+                        interval_scales != nullptr
+                            ? (*interval_scales)[static_cast<std::size_t>(sample)]
+                            : constant_scales;
+                    int used_dimension = 0;
+                    double residual = 0.0;
+                    bool ok = false;
+                    try {
+                        ok = krylov_exponential_action(
+                            problem,
+                            input,
+                            scales,
+                            interval_durations[static_cast<std::size_t>(sample)],
+                            problem.atol,
+                            kMaxKrylovDimension,
+                            output,
+                            used_dimension,
+                            residual,
+                            &krylov_scratch);
+                    } catch (...) {
+                        ok = false;
+                    }
+                    if (!ok) {
+                        worker_failed.store(true, std::memory_order_relaxed);
+                        break;
+                    }
+                    worker_evaluations[static_cast<std::size_t>(worker_index)] += 1;
+                    worker_iterations[static_cast<std::size_t>(worker_index)] += used_dimension;
+                    input.swap(output);
+                    if (store_trajectory) {
+                        const std::size_t base =
+                            static_cast<std::size_t>(sample + 1) * state.size();
+                        for (int row = 0; row < state_dimension; ++row) {
+                            local_trajectory[
+                                base + static_cast<std::size_t>(row)
+                                    * problem.batch_count + batch] =
+                                input[static_cast<std::size_t>(row)];
+                        }
+                    }
+                }
+                if (worker_failed.load(std::memory_order_relaxed)) {
+                    break;
+                }
+                for (int row = 0; row < state_dimension; ++row) {
+                    result[static_cast<std::size_t>(row) * problem.batch_count + batch] =
+                        input[static_cast<std::size_t>(row)];
+                }
+            }
+        };
+
+        if (worker_count == 1) {
+            worker(0);
+        } else {
+            std::vector<std::thread> workers;
+            workers.reserve(static_cast<std::size_t>(worker_count));
+            for (int worker_index = 0; worker_index < worker_count; ++worker_index) {
+                workers.emplace_back(worker, worker_index);
+            }
+            for (std::thread& thread : workers) {
+                thread.join();
+            }
+        }
+    } catch (...) {
+        success = false;
+    }
+    Py_END_ALLOW_THREADS
+
+    if (worker_failed.load(std::memory_order_relaxed)) {
+        success = false;
+    }
+    for (const std::int64_t value : worker_evaluations) {
+        problem.krylov_evaluations += value;
+    }
+    for (const std::int64_t value : worker_iterations) {
+        problem.krylov_iterations += value;
+    }
+    if (!success) {
+        problem.krylov_evaluations = 0;
+        problem.krylov_iterations = 0;
+        problem.parallel_workers = 1;
+        return false;
+    }
+
+    state.swap(result);
+    if (store_trajectory) {
+        trajectory.swap(local_trajectory);
+    }
+    problem.krylov_used = true;
+    problem.attempted_steps = static_cast<std::int64_t>(interval_count);
+    problem.rhs_evaluations = 0;
+    problem.max_error = 0.0;
+    problem.max_trial_error = 0.0;
+    return true;
+}
+
 bool run_constant_krylov(
     Problem& problem,
     std::vector<cdouble>& state,
     bool store_trajectory,
     std::vector<cdouble>& trajectory,
     std::string& error_message) {
-    (void)error_message;
     if (!(problem.sparse || problem.banded || problem.fused_sparse)
         || problem.interaction_picture
         || problem.sparse_expm_mode == 0
-        || (problem.n <= kMaxDenseExponentialDimension
+        || (problem.state_dimension() <= kMaxDenseExponentialDimension
             && problem.sparse_expm_mode != 2)
         || !problem.has_constant_coefficients()) {
         return false;
@@ -2578,87 +3905,58 @@ bool run_constant_krylov(
         scales[static_cast<std::size_t>(control)] =
             problem.constant_coefficient(control);
     }
-    // The small projected exponential is dense, but the physical operator
-    // action remains sparse.  A bounded basis keeps memory proportional to
-    // n*max_dimension and guarantees a deterministic fallback for difficult
-    // non-normal matrices.
-    constexpr int kMaxKrylovDimension = 96;
-    const double tolerance = problem.atol;
-    std::vector<cdouble> working = state;
-    std::vector<cdouble> local_trajectory;
-    if (store_trajectory) {
-        local_trajectory.reserve(
-            static_cast<std::size_t>(problem.sample_count) * working.size());
-        local_trajectory.insert(local_trajectory.end(), working.begin(), working.end());
-    }
-    std::vector<cdouble> input(static_cast<std::size_t>(problem.n));
-    std::vector<cdouble> output(static_cast<std::size_t>(problem.n));
-    std::vector<cdouble> next(working.size(), cdouble(0.0, 0.0));
-    bool success = true;
-    Py_BEGIN_ALLOW_THREADS
-    try {
-        for (int sample = 0; sample + 1 < problem.sample_count; ++sample) {
-            const double dt = problem.t_axis[sample + 1] - problem.t_axis[sample];
-            if (!(dt > 0.0) || !std::isfinite(dt)) {
-                success = false;
-                break;
-            }
-            for (int batch = 0; batch < problem.batch_count && success; ++batch) {
-                for (int row = 0; row < problem.n; ++row) {
-                    input[static_cast<std::size_t>(row)] = working[
-                        static_cast<std::size_t>(row) * problem.batch_count + batch];
-                }
-                int used_dimension = 0;
-                double residual = 0.0;
-                if (!krylov_exponential_action(
-                        problem,
-                        input,
-                        scales,
-                        dt,
-                        tolerance,
-                        kMaxKrylovDimension,
-                        output,
-                        used_dimension,
-                        residual)) {
-                    success = false;
-                    break;
-                }
-                problem.krylov_evaluations += 1;
-                problem.krylov_iterations += used_dimension;
-                for (int row = 0; row < problem.n; ++row) {
-                    next[static_cast<std::size_t>(row) * problem.batch_count + batch] =
-                        output[static_cast<std::size_t>(row)];
-                }
-            }
-            if (!success) {
-                break;
-            }
-            working.swap(next);
-            if (store_trajectory) {
-                local_trajectory.insert(local_trajectory.end(), working.begin(), working.end());
-            }
-        }
-    } catch (...) {
-        success = false;
-    }
-    Py_END_ALLOW_THREADS
-    if (!success) {
-        return false;
-    }
-    state.swap(working);
-    if (store_trajectory) {
-        trajectory.swap(local_trajectory);
-    }
-    problem.krylov_used = true;
-    problem.attempted_steps = std::max<std::int64_t>(
-        0,
-        static_cast<std::int64_t>(problem.sample_count) - 1);
-    problem.rhs_evaluations = 0;
-    problem.max_error = 0.0;
-    problem.max_trial_error = 0.0;
-    return true;
+    problem.prepare_constant_operator(scales);
+    return run_krylov_batch_intervals(
+        problem,
+        nullptr,
+        scales,
+        state,
+        store_trajectory,
+        trajectory,
+        error_message);
 }
 
+bool run_piecewise_constant_krylov(
+    Problem& problem,
+    std::vector<cdouble>& state,
+    bool store_trajectory,
+    std::vector<cdouble>& trajectory,
+    std::string& error_message) {
+    if (!(problem.sparse || problem.banded || problem.fused_sparse)
+        || problem.interaction_picture
+        || problem.sparse_expm_mode == 0
+        || (problem.state_dimension() <= kMaxDenseExponentialDimension
+            && problem.sparse_expm_mode != 2)
+        || problem.sample_count < 2) {
+        return false;
+    }
+
+    // Only enter this path when every source interval is exactly constant.
+    // If even one interval is genuinely varying, leave the state untouched so
+    // the established adaptive RK path can represent the original function.
+    std::vector<std::vector<cdouble>> interval_scales(
+        static_cast<std::size_t>(problem.sample_count - 1));
+    for (int sample = 0; sample + 1 < problem.sample_count; ++sample) {
+        problem.source_interval = sample;
+        if (!problem.interval_constant_scales(
+                sample,
+                interval_scales[static_cast<std::size_t>(sample)])) {
+            return false;
+        }
+    }
+    if (!run_krylov_batch_intervals(
+            problem,
+            &interval_scales,
+            std::vector<cdouble>(),
+            state,
+            store_trajectory,
+            trajectory,
+            error_message)) {
+        return false;
+    }
+    problem.piecewise_krylov_used = true;
+    return true;
+}
 void apply_interaction_frame(
     const Problem& problem,
     std::vector<cdouble>& state,
@@ -2766,7 +4064,24 @@ bool run_integration(
     bool store_trajectory,
     std::vector<cdouble>& trajectory,
     std::string& error_message) {
-    if (problem.diagonal_only) {
+    const auto integration_started = std::chrono::steady_clock::now();
+    struct IntegrationTimer {
+        Problem& problem;
+        std::chrono::steady_clock::time_point started;
+        ~IntegrationTimer() {
+            problem.integration_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - started).count();
+        }
+    } timer{problem, integration_started};
+    if (problem.lindblad && problem.lindblad_diagonal_only) {
+        return run_lindblad_diagonal_integration(
+            problem,
+            state,
+            store_trajectory,
+            trajectory,
+            error_message);
+    }
+    if (!problem.lindblad && problem.diagonal_only) {
         return run_diagonal_integration(
             problem,
             state,
@@ -2774,7 +4089,7 @@ bool run_integration(
             trajectory,
             error_message);
     }
-    if (problem.interaction_picture) {
+    if (!problem.lindblad && problem.interaction_picture) {
         return run_interaction_integration(
             problem,
             state,
@@ -2785,7 +4100,8 @@ bool run_integration(
     }
     if ((problem.sparse || problem.banded || problem.fused_sparse)
         && problem.sparse_expm_mode != 0
-        && (problem.n > kMaxDenseExponentialDimension
+        && (problem.sparse_expm_mode == 2 || !problem.lindblad)
+        && (problem.state_dimension() > kMaxDenseExponentialDimension
             || problem.sparse_expm_mode == 2)
         && problem.has_constant_coefficients()) {
         if (run_constant_krylov(
@@ -2801,7 +4117,26 @@ bool run_integration(
         problem.krylov_evaluations = 0;
         problem.krylov_iterations = 0;
     }
-    if (problem.has_constant_coefficients()) {
+    if ((problem.sparse || problem.banded || problem.fused_sparse)
+        && problem.sparse_expm_mode != 0
+        && (problem.sparse_expm_mode == 2 || !problem.lindblad)
+        && (problem.state_dimension() > kMaxDenseExponentialDimension
+            || problem.sparse_expm_mode == 2)
+        && !problem.has_constant_coefficients()) {
+        if (run_piecewise_constant_krylov(
+                problem,
+                state,
+                store_trajectory,
+                trajectory,
+                error_message)) {
+            return true;
+        }
+        // A failed certificate or a varying interval leaves the established
+        // adaptive RK path as the exact fallback.
+        problem.krylov_evaluations = 0;
+        problem.krylov_iterations = 0;
+    }
+    if (!problem.lindblad && problem.has_constant_coefficients()) {
         if (run_constant_exponential(
                 problem,
                 state,
@@ -2845,7 +4180,8 @@ bool run_integration(
             bool handled = false;
             const double interval_dt =
                 problem.t_axis[sample + 1] - problem.t_axis[sample];
-            if (problem.interval_constant_scales(sample, interval_scales)) {
+            if (!problem.lindblad
+                && problem.interval_constant_scales(sample, interval_scales)) {
                 bool all_zero = true;
                 for (const cdouble value : interval_scales) {
                     if (value != cdouble(0.0, 0.0)) {
@@ -3002,8 +4338,20 @@ PyObject* make_native_result(
     value = PyLong_FromLongLong(problem.krylov_iterations);
     PyDict_SetItemString(stats, "krylov_iterations", value);
     Py_DECREF(value);
+    value = PyFloat_FromDouble(problem.integration_seconds);
+    PyDict_SetItemString(stats, "integration_seconds", value);
+    Py_DECREF(value);
+    value = PyLong_FromLong(problem.state_dimension());
+    PyDict_SetItemString(stats, "state_dimension", value);
+    Py_DECREF(value);
     value = PyLong_FromLong(problem.sparse_expm_mode);
     PyDict_SetItemString(stats, "sparse_expm_mode", value);
+    Py_DECREF(value);
+    value = PyLong_FromLong(problem.parallel_mode);
+    PyDict_SetItemString(stats, "parallel_mode", value);
+    Py_DECREF(value);
+    value = PyLong_FromLongLong(problem.parallel_workers);
+    PyDict_SetItemString(stats, "parallel_workers", value);
     Py_DECREF(value);
     value = PyLong_FromLongLong(problem.diagonal_interval_evaluations);
     PyDict_SetItemString(stats, "diagonal_interval_evaluations", value);
@@ -3014,6 +4362,20 @@ PyObject* make_native_result(
     value = PyBool_FromLong(problem.interaction_dense ? 1 : 0);
     PyDict_SetItemString(stats, "interaction_dense", value);
     Py_DECREF(value);
+    value = PyBool_FromLong(problem.lindblad ? 1 : 0);
+    PyDict_SetItemString(stats, "lindblad", value);
+    Py_DECREF(value);
+    value = PyBool_FromLong(problem.lindblad_diagonal_exact ? 1 : 0);
+    PyDict_SetItemString(stats, "lindblad_diagonal_exact", value);
+    Py_DECREF(value);
+    if (problem.lindblad) {
+        value = PyLong_FromLong(problem.n);
+        PyDict_SetItemString(stats, "physical_dimension", value);
+        Py_DECREF(value);
+        value = PyLong_FromLong(problem.lindblad_collapse_count);
+        PyDict_SetItemString(stats, "collapse_count", value);
+        Py_DECREF(value);
+    }
     value = PyLong_FromLong(problem.mode);
     PyDict_SetItemString(stats, "mode", value);
     Py_DECREF(value);
@@ -3030,14 +4392,26 @@ PyObject* make_native_result(
     if (problem.whole_trace_exponential) {
         integrator_name = "cpp_constant_expm";
     }
-    if (problem.diagonal_only) {
+    if (problem.lindblad) {
+        integrator_name = problem.lindblad_diagonal_exact
+            ? "cpp_lindblad_diagonal_exact"
+            : "cpp_lindblad_matrix_free";
+    } else if (problem.diagonal_only) {
         integrator_name = "cpp_diagonal_exact";
     }
     if (problem.interaction_picture) {
         integrator_name = "cpp_interaction_exact_csr";
     }
     if (problem.krylov_used) {
-        integrator_name = "cpp_constant_krylov_csr";
+        if (problem.lindblad) {
+            integrator_name = problem.piecewise_krylov_used
+                ? "cpp_lindblad_piecewise_krylov"
+                : "cpp_lindblad_constant_krylov";
+        } else {
+            integrator_name = problem.piecewise_krylov_used
+                ? "cpp_piecewise_krylov_csr"
+                : "cpp_constant_krylov_csr";
+        }
     }
     value = PyUnicode_FromString(integrator_name);
     PyDict_SetItemString(stats, "integrator", value);
@@ -3082,15 +4456,16 @@ PyObject* native_propagate(PyObject*, PyObject* args, PyObject* kwargs) {
     PyObject* iq_polynomial_object = Py_None;
     int coefficient_order = 1;
     PyObject* control_modes_object = Py_None;
+    int parallel = 1;
     static const char* keywords[] = {
         "h0", "controls", "iq", "t_axis", "initial_states", "lo_freqs",
         "mode", "atol", "rtol", "max_steps", "store_trajectory", "sparse_expm",
-        "iq_polynomial", "coefficient_order", "control_modes", nullptr
+        "iq_polynomial", "coefficient_order", "control_modes", "parallel", nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOO|iddLiiOiO",
+            "OOOOOO|iddLiiOiOi",
             const_cast<char**>(keywords),
             &h0_object,
             &controls_object,
@@ -3106,7 +4481,8 @@ PyObject* native_propagate(PyObject*, PyObject* args, PyObject* kwargs) {
             &sparse_expm,
             &iq_polynomial_object,
             &coefficient_order,
-            &control_modes_object)) {
+            &control_modes_object,
+            &parallel)) {
         return nullptr;
     }
     if (mode != 0 && mode != 1 && mode != 2) {
@@ -3126,6 +4502,10 @@ PyObject* native_propagate(PyObject*, PyObject* args, PyObject* kwargs) {
     }
     if (coefficient_order < 0 || coefficient_order > 3) {
         PyErr_SetString(PyExc_ValueError, "coefficient_order must be between 0 and 3");
+        return nullptr;
+    }
+    if (parallel < 0 || parallel > 2) {
+        PyErr_SetString(PyExc_ValueError, "parallel must be 0 (off), 1 (auto), or 2 (on)");
         return nullptr;
     }
 
@@ -3248,6 +4628,7 @@ PyObject* native_propagate(PyObject*, PyObject* args, PyObject* kwargs) {
     problem.rtol = rtol;
     problem.max_steps = static_cast<std::int64_t>(max_steps);
     problem.sparse_expm_mode = sparse_expm;
+    problem.parallel_mode = parallel;
     problem.coefficient_order = coefficient_order;
     problem.polynomial_interval_count = std::max(0, problem.sample_count - 1);
     problem.iq_polynomial = has_polynomial
@@ -3398,6 +4779,251 @@ bool validate_control_modes_view(
     return true;
 }
 
+OwnedSparseMatrix copy_owned_sparse(
+    const cdouble* data,
+    const std::int64_t* indices,
+    const std::int64_t* indptr,
+    int n,
+    std::int64_t nnz) {
+    OwnedSparseMatrix result;
+    if (nnz > 0) {
+        result.data.assign(data, data + nnz);
+        result.indices.assign(indices, indices + nnz);
+    }
+    result.indptr.assign(indptr, indptr + n + 1);
+    result.diagonal = true;
+    result.diagonal_single = (nnz == static_cast<std::int64_t>(n));
+    for (int row = 0; row < n; ++row) {
+        const std::int64_t begin = result.indptr[static_cast<std::size_t>(row)];
+        const std::int64_t end = result.indptr[static_cast<std::size_t>(row) + 1];
+        if (end - begin != 1) {
+            result.diagonal_single = false;
+        }
+        for (std::int64_t entry = begin; entry < end; ++entry) {
+            if (result.indices[static_cast<std::size_t>(entry)] != row) {
+                result.diagonal = false;
+                result.diagonal_single = false;
+                break;
+            }
+        }
+    }
+    return result;
+}
+
+OwnedSparseMatrix conjugate_transpose_sparse(
+    const OwnedSparseMatrix& source,
+    int n) {
+    OwnedSparseMatrix result;
+    result.indptr.assign(static_cast<std::size_t>(n) + 1, 0);
+    for (const std::int64_t column : source.indices) {
+        ++result.indptr[static_cast<std::size_t>(column) + 1];
+    }
+    for (int row = 0; row < n; ++row) {
+        result.indptr[static_cast<std::size_t>(row) + 1] +=
+            result.indptr[static_cast<std::size_t>(row)];
+    }
+    result.indices.resize(source.data.size());
+    result.data.resize(source.data.size());
+    std::vector<std::int64_t> cursor = result.indptr;
+    for (int row = 0; row < n; ++row) {
+        for (std::int64_t entry = source.indptr[static_cast<std::size_t>(row)];
+             entry < source.indptr[static_cast<std::size_t>(row) + 1];
+             ++entry) {
+            const std::int64_t column = source.indices[static_cast<std::size_t>(entry)];
+            const std::int64_t target = cursor[static_cast<std::size_t>(column)]++;
+            result.indices[static_cast<std::size_t>(target)] = row;
+            result.data[static_cast<std::size_t>(target)] =
+                std::conj(source.data[static_cast<std::size_t>(entry)]);
+        }
+    }
+    result.diagonal = source.diagonal;
+    result.diagonal_single = source.diagonal_single;
+    return result;
+}
+
+OwnedSparseMatrix sparse_matrix_product(
+    const OwnedSparseMatrix& left,
+    const OwnedSparseMatrix& right,
+    int n) {
+    OwnedSparseMatrix result;
+    result.indptr.reserve(static_cast<std::size_t>(n) + 1);
+    result.indptr.push_back(0);
+    // The previous implementation allocated a tree map for every output
+    // row.  A marker/value scratch pair preserves the same accumulation order
+    // while making setup linear in the number of touched columns and reusing
+    // storage across rows.
+    std::vector<int> markers(static_cast<std::size_t>(n), -1);
+    std::vector<cdouble> values(static_cast<std::size_t>(n), cdouble(0.0, 0.0));
+    std::vector<std::int64_t> touched;
+    touched.reserve(static_cast<std::size_t>(n));
+    for (int row = 0; row < n; ++row) {
+        touched.clear();
+        for (std::int64_t left_entry = left.indptr[static_cast<std::size_t>(row)];
+             left_entry < left.indptr[static_cast<std::size_t>(row) + 1];
+             ++left_entry) {
+            const std::int64_t pivot = left.indices[static_cast<std::size_t>(left_entry)];
+            const cdouble left_value = left.data[static_cast<std::size_t>(left_entry)];
+            for (std::int64_t right_entry = right.indptr[static_cast<std::size_t>(pivot)];
+                 right_entry < right.indptr[static_cast<std::size_t>(pivot) + 1];
+                 ++right_entry) {
+                const std::int64_t column = right.indices[static_cast<std::size_t>(right_entry)];
+                const std::size_t column_index = static_cast<std::size_t>(column);
+                if (markers[column_index] != row) {
+                    markers[column_index] = row;
+                    values[column_index] = cdouble(0.0, 0.0);
+                    touched.push_back(column);
+                }
+                values[column_index] += left_value
+                    * right.data[static_cast<std::size_t>(right_entry)];
+            }
+        }
+        std::sort(touched.begin(), touched.end());
+        for (const std::int64_t column : touched) {
+            const cdouble value = values[static_cast<std::size_t>(column)];
+            if (value != cdouble(0.0, 0.0)) {
+                result.indices.push_back(column);
+                result.data.push_back(value);
+            }
+        }
+        result.indptr.push_back(static_cast<std::int64_t>(result.data.size()));
+    }
+    result.diagonal = true;
+    result.diagonal_single = (result.data.size() == static_cast<std::size_t>(n));
+    for (int row = 0; row < n; ++row) {
+        const std::int64_t begin = result.indptr[static_cast<std::size_t>(row)];
+        const std::int64_t end = result.indptr[static_cast<std::size_t>(row) + 1];
+        if (end - begin != 1) {
+            result.diagonal_single = false;
+        }
+        for (std::int64_t entry = begin; entry < end; ++entry) {
+            if (result.indices[static_cast<std::size_t>(entry)] != row) {
+                result.diagonal = false;
+                result.diagonal_single = false;
+                break;
+            }
+        }
+    }
+    return result;
+}
+
+LindbladJumpPattern build_lindblad_jump_pattern(
+    const OwnedSparseMatrix& collapse,
+    int n,
+    std::size_t max_entries) {
+    LindbladJumpPattern pattern;
+    pattern.row_ptr.assign(static_cast<std::size_t>(n) + 1, 0);
+    std::vector<int> nonempty_columns;
+    nonempty_columns.reserve(static_cast<std::size_t>(n));
+    const std::size_t total_nnz = collapse.data.size();
+    for (int column = 0; column < n; ++column) {
+        if (collapse.indptr[static_cast<std::size_t>(column) + 1]
+            > collapse.indptr[static_cast<std::size_t>(column)]) {
+            nonempty_columns.push_back(column);
+        }
+    }
+    std::size_t pair_count = 0;
+    for (int row = 0; row < n; ++row) {
+        const std::size_t left_count = static_cast<std::size_t>(
+            collapse.indptr[static_cast<std::size_t>(row) + 1]
+            - collapse.indptr[static_cast<std::size_t>(row)]);
+        if (total_nnz != 0 && left_count > max_entries / total_nnz) {
+            return pattern;
+        }
+        const std::size_t product = left_count * total_nnz;
+        if (pair_count > max_entries - product) {
+            return pattern;
+        }
+        pair_count += product;
+    }
+    pattern.entries.reserve(pair_count);
+    for (int row = 0; row < n; ++row) {
+        for (const int column : nonempty_columns) {
+            for (std::int64_t left_entry = collapse.indptr[static_cast<std::size_t>(row)];
+                 left_entry < collapse.indptr[static_cast<std::size_t>(row) + 1];
+                 ++left_entry) {
+                const int source_row = static_cast<int>(collapse.indices[
+                    static_cast<std::size_t>(left_entry)]);
+                const cdouble left_value = collapse.data[
+                    static_cast<std::size_t>(left_entry)];
+                for (std::int64_t right_entry = collapse.indptr[
+                        static_cast<std::size_t>(column)];
+                     right_entry < collapse.indptr[
+                         static_cast<std::size_t>(column) + 1];
+                     ++right_entry) {
+                    pattern.entries.push_back({
+                        row,
+                        column,
+                        source_row,
+                        static_cast<int>(collapse.indices[
+                            static_cast<std::size_t>(right_entry)]),
+                        left_value * std::conj(collapse.data[
+                            static_cast<std::size_t>(right_entry)]),
+                    });
+                }
+            }
+        }
+        pattern.row_ptr[static_cast<std::size_t>(row) + 1] =
+            static_cast<std::int64_t>(pattern.entries.size());
+    }
+    pattern.ready = true;
+    return pattern;
+}
+
+bool validate_csr_bundle(
+    const cdouble* data,
+    const std::int64_t* indices,
+    const std::int64_t* indptr,
+    const std::int64_t* offsets,
+    int matrix_count,
+    int n,
+    std::int64_t total_nnz,
+    const char* name) {
+    if (matrix_count < 0 || offsets == nullptr
+        || offsets[0] != 0 || offsets[matrix_count] != total_nnz) {
+        PyErr_Format(PyExc_ValueError, "%s CSR offsets are inconsistent", name);
+        return false;
+    }
+    for (int matrix = 0; matrix < matrix_count; ++matrix) {
+        const std::int64_t begin_offset = offsets[matrix];
+        const std::int64_t end_offset = offsets[matrix + 1];
+        if (begin_offset < 0 || end_offset < begin_offset
+            || end_offset > total_nnz) {
+            PyErr_Format(PyExc_ValueError, "%s CSR offsets must be monotone", name);
+            return false;
+        }
+        const std::int64_t* matrix_indptr = indptr
+            + static_cast<std::size_t>(matrix) * (n + 1);
+        if (matrix_indptr[0] != 0
+            || matrix_indptr[n] != end_offset - begin_offset) {
+            PyErr_Format(PyExc_ValueError, "%s CSR indptr does not match offsets", name);
+            return false;
+        }
+        for (int row = 0; row < n; ++row) {
+            if (matrix_indptr[row] > matrix_indptr[row + 1]
+                || matrix_indptr[row] < 0
+                || matrix_indptr[row + 1] > end_offset - begin_offset) {
+                PyErr_Format(PyExc_ValueError, "%s CSR indptr must be monotone", name);
+                return false;
+            }
+            std::int64_t previous_column = -1;
+            for (std::int64_t entry = matrix_indptr[row];
+                 entry < matrix_indptr[row + 1];
+                 ++entry) {
+                const std::int64_t global_entry = begin_offset + entry;
+                const std::int64_t column = indices[global_entry];
+                if (column < 0 || column >= n
+                    || (previous_column >= 0 && column <= previous_column)
+                    || !finite_value(data[global_entry])) {
+                    PyErr_Format(PyExc_ValueError, "%s CSR contains invalid or unsorted entries", name);
+                    return false;
+                }
+                previous_column = column;
+            }
+        }
+    }
+    return true;
+}
+
 bool validate_polynomial_view(
     const BufferView& view,
     int control_count,
@@ -3446,17 +5072,18 @@ PyObject* native_propagate_csr(PyObject*, PyObject* args, PyObject* kwargs) {
     PyObject* iq_polynomial_object = Py_None;
     int coefficient_order = 1;
     PyObject* control_modes_object = Py_None;
+    int parallel = 1;
     static const char* keywords[] = {
         "h0_data", "h0_indices", "h0_indptr",
         "controls_data", "controls_indices", "controls_indptr", "controls_offsets",
         "iq", "t_axis", "initial_states", "lo_freqs",
         "mode", "atol", "rtol", "max_steps", "store_trajectory", "sparse_expm",
-        "iq_polynomial", "coefficient_order", "control_modes", nullptr
+        "iq_polynomial", "coefficient_order", "control_modes", "parallel", nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOOOOOO|iddLiiOiO",
+            "OOOOOOOOOOO|iddLiiOiOi",
             const_cast<char**>(keywords),
             &h0_data_object,
             &h0_indices_object,
@@ -3477,7 +5104,8 @@ PyObject* native_propagate_csr(PyObject*, PyObject* args, PyObject* kwargs) {
             &sparse_expm,
             &iq_polynomial_object,
             &coefficient_order,
-            &control_modes_object)) {
+            &control_modes_object,
+            &parallel)) {
         return nullptr;
     }
     if (mode != 0 && mode != 1 && mode != 2) {
@@ -3497,6 +5125,10 @@ PyObject* native_propagate_csr(PyObject*, PyObject* args, PyObject* kwargs) {
     }
     if (coefficient_order < 0 || coefficient_order > 3) {
         PyErr_SetString(PyExc_ValueError, "coefficient_order must be between 0 and 3");
+        return nullptr;
+    }
+    if (parallel < 0 || parallel > 2) {
+        PyErr_SetString(PyExc_ValueError, "parallel must be 0 (off), 1 (auto), or 2 (on)");
         return nullptr;
     }
 
@@ -3671,6 +5303,7 @@ PyObject* native_propagate_csr(PyObject*, PyObject* args, PyObject* kwargs) {
     problem.t0 = problem.t_axis[0];
     problem.t_last = problem.t_axis[sample_count - 1];
     problem.sparse = true;
+    problem.parallel_mode = parallel;
     problem.angular_freqs.resize(static_cast<std::size_t>(problem.control_count));
     problem.h0_sparse = {
         h0_data_view.data<cdouble>(),
@@ -3779,16 +5412,17 @@ PyObject* native_propagate_interaction_csr(PyObject*, PyObject* args, PyObject* 
     PyObject* iq_polynomial_object = Py_None;
     int coefficient_order = 1;
     PyObject* control_modes_object = Py_None;
+    int parallel = 1;
     static const char* keywords[] = {
         "diagonal_energies", "controls_data", "indices", "indptr",
         "iq", "t_axis", "initial_states", "lo_freqs",
         "mode", "atol", "rtol", "max_steps", "store_trajectory", "sparse_expm",
-        "iq_polynomial", "coefficient_order", "control_modes", nullptr
+        "iq_polynomial", "coefficient_order", "control_modes", "parallel", nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOOO|iddLiiOiO",
+            "OOOOOOOO|iddLiiOiOi",
             const_cast<char**>(keywords),
             &energies_object,
             &controls_object,
@@ -3806,7 +5440,8 @@ PyObject* native_propagate_interaction_csr(PyObject*, PyObject* args, PyObject* 
             &sparse_expm,
             &iq_polynomial_object,
             &coefficient_order,
-            &control_modes_object)) {
+            &control_modes_object,
+            &parallel)) {
         return nullptr;
     }
     if (mode != 0 && mode != 1 && mode != 2) {
@@ -3826,6 +5461,10 @@ PyObject* native_propagate_interaction_csr(PyObject*, PyObject* args, PyObject* 
     }
     if (coefficient_order < 0 || coefficient_order > 3) {
         PyErr_SetString(PyExc_ValueError, "coefficient_order must be between 0 and 3");
+        return nullptr;
+    }
+    if (parallel < 0 || parallel > 2) {
+        PyErr_SetString(PyExc_ValueError, "parallel must be 0 (off), 1 (auto), or 2 (on)");
         return nullptr;
     }
 
@@ -3992,6 +5631,7 @@ PyObject* native_propagate_interaction_csr(PyObject*, PyObject* args, PyObject* 
     problem.t0 = problem.t_axis[0];
     problem.t_last = problem.t_axis[sample_count - 1];
     problem.interaction_picture = true;
+    problem.parallel_mode = parallel;
     problem.fused_sparse = true;
     problem.interaction_energies = energies_view.data<cdouble>();
     problem.fused_controls = controls_view.data<cdouble>();
@@ -4077,16 +5717,17 @@ PyObject* native_propagate_banded(PyObject*, PyObject* args, PyObject* kwargs) {
     PyObject* iq_polynomial_object = Py_None;
     int coefficient_order = 1;
     PyObject* control_modes_object = Py_None;
+    int parallel = 1;
     static const char* keywords[] = {
         "h0_banded", "controls_banded", "band_offsets",
         "iq", "t_axis", "initial_states", "lo_freqs",
         "mode", "atol", "rtol", "max_steps", "store_trajectory", "sparse_expm",
-        "iq_polynomial", "coefficient_order", "control_modes", nullptr
+        "iq_polynomial", "coefficient_order", "control_modes", "parallel", nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOO|iddLiiOiO",
+            "OOOOOOO|iddLiiOiOi",
             const_cast<char**>(keywords),
             &h0_banded_object,
             &controls_banded_object,
@@ -4103,7 +5744,8 @@ PyObject* native_propagate_banded(PyObject*, PyObject* args, PyObject* kwargs) {
             &sparse_expm,
             &iq_polynomial_object,
             &coefficient_order,
-            &control_modes_object)) {
+            &control_modes_object,
+            &parallel)) {
         return nullptr;
     }
     if (mode != 0 && mode != 1 && mode != 2) {
@@ -4123,6 +5765,10 @@ PyObject* native_propagate_banded(PyObject*, PyObject* args, PyObject* kwargs) {
     }
     if (coefficient_order < 0 || coefficient_order > 3) {
         PyErr_SetString(PyExc_ValueError, "coefficient_order must be between 0 and 3");
+        return nullptr;
+    }
+    if (parallel < 0 || parallel > 2) {
+        PyErr_SetString(PyExc_ValueError, "parallel must be 0 (off), 1 (auto), or 2 (on)");
         return nullptr;
     }
 
@@ -4273,6 +5919,7 @@ PyObject* native_propagate_banded(PyObject*, PyObject* args, PyObject* kwargs) {
     problem.t0 = problem.t_axis[0];
     problem.t_last = problem.t_axis[sample_count - 1];
     problem.banded = true;
+    problem.parallel_mode = parallel;
     problem.h0_banded = h0_view.data<cdouble>();
     problem.controls_banded = controls_view.data<cdouble>();
     problem.band_offsets = band_offsets;
@@ -4351,16 +5998,17 @@ PyObject* native_propagate_fused_csr(PyObject*, PyObject* args, PyObject* kwargs
     PyObject* iq_polynomial_object = Py_None;
     int coefficient_order = 1;
     PyObject* control_modes_object = Py_None;
+    int parallel = 1;
     static const char* keywords[] = {
         "static_data", "indices", "indptr", "controls_data",
         "iq", "t_axis", "initial_states", "lo_freqs",
         "mode", "atol", "rtol", "max_steps", "store_trajectory", "sparse_expm",
-        "iq_polynomial", "coefficient_order", "control_modes", nullptr
+        "iq_polynomial", "coefficient_order", "control_modes", "parallel", nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOOO|iddLiiOiO",
+            "OOOOOOOO|iddLiiOiOi",
             const_cast<char**>(keywords),
             &static_data_object,
             &indices_object,
@@ -4378,7 +6026,8 @@ PyObject* native_propagate_fused_csr(PyObject*, PyObject* args, PyObject* kwargs
             &sparse_expm,
             &iq_polynomial_object,
             &coefficient_order,
-            &control_modes_object)) {
+            &control_modes_object,
+            &parallel)) {
         return nullptr;
     }
     if (mode != 0 && mode != 1 && mode != 2) {
@@ -4398,6 +6047,10 @@ PyObject* native_propagate_fused_csr(PyObject*, PyObject* args, PyObject* kwargs
     }
     if (coefficient_order < 0 || coefficient_order > 3) {
         PyErr_SetString(PyExc_ValueError, "coefficient_order must be between 0 and 3");
+        return nullptr;
+    }
+    if (parallel < 0 || parallel > 2) {
+        PyErr_SetString(PyExc_ValueError, "parallel must be 0 (off), 1 (auto), or 2 (on)");
         return nullptr;
     }
 
@@ -4551,6 +6204,7 @@ PyObject* native_propagate_fused_csr(PyObject*, PyObject* args, PyObject* kwargs
     problem.t0 = problem.t_axis[0];
     problem.t_last = problem.t_axis[sample_count - 1];
     problem.fused_sparse = true;
+    problem.parallel_mode = parallel;
     problem.fused_static = static_view.data<cdouble>();
     problem.fused_controls = controls_view.data<cdouble>();
     problem.fused_indices = indices;
@@ -4612,6 +6266,391 @@ PyObject* native_propagate_fused_csr(PyObject*, PyObject* args, PyObject* kwargs
     return make_native_result(problem, state, trajectory, store_trajectory != 0);
 }
 
+PyObject* native_propagate_lindblad_csr(
+    PyObject*,
+    PyObject* args,
+    PyObject* kwargs) {
+    PyObject* h0_data_object = nullptr;
+    PyObject* h0_indices_object = nullptr;
+    PyObject* h0_indptr_object = nullptr;
+    PyObject* controls_data_object = nullptr;
+    PyObject* controls_indices_object = nullptr;
+    PyObject* controls_indptr_object = nullptr;
+    PyObject* controls_offsets_object = nullptr;
+    PyObject* collapse_data_object = nullptr;
+    PyObject* collapse_indices_object = nullptr;
+    PyObject* collapse_indptr_object = nullptr;
+    PyObject* collapse_offsets_object = nullptr;
+    PyObject* iq_object = nullptr;
+    PyObject* t_axis_object = nullptr;
+    PyObject* initial_object = nullptr;
+    PyObject* lo_freqs_object = nullptr;
+    int mode = 0;
+    double atol = 1e-8;
+    double rtol = 1e-6;
+    long long max_steps = 2000000;
+    int store_trajectory = 0;
+    int sparse_expm = 1;
+    PyObject* iq_polynomial_object = Py_None;
+    int coefficient_order = 1;
+    PyObject* control_modes_object = Py_None;
+    int parallel = 1;
+    static const char* keywords[] = {
+        "h0_data", "h0_indices", "h0_indptr",
+        "controls_data", "controls_indices", "controls_indptr", "controls_offsets",
+        "collapse_data", "collapse_indices", "collapse_indptr", "collapse_offsets",
+        "iq", "t_axis", "initial_states", "lo_freqs",
+        "mode", "atol", "rtol", "max_steps", "store_trajectory", "sparse_expm",
+        "iq_polynomial", "coefficient_order", "control_modes", "parallel", nullptr
+    };
+    if (!PyArg_ParseTupleAndKeywords(
+            args,
+            kwargs,
+            "OOOOOOOOOOOOOOO|iddLiiOiOi",
+            const_cast<char**>(keywords),
+            &h0_data_object,
+            &h0_indices_object,
+            &h0_indptr_object,
+            &controls_data_object,
+            &controls_indices_object,
+            &controls_indptr_object,
+            &controls_offsets_object,
+            &collapse_data_object,
+            &collapse_indices_object,
+            &collapse_indptr_object,
+            &collapse_offsets_object,
+            &iq_object,
+            &t_axis_object,
+            &initial_object,
+            &lo_freqs_object,
+            &mode,
+            &atol,
+            &rtol,
+            &max_steps,
+            &store_trajectory,
+            &sparse_expm,
+            &iq_polynomial_object,
+            &coefficient_order,
+            &control_modes_object,
+            &parallel)) {
+        return nullptr;
+    }
+    if (mode != 0 && mode != 1 && mode != 2) {
+        PyErr_SetString(PyExc_ValueError, "mode must be 0 (RF), 1 (complex envelope), or 2 (mixed)");
+        return nullptr;
+    }
+    if (!std::isfinite(atol) || !std::isfinite(rtol)
+        || !(atol > 0.0) || !(rtol > 0.0) || max_steps < 1) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "atol and rtol must be finite and positive; max_steps must be positive");
+        return nullptr;
+    }
+    if (sparse_expm < 0 || sparse_expm > 2) {
+        PyErr_SetString(PyExc_ValueError, "sparse_expm must be 0 (off), 1 (auto), or 2 (on)");
+        return nullptr;
+    }
+    if (coefficient_order < 0 || coefficient_order > 3) {
+        PyErr_SetString(PyExc_ValueError, "coefficient_order must be between 0 and 3");
+        return nullptr;
+    }
+    if (parallel < 0 || parallel > 2) {
+        PyErr_SetString(PyExc_ValueError, "parallel must be 0 (off), 1 (auto), or 2 (on)");
+        return nullptr;
+    }
+
+    BufferView h0_data_view, h0_indices_view, h0_indptr_view;
+    BufferView controls_data_view, controls_indices_view;
+    BufferView controls_indptr_view, controls_offsets_view;
+    BufferView collapse_data_view, collapse_indices_view;
+    BufferView collapse_indptr_view, collapse_offsets_view;
+    BufferView iq_view, t_view, initial_view, lo_view;
+    BufferView iq_polynomial_view, control_modes_view;
+    const bool has_polynomial = iq_polynomial_object != Py_None;
+    const bool has_control_modes = control_modes_object != Py_None;
+    if (!h0_data_view.acquire(h0_data_object, "h0_data", 1, sizeof(cdouble))
+        || !h0_indices_view.acquire(h0_indices_object, "h0_indices", 1, sizeof(std::int64_t))
+        || !h0_indptr_view.acquire(h0_indptr_object, "h0_indptr", 1, sizeof(std::int64_t))
+        || !controls_data_view.acquire(controls_data_object, "controls_data", 1, sizeof(cdouble))
+        || !controls_indices_view.acquire(controls_indices_object, "controls_indices", 1, sizeof(std::int64_t))
+        || !controls_indptr_view.acquire(controls_indptr_object, "controls_indptr", 2, sizeof(std::int64_t))
+        || !controls_offsets_view.acquire(controls_offsets_object, "controls_offsets", 1, sizeof(std::int64_t))
+        || !collapse_data_view.acquire(collapse_data_object, "collapse_data", 1, sizeof(cdouble))
+        || !collapse_indices_view.acquire(collapse_indices_object, "collapse_indices", 1, sizeof(std::int64_t))
+        || !collapse_indptr_view.acquire(collapse_indptr_object, "collapse_indptr", 2, sizeof(std::int64_t))
+        || !collapse_offsets_view.acquire(collapse_offsets_object, "collapse_offsets", 1, sizeof(std::int64_t))
+        || !iq_view.acquire(iq_object, "iq", 2, sizeof(cdouble))
+        || !t_view.acquire(t_axis_object, "t_axis", 1, sizeof(double))
+        || !initial_view.acquire(initial_object, "initial_states", 2, sizeof(cdouble))
+        || !lo_view.acquire(lo_freqs_object, "lo_freqs", 1, sizeof(double))
+        || (has_polynomial
+            && !iq_polynomial_view.acquire(
+                iq_polynomial_object,
+                "iq_polynomial",
+                3,
+                sizeof(cdouble)))
+        || (has_control_modes
+            && !control_modes_view.acquire(
+                control_modes_object,
+                "control_modes",
+                1,
+                sizeof(std::int64_t)))) {
+        return nullptr;
+    }
+
+    const int n = static_cast<int>(h0_indptr_view.view.shape[0]) - 1;
+    const int control_count = static_cast<int>(controls_indptr_view.view.shape[0]);
+    const int collapse_count = static_cast<int>(collapse_indptr_view.view.shape[0]);
+    const int sample_count = static_cast<int>(iq_view.view.shape[1]);
+    const int batch_count = static_cast<int>(initial_view.view.shape[1]);
+    const std::int64_t h0_nnz = static_cast<std::int64_t>(h0_data_view.view.shape[0]);
+    const std::int64_t controls_nnz = static_cast<std::int64_t>(controls_data_view.view.shape[0]);
+    const std::int64_t collapse_nnz = static_cast<std::int64_t>(collapse_data_view.view.shape[0]);
+    if (n < 1 || h0_indptr_view.view.shape[0] != static_cast<Py_ssize_t>(n + 1)
+        || h0_indices_view.view.shape[0] != static_cast<Py_ssize_t>(h0_nnz)
+        || controls_indptr_view.view.shape[1] != static_cast<Py_ssize_t>(n + 1)
+        || controls_offsets_view.view.shape[0] != static_cast<Py_ssize_t>(control_count + 1)
+        || collapse_count < 1
+        || collapse_indptr_view.view.shape[1] != static_cast<Py_ssize_t>(n + 1)
+        || collapse_offsets_view.view.shape[0] != static_cast<Py_ssize_t>(collapse_count + 1)
+        || iq_view.view.shape[0] != static_cast<Py_ssize_t>(control_count)
+        || t_view.view.shape[0] != static_cast<Py_ssize_t>(sample_count)
+        || lo_view.view.shape[0] != static_cast<Py_ssize_t>(control_count)
+        || initial_view.view.shape[0]
+            != static_cast<Py_ssize_t>(static_cast<std::size_t>(n) * n)
+        || sample_count < 1 || batch_count < 1) {
+        PyErr_SetString(PyExc_ValueError, "Lindblad CSR array shapes are inconsistent");
+        return nullptr;
+    }
+    std::int64_t validated_h0_nnz = 0;
+    bool validated_h0_diagonal = false;
+    bool validated_h0_diagonal_single = false;
+    if (!validate_sparse_matrix(
+            h0_data_view,
+            h0_indices_view,
+            h0_indptr_view,
+            n,
+            "h0",
+            h0_nnz,
+            &validated_h0_nnz,
+            &validated_h0_diagonal,
+            &validated_h0_diagonal_single)) {
+        return nullptr;
+    }
+    if (!validate_csr_bundle(
+            controls_data_view.data<cdouble>(),
+            controls_indices_view.data<std::int64_t>(),
+            controls_indptr_view.data<std::int64_t>(),
+            controls_offsets_view.data<std::int64_t>(),
+            control_count,
+            n,
+            controls_nnz,
+            "controls")) {
+        return nullptr;
+    }
+    if (!validate_csr_bundle(
+            collapse_data_view.data<cdouble>(),
+            collapse_indices_view.data<std::int64_t>(),
+            collapse_indptr_view.data<std::int64_t>(),
+            collapse_offsets_view.data<std::int64_t>(),
+            collapse_count,
+            n,
+            collapse_nnz,
+            "collapse")) {
+        return nullptr;
+    }
+    if (has_polynomial) {
+        if (!validate_polynomial_view(
+                iq_polynomial_view,
+                control_count,
+                std::max(0, sample_count - 1),
+                coefficient_order)) {
+            return nullptr;
+        }
+    } else if (coefficient_order != 1 && control_count > 0) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "iq_polynomial is required when coefficient_order is not 1");
+        return nullptr;
+    }
+    if (has_control_modes) {
+        if (!validate_control_modes_view(control_modes_view, control_count)) {
+            return nullptr;
+        }
+    } else if (mode == 2 && control_count > 0) {
+        PyErr_SetString(PyExc_ValueError, "control_modes is required for mixed mode");
+        return nullptr;
+    }
+
+    const std::size_t iq_size = static_cast<std::size_t>(control_count) * sample_count;
+    const std::size_t initial_size = static_cast<std::size_t>(n) * n * batch_count;
+    for (std::size_t index = 0; index < iq_size; ++index) {
+        if (!finite_value(iq_view.data<cdouble>()[index])) {
+            PyErr_SetString(PyExc_ValueError, "iq must contain only finite values");
+            return nullptr;
+        }
+    }
+    for (std::size_t index = 0; index < initial_size; ++index) {
+        if (!finite_value(initial_view.data<cdouble>()[index])) {
+            PyErr_SetString(PyExc_ValueError, "initial_states must contain only finite values");
+            return nullptr;
+        }
+    }
+    for (int index = 0; index < sample_count; ++index) {
+        if (!std::isfinite(t_view.data<double>()[index])) {
+            PyErr_SetString(PyExc_ValueError, "t_axis must contain only finite values");
+            return nullptr;
+        }
+    }
+    for (int index = 0; index < control_count; ++index) {
+        if (!std::isfinite(lo_view.data<double>()[index])) {
+            PyErr_SetString(PyExc_ValueError, "lo_freqs must contain only finite values");
+            return nullptr;
+        }
+    }
+
+    Problem problem;
+    problem.n = n;
+    problem.control_count = control_count;
+    problem.sample_count = sample_count;
+    problem.batch_count = batch_count;
+    problem.iq = iq_view.data<cdouble>();
+    problem.t_axis = t_view.data<double>();
+    problem.lo_freqs = lo_view.data<double>();
+    problem.mode = mode;
+    problem.atol = atol;
+    problem.rtol = rtol;
+    problem.max_steps = static_cast<std::int64_t>(max_steps);
+    problem.sparse_expm_mode = sparse_expm;
+    problem.parallel_mode = parallel;
+    problem.coefficient_order = coefficient_order;
+    problem.polynomial_interval_count = std::max(0, sample_count - 1);
+    problem.iq_polynomial = has_polynomial
+        ? iq_polynomial_view.data<cdouble>()
+        : nullptr;
+    problem.control_modes = has_control_modes
+        ? control_modes_view.data<std::int64_t>()
+        : nullptr;
+    problem.t0 = problem.t_axis[0];
+    problem.t_last = problem.t_axis[sample_count - 1];
+    problem.lindblad = true;
+    problem.lindblad_collapse_count = collapse_count;
+    problem.sparse = true;
+    problem.h0_sparse = {
+        h0_data_view.data<cdouble>(),
+        h0_indices_view.data<std::int64_t>(),
+        h0_indptr_view.data<std::int64_t>(),
+        h0_nnz,
+        validated_h0_diagonal,
+        validated_h0_diagonal_single,
+    };
+    const auto* control_offsets = controls_offsets_view.data<std::int64_t>();
+    const auto* control_indptr = controls_indptr_view.data<std::int64_t>();
+    const auto* controls_data_base = controls_data_view.data<cdouble>();
+    const auto* controls_indices_base = controls_indices_view.data<std::int64_t>();
+    problem.controls_sparse.reserve(static_cast<std::size_t>(control_count));
+    for (int control = 0; control < control_count; ++control) {
+        const std::int64_t offset = control_offsets[control];
+        const std::int64_t count = control_offsets[control + 1] - offset;
+        problem.controls_sparse.push_back({
+            controls_data_base == nullptr ? nullptr : controls_data_base + offset,
+            controls_indices_base == nullptr ? nullptr : controls_indices_base + offset,
+            control_indptr + static_cast<std::size_t>(control) * (n + 1),
+            count,
+            false,
+            false,
+        });
+        problem.angular_freqs.push_back(2.0 * kPi * problem.lo_freqs[control]);
+        problem.max_frequency = std::max(
+            problem.max_frequency,
+            std::abs(problem.lo_freqs[control]));
+    }
+    const auto* collapse_offsets = collapse_offsets_view.data<std::int64_t>();
+    const auto* collapse_indptr = collapse_indptr_view.data<std::int64_t>();
+    const auto* collapse_data = collapse_data_view.data<cdouble>();
+    const auto* collapse_indices = collapse_indices_view.data<std::int64_t>();
+    problem.lindblad_collapse.reserve(static_cast<std::size_t>(collapse_count));
+    problem.lindblad_products.reserve(static_cast<std::size_t>(collapse_count));
+    for (int collapse_index = 0; collapse_index < collapse_count; ++collapse_index) {
+        const std::int64_t offset = collapse_offsets[collapse_index];
+        const std::int64_t count = collapse_offsets[collapse_index + 1] - offset;
+        OwnedSparseMatrix collapse = copy_owned_sparse(
+            collapse_data == nullptr ? nullptr : collapse_data + offset,
+            collapse_indices == nullptr ? nullptr : collapse_indices + offset,
+            collapse_indptr + static_cast<std::size_t>(collapse_index) * (n + 1),
+            n,
+            count);
+        OwnedSparseMatrix dagger = conjugate_transpose_sparse(collapse, n);
+        OwnedSparseMatrix product = sparse_matrix_product(dagger, collapse, n);
+        problem.lindblad_collapse.push_back(std::move(collapse));
+        problem.lindblad_products.push_back(std::move(product));
+    }
+    problem.lindblad_jump_patterns.reserve(static_cast<std::size_t>(collapse_count));
+    constexpr std::size_t kJumpPatternBudgetBytes = 64u * 1024u * 1024u;
+    std::size_t jump_pattern_budget = kJumpPatternBudgetBytes;
+    for (const OwnedSparseMatrix& collapse : problem.lindblad_collapse) {
+        const std::size_t entry_budget = jump_pattern_budget
+            / std::max<std::size_t>(sizeof(LindbladJumpEntry), 1u);
+        LindbladJumpPattern pattern = build_lindblad_jump_pattern(
+            collapse, n, std::min<std::size_t>(entry_budget, 1u * 1024u * 1024u));
+        if (pattern.ready) {
+            const std::size_t bytes = pattern.entries.size()
+                * sizeof(LindbladJumpEntry)
+                + pattern.row_ptr.size() * sizeof(std::int64_t);
+            if (bytes > jump_pattern_budget) {
+                pattern = LindbladJumpPattern();
+            } else {
+                jump_pattern_budget -= bytes;
+            }
+        }
+        problem.lindblad_jump_patterns.push_back(std::move(pattern));
+    }
+    problem.detect_diagonal_sparse();
+    problem.detect_lindblad_diagonal();
+    if (sample_count > 1) {
+        problem.source_dt = problem.t_axis[1] - problem.t_axis[0];
+        if (!(problem.source_dt > 0.0)) {
+            PyErr_SetString(PyExc_ValueError, "t_axis must be strictly increasing");
+            return nullptr;
+        }
+        for (int index = 2; index < sample_count; ++index) {
+            const double delta = problem.t_axis[index] - problem.t_axis[index - 1];
+            if (!(delta > 0.0)) {
+                PyErr_SetString(PyExc_ValueError, "t_axis must be strictly increasing");
+                return nullptr;
+            }
+        }
+        problem.inv_source_dt = 1.0 / problem.source_dt;
+        problem.prepare_slopes();
+    } else {
+        problem.source_dt = 1.0;
+        problem.inv_source_dt = 1.0;
+    }
+    problem.prepare_frequency_cache();
+    std::vector<cdouble> state(initial_size);
+    std::copy(
+        initial_view.data<cdouble>(),
+        initial_view.data<cdouble>() + state.size(),
+        state.begin());
+    Workspace workspace;
+    workspace.resize(state.size(), 0);
+    workspace.resize_scales(static_cast<std::size_t>(problem.control_count));
+    workspace.resize_carrier_phases(problem.unique_angular_freqs.size());
+    std::vector<cdouble> trajectory;
+    std::string error_message;
+    if (!run_integration(
+            problem,
+            state,
+            workspace,
+            store_trajectory != 0,
+            trajectory,
+            error_message)) {
+        PyErr_SetString(PyExc_RuntimeError, error_message.c_str());
+        return nullptr;
+    }
+    return make_native_result(problem, state, trajectory, store_trajectory != 0);
+}
+
 PyMethodDef module_methods[] = {
     {
         "propagate",
@@ -4642,6 +6681,12 @@ PyMethodDef module_methods[] = {
         reinterpret_cast<PyCFunction>(native_propagate_interaction_csr),
         METH_VARARGS | METH_KEYWORDS,
         "Propagate coherent ket states in an exact diagonal interaction picture.",
+    },
+    {
+        "propagate_lindblad_csr",
+        reinterpret_cast<PyCFunction>(native_propagate_lindblad_csr),
+        METH_VARARGS | METH_KEYWORDS,
+        "Propagate density matrices with a matrix-free exact Lindblad CSR kernel.",
     },
     {nullptr, nullptr, 0, nullptr},
 };

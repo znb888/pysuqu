@@ -53,6 +53,11 @@ try:
 except (ImportError, ModuleNotFoundError, OSError):
     _native_propagate_interaction_csr = None
 
+try:
+    from ..._native import propagate_lindblad_csr as _native_propagate_lindblad_csr
+except (ImportError, ModuleNotFoundError, OSError):
+    _native_propagate_lindblad_csr = None
+
 
 # Prepared plans are immutable after construction.  A small process-local LRU
 # therefore lets repeated gate/fidelity calls share the expensive Qobj -> CSR,
@@ -118,7 +123,7 @@ def cpp_interaction_backend_available() -> bool:
 
 def cpp_lindblad_backend_available() -> bool:
     """Return whether the native Lindblad wrapper can delegate to C++."""
-    return cpp_backend_available()
+    return callable(_native_propagate_lindblad_csr) or cpp_backend_available()
 
 
 def _qobj_matrix(value: qt.Qobj) -> np.ndarray:
@@ -260,37 +265,46 @@ def _fused_csr_bundle_from_components(
     pointers.  Structural zeros are retained in the value planes so the
     operation remains mathematically identical to applying each input matrix.
     """
-    coordinates = set()
-    for _, indices, indptr in matrices:
-        for row in range(n):
-            begin = int(indptr[row])
-            end = int(indptr[row + 1])
-            coordinates.update((row, int(column)) for column in indices[begin:end])
-    ordered = sorted(coordinates)
-    row_ptr = np.zeros(n + 1, dtype=np.int64)
-    for row, _ in ordered:
-        row_ptr[row + 1] += 1
-    np.cumsum(row_ptr, out=row_ptr)
-    indices = np.ascontiguousarray(
-        np.array([column for _, column in ordered], dtype=np.int64)
-    )
-    position = {coordinate: index for index, coordinate in enumerate(ordered)}
-    static_values = np.zeros(len(ordered), dtype=np.complex128)
-    control_values = np.zeros(
-        (max(0, len(matrices) - 1), len(ordered)),
-        dtype=np.complex128,
-    )
-    for operator_index, (data, matrix_indices, indptr) in enumerate(matrices):
+    # Row-major integer keys let NumPy build and map the sorted union without
+    # per-nonzero Python tuples.  Keep a pair-key fallback for int64 overflow.
+    pair_keys = n > math.isqrt(np.iinfo(np.int64).max)
+    key_dtype = [("row", np.int64), ("column", np.int64)] if pair_keys else np.int64
+    keys = np.empty(sum(len(data) for data, _, _ in matrices), dtype=key_dtype)
+    row_numbers = np.arange(n, dtype=np.int64)
+    offset = 0
+    for data, matrix_indices, indptr in matrices:
+        end = offset + len(data)
+        rows = np.repeat(row_numbers, np.diff(indptr))
+        if pair_keys:
+            keys["row"][offset:end] = rows
+            keys["column"][offset:end] = matrix_indices
+        else:
+            keys[offset:end] = rows * n + matrix_indices
+        offset = end
+    union, positions = np.unique(keys, return_inverse=True)
+    if pair_keys:
+        rows, indices = union["row"], union["column"]
+    elif n:
+        rows, indices = np.divmod(union, n)
+    else:
+        rows = indices = np.empty(0, dtype=np.int64)
+    row_ptr = np.empty(n + 1, dtype=np.int64)
+    row_ptr[0] = 0
+    np.cumsum(np.bincount(rows, minlength=n), out=row_ptr[1:])
+    static_values = np.zeros(len(union), dtype=np.complex128)
+    control_values = np.zeros((max(0, len(matrices) - 1), len(union)), dtype=np.complex128)
+    offset = 0
+    for operator_index, (data, _, _) in enumerate(matrices):
         target = static_values if operator_index == 0 else control_values[operator_index - 1]
-        for row in range(n):
-            begin = int(indptr[row])
-            end = int(indptr[row + 1])
-            for entry in range(begin, end):
-                target[position[(row, int(matrix_indices[entry]))]] += data[entry]
+        end = offset + len(data)
+        # add.at retains input-order accumulation, including duplicate entries
+        # in noncanonical CSR input, rather than changing cancellation order.
+        np.add.at(target, positions[offset:end], data)
+        offset = end
     return (
         np.ascontiguousarray(static_values, dtype=np.complex128),
         np.ascontiguousarray(control_values, dtype=np.complex128),
-        indices,
+        np.ascontiguousarray(indices, dtype=np.int64),
         np.ascontiguousarray(row_ptr, dtype=np.int64),
     )
 
@@ -716,6 +730,26 @@ def _split_csr_bundle(bundle, n_controls: int):
         dtype=np.int64,
     )
     return h0, (control_data, control_indices, control_indptr, control_offsets)
+
+
+def _native_lindblad_csr_components(prepared):
+    """Pack the physical Hamiltonian/collapse operators for the matrix-free ABI."""
+    n = int(prepared.static_hamiltonian.shape[0])
+    hamiltonian_components = [_qobj_csr(prepared.static_hamiltonian)]
+    hamiltonian_components.extend(_qobj_csr(term.operator) for term in prepared.drive_terms)
+    hamiltonian_bundle = _csr_bundle_from_components(hamiltonian_components, n=n)
+    h0, controls = _split_csr_bundle(hamiltonian_bundle, len(prepared.drive_terms))
+    collapse_components = []
+    for raw_operator in prepared.c_ops:
+        collapse_components.append(
+            _qobj_csr(_static_collapse_operator(raw_operator, n))
+        )
+    if not collapse_components:
+        raise UnsupportedBackendError(
+            "matrix-free native Lindblad propagation requires at least one collapse operator"
+        )
+    collapse_bundle = _csr_bundle_from_components(collapse_components, n=n)
+    return h0, controls, collapse_bundle
 
 
 def _decode_complex_payload(payload, shape):
@@ -2386,6 +2420,8 @@ class CppPropagationBackend:
                 legacy.pop("iq_polynomial", None)
             if legacy.get("coefficient_order") == 1:
                 legacy.pop("coefficient_order", None)
+            if legacy.get("parallel") == 1:
+                legacy.pop("parallel", None)
             modes = legacy.get("control_modes")
             if modes is None or (
                 isinstance(modes, np.ndarray)
@@ -2417,6 +2453,11 @@ class CppPropagationBackend:
                 "auto": 1,
                 "on": 2,
             }.get(str(getattr(self.prepared.options, "sparse_expm", "auto")).lower(), 1),
+            "parallel": {
+                "off": 0,
+                "auto": 1,
+                "on": 2,
+            }.get(str(getattr(self.prepared.options, "parallel", "auto")).lower(), 1),
             "iq_polynomial": plan.iq_polynomial,
             "coefficient_order": int(plan.coefficient_order),
             "control_modes": plan.control_modes,
@@ -2702,11 +2743,6 @@ class LindbladCppPropagationBackend:
         dimension = int(prepared.static_hamiltonian.shape[0])
         if prepared.static_hamiltonian.shape != (dimension, dimension):
             raise UnsupportedBackendError("native Lindblad propagation requires a square Hamiltonian")
-        effective_static, effective_drives = _lindblad_effective_operators(
-            prepared.static_hamiltonian,
-            prepared.drive_terms,
-            prepared.c_ops,
-        )
         extra = dict(getattr(prepared.options, "extra", {}) or {})
         # A density-vector's Euclidean norm is not its trace.  Disable the ket
         # adapter's optional norm correction and preserve the Lindblad trace
@@ -2716,21 +2752,54 @@ class LindbladCppPropagationBackend:
             prepared.options,
             backend="cpp",
             frame="lab",
+            matrix_format="csr",
+            sparse_kernel="standard",
             block_decompose="off",
             extra=extra,
         )
         self.prepared = prepared
         self.dimension = dimension
-        self._proxy = PreparedPropagation(
-            effective_static,
-            effective_drives,
-            prepared.tlist,
-            c_ops=[],
-            options=proxy_options,
-            args=prepared.args,
-            backend="cpp",
-        )
-        self._backend = CppPropagationBackend.from_prepared(self._proxy)
+        self._direct = callable(_native_propagate_lindblad_csr)
+        self._proxy = None
+        self._backend = None
+        self._direct_plan = None
+        self._direct_h0 = None
+        self._direct_controls = None
+        self._direct_collapses = None
+        if self._direct:
+            # A coherent proxy is used only for the shared trace/grid plan;
+            # the native call below applies the physical Lindblad equation
+            # directly and never uses its Hamiltonian as a Liouvillian.
+            self._proxy = PreparedPropagation(
+                prepared.static_hamiltonian,
+                prepared.drive_terms,
+                prepared.tlist,
+                c_ops=[],
+                options=proxy_options,
+                args=prepared.args,
+                backend="cpp",
+            )
+            self._backend = CppPropagationBackend.from_prepared(self._proxy)
+            self._direct_plan = self._backend._ensure_plan()
+            self._direct_h0, self._direct_controls, self._direct_collapses = (
+                _native_lindblad_csr_components(prepared)
+            )
+        else:
+            effective_static, effective_drives = _lindblad_effective_operators(
+                prepared.static_hamiltonian,
+                prepared.drive_terms,
+                prepared.c_ops,
+            )
+            self._proxy = PreparedPropagation(
+                effective_static,
+                effective_drives,
+                prepared.tlist,
+                c_ops=[],
+                options=proxy_options,
+                args=prepared.args,
+                backend="cpp",
+            )
+            self._backend = CppPropagationBackend.from_prepared(self._proxy)
 
     def _density(self, state: qt.Qobj) -> Tuple[qt.Qobj, Any]:
         if not isinstance(state, qt.Qobj):
@@ -2760,7 +2829,10 @@ class LindbladCppPropagationBackend:
         )
 
     def _density_state(self, vector_state: qt.Qobj, dims) -> qt.Qobj:
-        vector = np.asarray(vector_state.full(), dtype=np.complex128).reshape(-1)
+        return self._density_array(vector_state.full(), dims)
+
+    def _density_array(self, values: np.ndarray, dims) -> qt.Qobj:
+        vector = np.asarray(values, dtype=np.complex128).reshape(-1)
         if vector.size != self.dimension * self.dimension:
             raise ValueError("native Lindblad result has an invalid vector dimension")
         matrix = np.asarray(
@@ -2769,7 +2841,133 @@ class LindbladCppPropagationBackend:
         )
         return qt.Qobj(matrix, dims=dims)
 
+    def _direct_native_call(self, initial_matrix: np.ndarray):
+        """Invoke the matrix-free Lindblad extension for one batch payload."""
+        plan = self._direct_plan
+        if plan is None or self._direct_h0 is None or self._direct_controls is None:
+            raise BackendUnavailable("native Lindblad plan is not initialized")
+        if _native_propagate_lindblad_csr is None:
+            raise BackendUnavailable("the matrix-free Lindblad extension is unavailable")
+        h0_data, h0_indices, h0_indptr = self._direct_h0
+        controls_data, controls_indices, controls_indptr, controls_offsets = self._direct_controls
+        collapse_data, collapse_indices, collapse_indptr, collapse_offsets, _ = self._direct_collapses
+        common = {
+            "mode": int(plan.mode),
+            "atol": float(self.prepared.options.atol),
+            "rtol": float(self.prepared.options.rtol),
+            "max_steps": int(self.prepared.options.extra.get("native_max_steps", 2_000_000)),
+            "store_trajectory": bool(self.prepared.options.store_states),
+            "sparse_expm": {
+                "off": 0,
+                "auto": 1,
+                "on": 2,
+            }.get(str(getattr(self.prepared.options, "sparse_expm", "auto")).lower(), 1),
+            "iq_polynomial": plan.iq_polynomial,
+            "coefficient_order": int(plan.coefficient_order),
+            "control_modes": plan.control_modes,
+            "parallel": {
+                "off": 0,
+                "auto": 1,
+                "on": 2,
+            }.get(str(getattr(self.prepared.options, "parallel", "auto")).lower(), 1),
+        }
+        return self._backend._invoke_native(
+            _native_propagate_lindblad_csr,
+            h0_data,
+            h0_indices,
+            h0_indptr,
+            controls_data,
+            controls_indices,
+            controls_indptr,
+            controls_offsets,
+            collapse_data,
+            collapse_indices,
+            collapse_indptr,
+            collapse_offsets,
+            plan.iq,
+            plan.t_axis,
+            np.ascontiguousarray(initial_matrix, dtype=np.complex128),
+            plan.lo_freqs,
+            **common,
+        )
+
+    def _direct_result(self, initial_states: Sequence[qt.Qobj]):
+        states = list(initial_states)
+        densities = []
+        dims = []
+        for state in states:
+            density, state_dims = self._density(state)
+            densities.append(
+                np.asarray(density.full(), dtype=np.complex128).reshape(-1, order="F")
+            )
+            dims.append(state_dims)
+        initial_matrix = np.ascontiguousarray(np.column_stack(densities), dtype=np.complex128)
+        final_payload, trajectory_payload, native_stats = self._direct_native_call(initial_matrix)
+        plan = self._direct_plan
+        batch_count = len(states)
+        final_vectors = _decode_complex_payload(
+            final_payload,
+            (self.dimension * self.dimension, batch_count),
+        )
+        final_states = []
+        for index in range(batch_count):
+            final_states.append(
+                self._density_array(final_vectors[:, index], dims[index])
+            )
+        trajectory = _decode_complex_payload(
+            trajectory_payload,
+            (len(plan.t_axis), self.dimension * self.dimension, batch_count),
+        )
+        if trajectory is not None and plan.output_indices is not None:
+            trajectory = trajectory[np.asarray(plan.output_indices, dtype=np.int64)]
+        output_times = np.array(
+            plan.output_t_axis if plan.output_t_axis is not None else plan.t_axis,
+            copy=True,
+        )
+        per_state = []
+        for index in range(batch_count):
+            item_states = []
+            if trajectory is not None:
+                item_states = [
+                    self._density_array(sample[:, index], dims[index])
+                    for sample in trajectory
+                ]
+            stats = dict(native_stats or {})
+            stats.update(
+                {
+                    "open_system": "lindblad",
+                    "liouvillian_dimension": self.dimension * self.dimension,
+                    "collapse_operators": len(self.prepared.c_ops),
+                    "matrix_free": True,
+                }
+            )
+            per_state.append(
+                NativePropagationResult(
+                    final_state=final_states[index],
+                    states=item_states,
+                    times=np.array(output_times, copy=True),
+                    stats=stats,
+                )
+            )
+        stats = dict(native_stats or {})
+        stats.update(
+            {
+                "open_system": "lindblad",
+                "liouvillian_dimension": self.dimension * self.dimension,
+                "collapse_operators": len(self.prepared.c_ops),
+                "matrix_free": True,
+            }
+        )
+        return BatchPropagationResult(
+            final_states=final_states,
+            results=per_state,
+            times=output_times,
+            stats=stats,
+        )
+
     def propagate(self, initial_state: qt.Qobj) -> NativePropagationResult:
+        if self._direct:
+            return self._direct_result([initial_state]).results[0]
         density, dims = self._density(initial_state)
         result = self._backend.propagate(self._vector_state(density))
         states = [self._density_state(item, dims) for item in result.states]
@@ -2792,6 +2990,8 @@ class LindbladCppPropagationBackend:
         states = list(initial_states)
         if not states:
             return BatchPropagationResult([], [], np.array(self.prepared.tlist, copy=True), {})
+        if self._direct:
+            return self._direct_result(states)
         densities = []
         dims = []
         for state in states:
