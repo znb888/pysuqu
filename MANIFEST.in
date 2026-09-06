@@ -1,5 +1,6 @@
 include LICENSE
 include README.md
+recursive-include native *.cpp *.h *.hpp CMakeLists.txt
 recursive-include docs *.md *.svg
 recursive-include demo *.md *.ipynb *.csv
 recursive-include benchmarks *.py

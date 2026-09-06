@@ -1,12 +1,28 @@
 ﻿from pathlib import Path
 
-from setuptools import find_packages, setup
+import os
+
+from setuptools import Extension, find_packages, setup
 
 
 ROOT = Path(__file__).resolve().parent
 ABOUT = {}
 exec((ROOT / "pysuqu" / "version.py").read_text(encoding="utf-8"), ABOUT)
 README = (ROOT / "README.md").read_text(encoding="utf-8")
+
+
+def native_extensions():
+    """Enable native propagation explicitly while keeping compiler-free installs."""
+    if os.environ.get("PYSUQU_BUILD_NATIVE", "0").lower() not in {"1", "true", "yes", "on"}:
+        return []
+    compile_args = ["/O2", "/std:c++17"] if os.name == "nt" else ["-O3", "-std=c++17", "-pthread"]
+    return [Extension(
+        "pysuqu._native._dynamics",
+        sources=["native/dynamics.cpp"],
+        language="c++",
+        extra_compile_args=compile_args,
+        extra_link_args=[] if os.name == "nt" else ["-pthread"],
+    )]
 
 
 setup(
@@ -21,6 +37,7 @@ setup(
     license="GNU Affero General Public License v3 or later (AGPLv3+)",
     license_files=["LICENSE"],
     packages=find_packages(include=("pysuqu", "pysuqu.*")),
+    ext_modules=native_extensions(),
     python_requires=">=3.8",
     install_requires=[
         "matplotlib>=3.4.0",

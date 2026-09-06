@@ -634,7 +634,10 @@ class PreparedPropagation:
             if not native_backend_available():
                 raise BackendUnavailable("The optional C++ propagation extension is unavailable.")
             if self.c_ops:
-                from .backends.cpp_backend import LindbladCppPropagationBackend
+                try:
+                    from .backends.cpp_backend import LindbladCppPropagationBackend
+                except ImportError as exc:
+                    raise UnsupportedBackendError("This native backend does not support collapse operators.") from exc
 
                 self._native_backend = LindbladCppPropagationBackend(self)
             else:
