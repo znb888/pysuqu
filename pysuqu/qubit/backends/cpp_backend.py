@@ -7,7 +7,11 @@ receive a precise error when the extension has not been built.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from collections import OrderedDict
+import hashlib
+import math
+import threading
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
@@ -16,6 +20,9 @@ import qutip as qt
 from ..propagation import (
     BackendUnavailable,
     BatchPropagationResult,
+    DriveTerm,
+    PreparedPropagation,
+    PropagationOptions,
     UnsupportedBackendError,
     _validate_trace,
 )
@@ -47,6 +54,44 @@ except (ImportError, ModuleNotFoundError, OSError):
     _native_propagate_interaction_csr = None
 
 
+# Prepared plans are immutable after construction.  A small process-local LRU
+# therefore lets repeated gate/fidelity calls share the expensive Qobj -> CSR,
+# band, union-pattern, and interaction-basis preparation work.  The cache is
+# deliberately kept in this adapter (rather than the extension) so importing
+# pysuqu remains safe when the optional native module is absent.
+_PLAN_CACHE: "OrderedDict[bytes, _NativePlan]" = OrderedDict()
+_PLAN_CACHE_LOCK = threading.RLock()
+
+
+def clear_native_plan_cache() -> None:
+    """Drop all process-local immutable native propagation plans."""
+    with _PLAN_CACHE_LOCK:
+        _PLAN_CACHE.clear()
+
+
+def native_plan_cache_info() -> Dict[str, int]:
+    """Return a snapshot of the native plan cache size and entry count."""
+    with _PLAN_CACHE_LOCK:
+        return {"entries": len(_PLAN_CACHE)}
+
+
+def _hash_array(hasher, value: Any) -> None:
+    array = np.ascontiguousarray(np.asarray(value))
+    hasher.update(str(array.dtype).encode("ascii"))
+    hasher.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+    hasher.update(array.tobytes(order="C"))
+
+
+def _hash_qobj(hasher, value: qt.Qobj) -> None:
+    hasher.update(str(tuple(value.shape)).encode("ascii"))
+    # Hash the canonical sparse representation.  This makes equivalent Qobj
+    # storage formats share one plan while preserving every nonzero exactly.
+    data, indices, indptr = _qobj_csr(value)
+    _hash_array(hasher, data)
+    _hash_array(hasher, indices)
+    _hash_array(hasher, indptr)
+
+
 def cpp_backend_available() -> bool:
     return callable(_native_propagate)
 
@@ -71,6 +116,11 @@ def cpp_interaction_backend_available() -> bool:
     return callable(_native_propagate_interaction_csr)
 
 
+def cpp_lindblad_backend_available() -> bool:
+    """Return whether the native Lindblad wrapper can delegate to C++."""
+    return cpp_backend_available()
+
+
 def _qobj_matrix(value: qt.Qobj) -> np.ndarray:
     data = np.asarray(value.full(), dtype=np.complex128)
     if not np.all(np.isfinite(data)):
@@ -88,7 +138,9 @@ def _qobj_csr(value: qt.Qobj) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     data = getattr(value, "data", None)
     as_scipy = getattr(data, "as_scipy", None)
     as_ndarray = getattr(data, "as_ndarray", None)
-    if callable(as_scipy):
+    if data is None:
+        source = value.full()
+    elif callable(as_scipy):
         source = as_scipy()
     elif callable(as_ndarray):
         source = as_ndarray()
@@ -106,6 +158,17 @@ def _qobj_csr(value: qt.Qobj) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if not np.all(np.isfinite(values)):
         raise ValueError("Native Hamiltonian and drive operators must contain finite values.")
     return values, indices, indptr
+
+
+def _qobj_from_sparse(matrix) -> qt.Qobj:
+    """Construct a Qobj from SciPy sparse data across QuTiP/stub versions."""
+    try:
+        return qt.Qobj(matrix)
+    except (TypeError, ValueError):
+        toarray = getattr(matrix, "toarray", None)
+        if not callable(toarray):
+            raise
+        return qt.Qobj(np.asarray(toarray(), dtype=np.complex128))
 
 
 def _csr_to_dense(
@@ -276,6 +339,257 @@ def _diagonal_from_csr(
     return True, diagonal
 
 
+def _connected_components(
+    static_operator: qt.Qobj,
+    drive_operators: Sequence[qt.Qobj],
+) -> List[np.ndarray]:
+    """Find exact invariant coordinate blocks in the operator union.
+
+    An edge is present whenever any operator contains a mathematically
+    nonzero off-diagonal entry.  The graph is treated as undirected because a
+    one-way matrix entry still couples the corresponding invariant subspaces.
+    No numerical threshold is used: tiny entries remain physical couplings.
+    """
+    n = int(static_operator.shape[0])
+    parent = list(range(n))
+
+    def find(index: int) -> int:
+        root = index
+        while parent[root] != root:
+            root = parent[root]
+        while parent[index] != index:
+            next_index = parent[index]
+            parent[index] = root
+            index = next_index
+        return root
+
+    def union(left: int, right: int) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for operator in (static_operator, *drive_operators):
+        _data, indices, indptr = _qobj_csr(operator)
+        for row in range(n):
+            begin = int(indptr[row])
+            end = int(indptr[row + 1])
+            for entry in range(begin, end):
+                column = int(indices[entry])
+                if column != row:
+                    union(row, column)
+    groups: Dict[int, List[int]] = {}
+    for index in range(n):
+        groups.setdefault(find(index), []).append(index)
+    return [np.asarray(indices, dtype=np.int64) for indices in groups.values()]
+
+
+def _conjugate_trace(trace: Any) -> Any:
+    """Return a trace with conjugated samples while preserving its metadata."""
+    values = np.conj(np.asarray(getattr(trace, "values"), dtype=np.complex128))
+    clone = getattr(trace, "clone", None)
+    if callable(clone):
+        return clone(values=values)
+    try:
+        from ...funclib.transmission import SignalTrace
+
+        return SignalTrace(
+            t_axis=np.asarray(trace.t_axis, dtype=np.float64),
+            values=values,
+            sample_rate=float(trace.sample_rate),
+            domain=trace.domain,
+            plane=trace.plane,
+            lo_freq=float(getattr(trace, "lo_freq", 0.0) or 0.0),
+            label=str(getattr(trace, "label", "signal")),
+            metadata=dict(getattr(trace, "metadata", {}) or {}),
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise UnsupportedBackendError(
+            "native Lindblad propagation requires trace objects that can be conjugated"
+        ) from exc
+
+
+def _slice_operator(operator: qt.Qobj, indices: np.ndarray) -> qt.Qobj:
+    try:
+        from scipy import sparse
+
+        data, columns, indptr = _qobj_csr(operator)
+        matrix = sparse.csr_matrix(
+            (data, columns, indptr),
+            shape=operator.shape,
+        )
+        sliced = matrix[indices, :][:, indices].tocsr()
+        sliced.sum_duplicates()
+        sliced.eliminate_zeros()
+        sliced.sort_indices()
+        return _qobj_from_sparse(sliced)
+    except (BackendUnavailable, TypeError, ValueError):
+        matrix = _qobj_matrix(operator)
+        sliced = matrix[np.ix_(indices, indices)]
+        return qt.Qobj(np.ascontiguousarray(sliced, dtype=np.complex128))
+
+
+def _transform_block_diagonal_basis(
+    operator: qt.Qobj,
+    basis: np.ndarray,
+    components: Sequence[np.ndarray],
+) -> np.ndarray:
+    """Compute B^H A B using block structure without dense n^3 products."""
+    try:
+        from scipy import sparse
+
+        data, columns, indptr = _qobj_csr(operator)
+        source = sparse.csr_matrix((data, columns, indptr), shape=operator.shape)
+        result = np.zeros(operator.shape, dtype=np.complex128)
+        for column_indices in components:
+            block_basis = basis[np.ix_(column_indices, column_indices)]
+            intermediate = source[:, column_indices].dot(block_basis)
+            for row_indices in components:
+                row_basis = basis[np.ix_(row_indices, row_indices)]
+                result[np.ix_(row_indices, column_indices)] = (
+                    row_basis.conj().T @ intermediate[row_indices, :]
+                )
+        return np.ascontiguousarray(result, dtype=np.complex128)
+    except (BackendUnavailable, TypeError, ValueError):
+        matrix = _qobj_matrix(operator)
+        return np.ascontiguousarray(basis.conj().T @ matrix @ basis, dtype=np.complex128)
+
+
+def _static_collapse_operator(value: Any, dimension: int) -> qt.Qobj:
+    """Normalize one static collapse-operator specification.
+
+    QuTiP also accepts ``[operator, coefficient]`` entries.  A numeric
+    coefficient is folded into the operator exactly; callable/string
+    coefficients are rejected because evaluating them inside the native
+    GIL-free loop would change the callback semantics.
+    """
+    coefficient = 1.0
+    operator = value
+    if isinstance(value, (list, tuple)):
+        if len(value) != 2:
+            raise UnsupportedBackendError(
+                "native Lindblad propagation expects Qobj collapse operators "
+                "or [Qobj, numeric] pairs"
+            )
+        operator, coefficient = value
+        if not np.isscalar(coefficient) or isinstance(coefficient, (str, bytes)):
+            raise UnsupportedBackendError(
+                "time-dependent collapse-operator coefficients require a QuTiP backend"
+            )
+    if not isinstance(operator, qt.Qobj):
+        raise TypeError("collapse operators must be qutip.Qobj instances")
+    if getattr(operator, "issuper", False) or operator.shape != (dimension, dimension):
+        raise UnsupportedBackendError(
+            "native Lindblad propagation requires square operator collapse operators"
+        )
+    try:
+        coefficient = complex(coefficient)
+    except (TypeError, ValueError) as exc:
+        raise UnsupportedBackendError("collapse-operator coefficient must be numeric") from exc
+    if not np.isfinite(coefficient.real) or not np.isfinite(coefficient.imag):
+        raise ValueError("collapse-operator coefficients must be finite")
+    if coefficient == 1.0:
+        return operator
+    return coefficient * operator
+
+
+def _lindblad_effective_operators(
+    static_hamiltonian: qt.Qobj,
+    drive_terms: Sequence[DriveTerm],
+    c_ops: Sequence[Any],
+) -> Tuple[qt.Qobj, List[DriveTerm]]:
+    """Construct the exact ordinary-operator representation of a Lindbladian.
+
+    For column-major ``vec(rho)``, ``d vec(rho) / dt = L vec(rho)``.  The
+    native ket kernel solves ``d y / dt = -i H_native y``, so we pass
+    ``H_native = i L``.  This is a representation change only; no rotating
+    wave, level, or magnitude approximation is introduced.
+    """
+    try:
+        from scipy import sparse
+    except ImportError as exc:  # pragma: no cover - scipy is a package dependency
+        raise BackendUnavailable("scipy is required for native Lindblad propagation") from exc
+
+    dimension = int(static_hamiltonian.shape[0])
+    if (
+        static_hamiltonian.shape != (dimension, dimension)
+        or getattr(static_hamiltonian, "issuper", False)
+    ):
+        raise UnsupportedBackendError(
+            "native Lindblad propagation requires a square operator Hamiltonian"
+        )
+    def scipy_csr(operator: qt.Qobj):
+        data, columns, indptr = _qobj_csr(operator)
+        return sparse.csr_matrix(
+            (data, columns, indptr),
+            shape=operator.shape,
+            dtype=np.complex128,
+        )
+
+    static_matrix = scipy_csr(static_hamiltonian)
+    identity = sparse.identity(dimension, format="csr", dtype=np.complex128)
+
+    def hamiltonian_superoperator(operator: qt.Qobj):
+        matrix = scipy_csr(operator)
+        return sparse.kron(identity, matrix, format="csr") - sparse.kron(
+            matrix.conjugate(), identity, format="csr"
+        )
+
+    effective_static = hamiltonian_superoperator(static_hamiltonian)
+    for raw_operator in c_ops:
+        operator = _static_collapse_operator(raw_operator, dimension)
+        collapse = scipy_csr(operator)
+        dagger_product = collapse.getH().dot(collapse).tocsr()
+        dissipator = sparse.kron(collapse.conjugate(), collapse, format="csr")
+        dissipator = dissipator - 0.5 * sparse.kron(
+            identity, dagger_product, format="csr"
+        )
+        dissipator = dissipator - 0.5 * sparse.kron(
+            dagger_product.transpose(), identity, format="csr"
+        )
+        effective_static = effective_static + 1j * dissipator
+    effective_static = effective_static.tocsr()
+    effective_static.sum_duplicates()
+    effective_static.eliminate_zeros()
+    effective_static.sort_indices()
+
+    effective_drives: List[DriveTerm] = []
+    for term in drive_terms:
+        if term.mode not in {"rf", "complex_envelope"}:
+            raise UnsupportedBackendError(
+                "native Lindblad propagation supports rf and complex_envelope drive modes"
+            )
+        operator_matrix = scipy_csr(term.operator)
+        if term.mode == "complex_envelope":
+            # H_native = i L contains f(t) (I kron A) and
+            # -conj(f(t)) (conj(A) kron I).  Keeping these as two controls
+            # preserves the exact adjoint on the right side for complex
+            # coefficients; collapsing them into one control would silently
+            # change the equation whenever f has an imaginary part.
+            left = sparse.kron(identity, operator_matrix, format="csr")
+            right = -sparse.kron(operator_matrix.conjugate(), identity, format="csr")
+            for matrix, trace in (
+                (left, term.trace),
+                (right, _conjugate_trace(term.trace)),
+            ):
+                matrix = matrix.tocsr()
+                matrix.sum_duplicates()
+                matrix.eliminate_zeros()
+                matrix.sort_indices()
+                effective_drives.append(
+                    DriveTerm(_qobj_from_sparse(matrix), trace, mode="complex_envelope")
+                )
+        else:
+            effective = hamiltonian_superoperator(term.operator).tocsr()
+            effective.sum_duplicates()
+            effective.eliminate_zeros()
+            effective.sort_indices()
+            effective_drives.append(
+                DriveTerm(_qobj_from_sparse(effective), term.trace, mode=term.mode)
+            )
+    return _qobj_from_sparse(effective_static), effective_drives
+
+
 def _interaction_bundle_from_components(
     controls: Sequence[Tuple[np.ndarray, np.ndarray, np.ndarray]],
     n: int,
@@ -311,6 +625,14 @@ class _NativePlan:
     fused_csr: Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = None
     interaction_energies: Optional[np.ndarray] = None
     interaction_basis: Optional[np.ndarray] = None
+    # Optional coefficients in ascending powers of the normalized interval
+    # coordinate u=(t-t_i)/(t_{i+1}-t_i).  The native kernel falls back to its
+    # historical linear interpolation when this payload is absent.
+    iq_polynomial: Optional[np.ndarray] = None
+    coefficient_order: int = 1
+    output_t_axis: Optional[np.ndarray] = None
+    output_indices: Optional[np.ndarray] = None
+    control_modes: Optional[np.ndarray] = None
 
 
 @dataclass(frozen=True)
@@ -415,6 +737,172 @@ def _decode_complex_payload(payload, shape):
     return np.array(array, dtype=np.complex128, copy=True).reshape(shape)
 
 
+def _native_polynomial_coefficients(
+    trace: Any,
+    order: int,
+) -> Tuple[np.ndarray, int]:
+    """Build QuTiP-compatible piecewise polynomial coefficients.
+
+    Coefficients are stored in ascending powers of the normalized interval
+    coordinate.  Orders 0 and 1 are constructed directly; higher orders use
+    SciPy's public ``make_interp_spline`` exactly as QuTiP's array coefficient
+    does, then convert derivatives to the native normalized basis.
+    """
+    t_axis, values, _domain, _lo_freq = _validate_trace(trace)
+    requested = int(order)
+    effective = min(requested, max(0, len(t_axis) - 1))
+    intervals = max(0, len(t_axis) - 1)
+    complex_values = np.asarray(values, dtype=np.complex128)
+    if intervals == 0:
+        return np.empty((0, effective + 1), dtype=np.complex128), effective
+    if effective == 0:
+        coefficients = complex_values[:-1, np.newaxis]
+        return np.ascontiguousarray(coefficients, dtype=np.complex128), effective
+    if effective == 1:
+        coefficients = np.empty((intervals, 2), dtype=np.complex128)
+        coefficients[:, 0] = complex_values[:-1]
+        coefficients[:, 1] = np.diff(complex_values)
+        return np.ascontiguousarray(coefficients), effective
+    try:
+        from scipy.interpolate import make_interp_spline
+    except ImportError as exc:  # pragma: no cover - scipy is a package dependency
+        raise BackendUnavailable("scipy is required for native spline coefficients") from exc
+    spline = make_interp_spline(t_axis, complex_values, k=effective, bc_type=None)
+    coefficients = np.empty((intervals, effective + 1), dtype=np.complex128)
+    for interval in range(intervals):
+        dt = float(t_axis[interval + 1] - t_axis[interval])
+        start = float(t_axis[interval])
+        for power in range(effective + 1):
+            derivative = np.asarray(spline(start, nu=power), dtype=np.complex128)
+            coefficients[interval, power] = (
+                derivative / float(math.factorial(power)) * (dt ** power)
+            )
+    return np.ascontiguousarray(coefficients), effective
+
+
+def _prepare_native_trace_payloads(
+    traces: Sequence[Any],
+    output_t_axis: np.ndarray,
+    order: int,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], int, np.ndarray]:
+    """Prepare a common exact source grid for native interpolation.
+
+    QuTiP's spline builder may introduce interior knots that are not present in
+    the user's output grid (notably for quadratic splines).  The native kernel
+    uses one source grid, so we form the exact union of all spline knots and
+    requested output times, evaluate each trace there, and return indices for
+    restoring the original output trajectory.
+    """
+    output_t_axis = np.ascontiguousarray(np.asarray(output_t_axis, dtype=np.float64))
+    requested = int(order)
+    if not traces:
+        return (
+            output_t_axis,
+            np.empty((0, len(output_t_axis)), dtype=np.complex128),
+            None,
+            requested,
+            np.arange(len(output_t_axis), dtype=np.int64),
+        )
+    validated = []
+    knots = [output_t_axis]
+    spline_objects = []
+    effective_orders = []
+    for trace in traces:
+        t_axis, values, _domain, _lo_freq = _validate_trace(trace)
+        if output_t_axis[0] < t_axis[0] or output_t_axis[-1] > t_axis[-1]:
+            raise UnsupportedBackendError(
+                "native trace interpolation requires tlist to lie within each trace domain"
+            )
+        complex_values = np.asarray(values, dtype=np.complex128)
+        effective = min(requested, max(0, len(t_axis) - 1))
+        spline = None
+        if effective >= 2:
+            try:
+                from scipy.interpolate import make_interp_spline
+            except ImportError as exc:  # pragma: no cover
+                raise BackendUnavailable("scipy is required for native spline coefficients") from exc
+            spline = make_interp_spline(t_axis, complex_values, k=effective, bc_type=None)
+            spline_knots = np.unique(np.asarray(spline.t, dtype=np.float64))
+            knots.append(
+                spline_knots[
+                    (spline_knots >= output_t_axis[0])
+                    & (spline_knots <= output_t_axis[-1])
+                ]
+            )
+        trace_knots = np.asarray(t_axis, dtype=np.float64)
+        knots.append(
+            trace_knots[
+                (trace_knots >= output_t_axis[0])
+                & (trace_knots <= output_t_axis[-1])
+            ]
+        )
+        validated.append((np.asarray(t_axis, dtype=np.float64), complex_values))
+        spline_objects.append(spline)
+        effective_orders.append(effective)
+    source_t_axis = np.unique(np.concatenate(knots)).astype(np.float64, copy=False)
+    source_t_axis = np.ascontiguousarray(source_t_axis, dtype=np.float64)
+    if source_t_axis.size == 0 or np.any(np.diff(source_t_axis) <= 0):
+        raise UnsupportedBackendError("native source interpolation grid must be strictly increasing")
+    global_order = max(effective_orders) if effective_orders else requested
+    source_values = np.empty(
+        (len(traces), len(source_t_axis)),
+        dtype=np.complex128,
+    )
+    polynomial = np.zeros(
+        (len(traces), max(0, len(source_t_axis) - 1), global_order + 1),
+        dtype=np.complex128,
+    )
+    for control, ((trace_t, trace_values), spline, effective) in enumerate(
+        zip(validated, spline_objects, effective_orders)
+    ):
+        if effective == 0:
+            positions = np.searchsorted(trace_t, source_t_axis, side="right") - 1
+            positions = np.clip(positions, 0, len(trace_t) - 1)
+            source_values[control] = trace_values[positions]
+        elif effective == 1:
+            source_values[control] = np.interp(
+                source_t_axis,
+                trace_t,
+                trace_values.real,
+            ) + 1j * np.interp(
+                source_t_axis,
+                trace_t,
+                trace_values.imag,
+            )
+        else:
+            source_values[control] = np.asarray(spline(source_t_axis), dtype=np.complex128)
+        for interval in range(max(0, len(source_t_axis) - 1)):
+            dt = float(source_t_axis[interval + 1] - source_t_axis[interval])
+            start = float(source_t_axis[interval])
+            if effective == 0:
+                polynomial[control, interval, 0] = source_values[control, interval]
+            elif effective == 1:
+                polynomial[control, interval, 0] = source_values[control, interval]
+                polynomial[control, interval, 1] = (
+                    source_values[control, interval + 1]
+                    - source_values[control, interval]
+                )
+            else:
+                for power in range(effective + 1):
+                    derivative = np.asarray(spline(start, nu=power), dtype=np.complex128)
+                    polynomial[control, interval, power] = (
+                        derivative / float(math.factorial(power)) * (dt ** power)
+                    )
+    output_indices = np.searchsorted(source_t_axis, output_t_axis)
+    safe_indices = np.clip(output_indices, 0, max(0, len(source_t_axis) - 1))
+    if np.any(output_indices >= len(source_t_axis)) or not np.array_equal(
+        source_t_axis[safe_indices], output_t_axis
+    ):
+        raise RuntimeError("native source grid did not retain the requested output times")
+    return (
+        source_t_axis,
+        np.ascontiguousarray(source_values, dtype=np.complex128),
+        np.ascontiguousarray(polynomial, dtype=np.complex128),
+        global_order,
+        np.ascontiguousarray(output_indices, dtype=np.int64),
+    )
+
+
 @dataclass
 class NativePropagationResult:
     """Small Result-compatible object returned by the native backend."""
@@ -449,10 +937,308 @@ class CppPropagationBackend:
                 "use backend='qutip_compiled' for c_ops."
             )
         self._plan: Optional[_NativePlan] = None
+        self._plan_cache_hit = False
+        self._plan_cache_digest: Optional[bytes] = None
+        self._block_backends = None
 
     @classmethod
     def from_prepared(cls, prepared) -> "CppPropagationBackend":
         return cls(prepared)
+
+    def _plan_cache_key(self) -> bytes:
+        """Build a content-addressed key for the immutable numerical plan.
+
+        The key intentionally excludes initial states and solver tolerances
+        that only affect integration.  It includes every input that changes
+        matrix layout, frame transformation, or coefficient representation.
+        """
+        hasher = hashlib.blake2b(digest_size=24)
+        prepared = self.prepared
+        hasher.update(b"pysuqu-native-plan-v2\0")
+        hasher.update(str(prepared.backend).lower().encode("utf-8"))
+        options = prepared.options
+        for name in (
+            "matrix_format",
+            "frame",
+            "sparse_kernel",
+            "coefficient_order",
+            "block_decompose",
+        ):
+            hasher.update(str(getattr(options, name, None)).encode("utf-8"))
+            hasher.update(b"\0")
+        hasher.update(repr(float(getattr(options, "sparse_threshold", 0.6))).encode("ascii"))
+        hasher.update(b"\0")
+        extras = getattr(options, "extra", {}) or {}
+        # These legacy options can alter the selected RWA plan.  Other extra
+        # values are QuTiP-only and do not affect native matrix preparation.
+        for name in ("active_levels", "rwa_max_discarded_ratio"):
+            hasher.update(name.encode("ascii"))
+            hasher.update(repr(extras.get(name, None)).encode("utf-8"))
+            hasher.update(b"\0")
+        _hash_qobj(hasher, prepared.static_hamiltonian)
+        for term in prepared.drive_terms:
+            hasher.update(str(term.mode).encode("utf-8"))
+            hasher.update(b"\0")
+            _hash_qobj(hasher, term.operator)
+            t_axis, values, domain, lo_freq = _validate_trace(term.trace)
+            hasher.update(str(domain).encode("ascii"))
+            hasher.update(repr(float(lo_freq)).encode("ascii"))
+            _hash_array(hasher, t_axis)
+            _hash_array(hasher, values)
+        _hash_array(hasher, np.asarray(prepared.tlist, dtype=np.float64))
+        return hasher.digest()
+
+    def _ensure_plan(self) -> _NativePlan:
+        """Resolve this backend's plan, consulting the bounded process cache."""
+        if self._plan is not None:
+            return self._plan
+        cache_size = int(getattr(self.prepared.options, "plan_cache_size", 16))
+        key = self._plan_cache_key() if cache_size > 0 else None
+        if key is not None:
+            with _PLAN_CACHE_LOCK:
+                cached = _PLAN_CACHE.get(key)
+                if cached is not None:
+                    _PLAN_CACHE.move_to_end(key)
+                    self._plan = cached
+                    self._plan_cache_hit = True
+                    self._plan_cache_digest = key
+                    return cached
+        plan = self._build_plan()
+        if key is not None:
+            with _PLAN_CACHE_LOCK:
+                _PLAN_CACHE[key] = plan
+                _PLAN_CACHE.move_to_end(key)
+                while len(_PLAN_CACHE) > cache_size:
+                    _PLAN_CACHE.popitem(last=False)
+        self._plan = plan
+        self._plan_cache_hit = False
+        self._plan_cache_digest = key
+        return plan
+
+    def _ensure_block_backends(self):
+        """Prepare independent exact block propagators when structure allows it."""
+        if self._block_backends is not None:
+            return self._block_backends
+        options = self.prepared.options
+        requested = str(getattr(options, "block_decompose", "auto")).lower()
+        if requested == "off":
+            self._block_backends = ()
+            return self._block_backends
+        if self.prepared.c_ops or self.prepared.backend == "cpp_rwa":
+            self._block_backends = ()
+            return self._block_backends
+        frame = str(getattr(options, "frame", "lab")).lower()
+        if frame != "lab":
+            # A unitary interaction-basis transform can destroy a sparse block
+            # pattern.  Keep the explicitly selected frame authoritative.
+            self._block_backends = ()
+            return self._block_backends
+        n = int(self.prepared.static_hamiltonian.shape[0])
+        if (
+            self.prepared.static_hamiltonian.shape[0]
+            != self.prepared.static_hamiltonian.shape[1]
+            or getattr(self.prepared.static_hamiltonian, "issuper", False)
+        ):
+            self._block_backends = ()
+            return self._block_backends
+        if requested == "auto" and n < 16:
+            self._block_backends = ()
+            return self._block_backends
+        # A diagonal problem already has an O(n * samples) exact path.  Splitting
+        # it into one-dimensional Python backends would add overhead without
+        # reducing the native arithmetic.
+        if _diagonal_from_csr(
+            _qobj_csr(self.prepared.static_hamiltonian),
+            n,
+        )[0] and all(
+            _diagonal_from_csr(_qobj_csr(term.operator), n)[0]
+            for term in self.prepared.drive_terms
+        ):
+            self._block_backends = ()
+            return self._block_backends
+        components = _connected_components(
+            self.prepared.static_hamiltonian,
+            [term.operator for term in self.prepared.drive_terms],
+        )
+        if len(components) <= 1:
+            self._block_backends = ()
+            return self._block_backends
+        # Explicit ``on`` is useful for benchmarking small blocks; automatic
+        # selection avoids overhead when a decomposition would be nearly the
+        # same size as the original problem.
+        largest = max(len(item) for item in components)
+        if requested == "auto" and largest >= 0.9 * n:
+            self._block_backends = ()
+            return self._block_backends
+        block_options = replace(options, backend="cpp", block_decompose="off")
+        backends = []
+        for indices in components:
+            static = _slice_operator(self.prepared.static_hamiltonian, indices)
+            terms = [
+                type(term)(
+                    _slice_operator(term.operator, indices),
+                    term.trace,
+                    mode=term.mode,
+                )
+                for term in self.prepared.drive_terms
+            ]
+            block_prepared = self.prepared.__class__(
+                static,
+                terms,
+                self.prepared.tlist,
+                c_ops=[],
+                options=block_options,
+                args=self.prepared.args,
+                backend="cpp",
+            )
+            backends.append((indices, CppPropagationBackend.from_prepared(block_prepared)))
+        self._block_backends = tuple(backends)
+        return self._block_backends
+
+    def _attach_polynomial_coefficients(
+        self,
+        plan: _NativePlan,
+        coefficient_order: int,
+        polynomial: Optional[np.ndarray] = None,
+        effective_order: Optional[int] = None,
+        output_t_axis: Optional[np.ndarray] = None,
+        output_indices: Optional[np.ndarray] = None,
+        control_modes: Optional[np.ndarray] = None,
+    ) -> _NativePlan:
+        """Attach exact per-interval coefficients for non-linear interpolation."""
+        requested = int(coefficient_order)
+        if polynomial is None and requested != 1 and self.prepared.drive_terms:
+            # Retain a defensive direct path for callers constructing plans in
+            # tests or downstream extensions without the common-grid helper.
+            arrays = []
+            effective_orders = []
+            for term in self.prepared.drive_terms:
+                coefficients, effective = _native_polynomial_coefficients(term.trace, requested)
+                arrays.append(coefficients)
+                effective_orders.append(effective)
+            if len(set(effective_orders)) > 1:
+                raise UnsupportedBackendError(
+                    "native polynomial traces must have a common effective interpolation order"
+                )
+            effective_order = effective_orders[0] if effective_orders else requested
+            polynomial = (
+                np.ascontiguousarray(np.stack(arrays, axis=0), dtype=np.complex128)
+                if arrays
+                else None
+            )
+        if effective_order is None:
+            effective_order = requested
+        return self._freeze_plan_arrays(
+            replace(
+                plan,
+                iq_polynomial=polynomial,
+                coefficient_order=int(effective_order),
+                output_t_axis=output_t_axis,
+                output_indices=output_indices,
+                control_modes=control_modes,
+            )
+        )
+
+    @staticmethod
+    def _combine_block_results(
+        original_states: Sequence[qt.Qobj],
+        block_payloads,
+        tlist: np.ndarray,
+    ) -> BatchPropagationResult:
+        """Reassemble block-wise native results in the caller's basis."""
+        states = list(original_states)
+        if not states:
+            return BatchPropagationResult([], [], np.array(tlist, copy=True), {})
+        n = int(_qobj_matrix(states[0]).shape[0])
+        batch_count = len(states)
+        final_matrix = np.zeros((n, batch_count), dtype=np.complex128)
+        block_results = []
+        for indices, batch_result in block_payloads:
+            for column, state in enumerate(batch_result.final_states):
+                final_matrix[indices, column] = _qobj_matrix(state)[:, 0]
+            block_results.append((indices, batch_result))
+
+        aggregate: Dict[str, Any] = {}
+        numeric_sum = {
+            "steps",
+            "rhs_evaluations",
+            "exponential_evaluations",
+            "exponential_cache_hits",
+            "diagonal_interval_evaluations",
+            "zero_interval_evaluations",
+            "krylov_evaluations",
+            "krylov_iterations",
+        }
+        numeric_max = {"max_error", "max_trial_error"}
+        for _indices, batch_result in block_results:
+            for key, value in dict(batch_result.stats or {}).items():
+                if key in numeric_sum:
+                    aggregate[key] = aggregate.get(key, 0) + int(value)
+                elif key in numeric_max:
+                    aggregate[key] = max(float(aggregate.get(key, 0.0)), float(value))
+                elif key not in aggregate:
+                    aggregate[key] = value
+        aggregate.update(
+            {
+                "block_decomposed": True,
+                "block_count": len(block_results),
+                "block_sizes": tuple(int(len(indices)) for indices, _ in block_results),
+                "integrator": "cpp_block_decomposed",
+            }
+        )
+        final_states = [
+            qt.Qobj(final_matrix[:, column], dims=states[column].dims)
+            for column in range(batch_count)
+        ]
+        per_state_results = []
+        store_states = bool(
+            block_results
+            and block_results[0][1].results
+            and block_results[0][1].results[0].states
+        )
+        for column, original in enumerate(states):
+            trajectories = []
+            if store_states:
+                for time_index, _time in enumerate(tlist):
+                    vector = np.zeros(n, dtype=np.complex128)
+                    for indices, batch_result in block_results:
+                        block_states = batch_result.results[column].states
+                        if time_index < len(block_states):
+                            vector[indices] = _qobj_matrix(block_states[time_index])[:, 0]
+                    trajectories.append(qt.Qobj(vector, dims=original.dims))
+            state_stats = dict(aggregate)
+            per_state_results.append(
+                NativePropagationResult(
+                    final_state=final_states[column],
+                    states=trajectories,
+                    times=np.array(tlist, copy=True),
+                    stats=state_stats,
+                )
+            )
+        return BatchPropagationResult(
+            final_states=final_states,
+            results=per_state_results,
+            times=np.array(tlist, copy=True),
+            stats=aggregate,
+        )
+
+    def _propagate_blockwise(self, states: Sequence[qt.Qobj]):
+        blocks = self._ensure_block_backends()
+        if not blocks:
+            return None
+        payloads = []
+        for indices, backend in blocks:
+            sub_states = []
+            for state in states:
+                vector = _qobj_matrix(state)
+                sub_states.append(
+                    qt.Qobj(
+                        np.ascontiguousarray(vector[indices, :], dtype=np.complex128),
+                        dims=[[len(indices)], [1]],
+                    )
+                )
+            payloads.append((indices, backend.propagate_batch(sub_states)))
+        return self._combine_block_results(states, payloads, self.prepared.tlist)
 
     def _requested_sparse_kernel(self) -> str:
         """Return the validated sparse-kernel preference.
@@ -586,6 +1372,18 @@ class CppPropagationBackend:
         interaction_basis = plan.interaction_basis
         if interaction_basis is not None:
             interaction_basis = _freeze_array(interaction_basis)
+        iq_polynomial = plan.iq_polynomial
+        if iq_polynomial is not None:
+            iq_polynomial = _freeze_array(iq_polynomial)
+        output_t_axis = plan.output_t_axis
+        if output_t_axis is not None:
+            output_t_axis = _freeze_array(output_t_axis)
+        output_indices = plan.output_indices
+        if output_indices is not None:
+            output_indices = _freeze_array(output_indices)
+        control_modes = plan.control_modes
+        if control_modes is not None:
+            control_modes = _freeze_array(control_modes)
         return _NativePlan(
             matrix_format=plan.matrix_format,
             static_matrix=(None if plan.static_matrix is None else _freeze_array(plan.static_matrix)),
@@ -605,6 +1403,11 @@ class CppPropagationBackend:
             fused_csr=fused_csr,
             interaction_energies=interaction_energies,
             interaction_basis=interaction_basis,
+            iq_polynomial=iq_polynomial,
+            coefficient_order=plan.coefficient_order,
+            output_t_axis=output_t_axis,
+            output_indices=output_indices,
+            control_modes=control_modes,
         )
 
     def _plan_from_qobjs(
@@ -834,29 +1637,66 @@ class CppPropagationBackend:
                 "frame='interaction_exact' requires real diagonal energies."
             )
         interaction_basis = None
+        interaction_block_count = 1
+        interaction_block_max = int(static_operator.shape[0])
         if static_diagonal:
             control_csrs = [_qobj_csr(operator) for operator in drive_operators]
         else:
             # A Hermitian static Hamiltonian can be diagonalized exactly by a
-            # unitary basis change.  Keep this opt-in frame explicit and limit
-            # the dense eigendecomposition to practical gate dimensions.
+            # unitary basis change.  For a block-diagonal sparse H0, diagonalize
+            # each connected block independently so the dense eigensolver never
+            # sees the full Hilbert-space dimension.
             dimension = int(static_operator.shape[0])
-            if dimension > 256:
+            block_components = _connected_components(static_operator, [])
+            interaction_block_count = len(block_components)
+            interaction_block_max = max(len(item) for item in block_components)
+            if dimension > 256 and (
+                len(block_components) <= 1
+                or max(len(item) for item in block_components) > 256
+            ):
                 raise UnsupportedBackendError(
-                    "frame='interaction_exact' diagonalization is limited to dimension <= 256."
+                    "frame='interaction_exact' requires H0 blocks of dimension <= 256."
                 )
-            static_matrix = _qobj_matrix(static_operator)
+            static_matrix = (
+                _qobj_matrix(static_operator)
+                if dimension <= 256
+                else None
+            )
             # ``eigh`` assumes a Hermitian input.  Permit only the tiny
             # antisymmetry introduced by floating-point construction of a
             # mathematically Hermitian Qobj; anything larger is rejected
             # instead of being silently projected into a new Hamiltonian.
-            adjoint = static_matrix.conj().T
-            scale = max(1.0, float(np.linalg.norm(static_matrix)))
+            if static_matrix is not None:
+                adjoint = static_matrix.conj().T
+                scale = max(1.0, float(np.linalg.norm(static_matrix)))
+            else:
+                static_sparse = _qobj_csr(static_operator)
+                try:
+                    from scipy import sparse
+                except ImportError as exc:  # pragma: no cover
+                    raise BackendUnavailable(
+                        "scipy is required for block interaction preparation"
+                    ) from exc
+                sparse_matrix = sparse.csr_matrix(
+                    (static_sparse[0], static_sparse[1], static_sparse[2]),
+                    shape=(dimension, dimension),
+                )
+                scale = max(1.0, float(np.max(np.asarray(np.abs(sparse_matrix).sum(axis=0)).ravel())))
+                adjoint = None
             if not np.isfinite(scale):
                 raise UnsupportedBackendError(
                     "frame='interaction_exact' requires a finite static Hamiltonian."
                 )
-            hermitian_residual = float(np.linalg.norm(static_matrix - adjoint))
+            if static_matrix is not None:
+                hermitian_residual = float(np.linalg.norm(static_matrix - adjoint))
+            else:
+                hermitian_residual = 0.0
+                for indices in block_components:
+                    block = sparse_matrix[indices, :][:, indices].toarray()
+                    hermitian_residual = max(
+                        hermitian_residual,
+                        float(np.linalg.norm(block - block.conj().T)),
+                    )
             hermitian_tolerance = 64.0 * np.finfo(np.float64).eps * scale
             if hermitian_residual > hermitian_tolerance:
                 raise UnsupportedBackendError(
@@ -865,25 +1705,54 @@ class CppPropagationBackend:
             # Canonicalize only this bounded round-off residue so the LAPACK
             # eigensolver sees a Hermitian matrix.  The residual is many orders
             # below the native integration tolerance for ordinary inputs.
-            hermitian = (
-                static_matrix
-                if hermitian_residual == 0.0
-                else 0.5 * (static_matrix + adjoint)
-            )
-            energies_real, interaction_basis = np.linalg.eigh(hermitian)
-            basis_residual = float(
-                np.linalg.norm(
-                    interaction_basis.conj().T @ interaction_basis
-                    - np.eye(dimension, dtype=np.complex128)
+            if static_matrix is not None:
+                hermitian = (
+                    static_matrix
+                    if hermitian_residual == 0.0
+                    else 0.5 * (static_matrix + adjoint)
                 )
-            )
-            eigen_residual = float(
-                np.linalg.norm(
-                    static_matrix @ interaction_basis
-                    - interaction_basis * energies_real[np.newaxis, :]
+                energies_real, interaction_basis = np.linalg.eigh(hermitian)
+                basis_residual = float(
+                    np.linalg.norm(
+                        interaction_basis.conj().T @ interaction_basis
+                        - np.eye(dimension, dtype=np.complex128)
+                    )
                 )
-                / scale
-            )
+                eigen_residual = float(
+                    np.linalg.norm(
+                        static_matrix @ interaction_basis
+                        - interaction_basis * energies_real[np.newaxis, :]
+                    )
+                    / scale
+                )
+            else:
+                interaction_basis = np.zeros(
+                    (dimension, dimension), dtype=np.complex128
+                )
+                energies_real = np.empty(dimension, dtype=np.float64)
+                basis_residual = 0.0
+                eigen_residual = 0.0
+                for indices in block_components:
+                    block = sparse_matrix[indices, :][:, indices].toarray()
+                    block = 0.5 * (block + block.conj().T)
+                    block_values, block_vectors = np.linalg.eigh(block)
+                    interaction_basis[np.ix_(indices, indices)] = block_vectors
+                    energies_real[indices] = block_values
+                    block_basis_residual = float(
+                        np.linalg.norm(
+                            block_vectors.conj().T @ block_vectors
+                            - np.eye(len(indices), dtype=np.complex128)
+                        )
+                    )
+                    block_eigen_residual = float(
+                        np.linalg.norm(
+                            block @ block_vectors
+                            - block_vectors * block_values[np.newaxis, :]
+                        )
+                        / scale
+                    )
+                    basis_residual = max(basis_residual, block_basis_residual)
+                    eigen_residual = max(eigen_residual, block_eigen_residual)
             if basis_residual > 1e-10 or eigen_residual > 1e-10:
                 raise UnsupportedBackendError(
                     "frame='interaction_exact' eigendecomposition failed its numerical residual check."
@@ -891,10 +1760,20 @@ class CppPropagationBackend:
             energies = np.asarray(energies_real, dtype=np.complex128)
             transformed_controls = []
             for operator in drive_operators:
-                matrix = _qobj_matrix(operator)
+                matrix = (
+                    _transform_block_diagonal_basis(
+                        operator,
+                        interaction_basis,
+                        block_components,
+                    )
+                    if static_matrix is None
+                    else _qobj_matrix(operator)
+                )
                 transformed_controls.append(
                     np.asarray(
-                        interaction_basis.conj().T @ matrix @ interaction_basis,
+                        matrix
+                        if static_matrix is None
+                        else interaction_basis.conj().T @ matrix @ interaction_basis,
                         dtype=np.complex128,
                     )
                 )
@@ -947,6 +1826,13 @@ class CppPropagationBackend:
                 mode,
                 metadata=metadata,
             )
+        interaction_metadata = dict(metadata or {})
+        interaction_metadata.update(
+            {
+                "interaction_block_count": interaction_block_count,
+                "interaction_block_max": interaction_block_max,
+            }
+        )
         bundle = _interaction_bundle_from_components(
             control_csrs,
             int(static_operator.shape[0]),
@@ -961,7 +1847,7 @@ class CppPropagationBackend:
             mode=mode,
             sparse_kernel="interaction",
             frame="interaction_exact",
-            metadata=metadata,
+            metadata=interaction_metadata,
             fused_csr=bundle,
             interaction_energies=np.asarray(energies, dtype=np.complex128),
             interaction_basis=interaction_basis,
@@ -1157,22 +2043,27 @@ class CppPropagationBackend:
 
     def _build_plan(self) -> _NativePlan:
         prepared = self.prepared
-        if prepared.drive_terms and int(prepared.options.coefficient_order) != 1:
-            raise UnsupportedBackendError(
-                "The native backend uses exact piecewise-linear trace interpolation; "
-                "set coefficient_order=1 or use a QuTiP backend."
-            )
+        coefficient_order = int(getattr(prepared.options, "coefficient_order", 1))
         if prepared.backend == "cpp_rwa":
+            if coefficient_order != 1:
+                raise UnsupportedBackendError(
+                    "cpp_rwa requires coefficient_order=1; use the exact native path "
+                    "for polynomial coefficient representations."
+                )
             return self._build_rwa_plan()
 
         static_operator = prepared.static_hamiltonian
         if not isinstance(static_operator, qt.Qobj):
             raise TypeError("static_hamiltonian must be a qutip.Qobj")
-        if static_operator.shape[0] != static_operator.shape[1] or static_operator.issuper:
+        if (
+            static_operator.shape[0] != static_operator.shape[1]
+            or getattr(static_operator, "issuper", False)
+        ):
             raise UnsupportedBackendError(
                 "The native backend requires a square operator Hamiltonian, not a superoperator."
             )
         operators: List[qt.Qobj] = []
+        trace_axes = []
         traces = []
         lo_freqs = []
         modes = []
@@ -1181,7 +2072,7 @@ class CppPropagationBackend:
                 raise TypeError("Every drive operator must be a qutip.Qobj.")
             if term.operator.shape != static_operator.shape:
                 raise ValueError("Every drive operator must match the static Hamiltonian dimension.")
-            if term.operator.issuper:
+            if getattr(term.operator, "issuper", False):
                 raise UnsupportedBackendError("The native backend does not support superoperator drive terms.")
             raw_t_axis, raw_values, domain, lo_freq = _validate_trace(term.trace)
             t_axis = np.ascontiguousarray(raw_t_axis, dtype=np.float64)
@@ -1193,39 +2084,54 @@ class CppPropagationBackend:
             if term.mode not in {"rf", "complex_envelope"}:
                 raise ValueError("Each native drive term mode must be 'rf' or 'complex_envelope'.")
             operators.append(term.operator)
+            trace_axes.append(t_axis)
             traces.append(values)
             lo_freqs.append(lo_freq if domain == "iq_complex" else 0.0)
             modes.append(1 if term.mode == "complex_envelope" else 0)
 
-        t_axis = np.ascontiguousarray(prepared.tlist, dtype=np.float64)
-        self._require_regular_grid(t_axis)
-        for term in prepared.drive_terms:
-            source_t = np.asarray(term.trace.t_axis, dtype=np.float64)
-            if (
-                len(source_t) != len(t_axis)
-                or not np.all(np.isfinite(source_t))
-                or not np.array_equal(source_t, t_axis)
-            ):
-                raise UnsupportedBackendError(
-                    "The C++ backend currently requires each trace grid to match tlist exactly."
-                )
-        if len(set(modes)) > 1:
-            raise UnsupportedBackendError("Mixed RF and complex-envelope native terms are not supported yet.")
-        iq = (
-            np.ascontiguousarray(np.stack(traces, axis=0), dtype=np.complex128)
-            if traces
-            else np.empty((0, len(t_axis)), dtype=np.complex128)
+        output_t_axis = np.ascontiguousarray(prepared.tlist, dtype=np.float64)
+        self._require_regular_grid(output_t_axis)
+        coefficient_order = int(getattr(prepared.options, "coefficient_order", 1))
+        grid_matches = all(
+            np.array_equal(axis, output_t_axis)
+            for axis in trace_axes
         )
+        needs_polynomial_grid = coefficient_order != 1 or not grid_matches
+        if needs_polynomial_grid:
+            (
+                t_axis,
+                iq,
+                polynomial,
+                effective_order,
+                output_indices,
+            ) = _prepare_native_trace_payloads(
+                [term.trace for term in prepared.drive_terms],
+                output_t_axis,
+                coefficient_order,
+            )
+        else:
+            t_axis = output_t_axis
+            iq = (
+                np.ascontiguousarray(np.stack(traces, axis=0), dtype=np.complex128)
+                if traces
+                else np.empty((0, len(t_axis)), dtype=np.complex128)
+            )
+            polynomial = None
+            effective_order = coefficient_order
+            output_indices = np.arange(len(t_axis), dtype=np.int64)
+        native_mode = (modes[0] if modes else 1) if len(set(modes)) <= 1 else 2
+        control_modes = np.ascontiguousarray(np.asarray(modes, dtype=np.int64))
         frame = str(getattr(prepared.options, "frame", "lab")).lower()
+        plan = None
         if frame in {"interaction_exact", "auto"}:
             try:
-                return self._plan_from_interaction_qobjs(
+                plan = self._plan_from_interaction_qobjs(
                     static_operator,
                     operators,
                     iq,
                     t_axis,
                     np.asarray(lo_freqs, dtype=np.float64),
-                    modes[0] if modes else 1,
+                    native_mode,
                 )
             except (BackendUnavailable, UnsupportedBackendError):
                 if frame == "interaction_exact":
@@ -1235,13 +2141,23 @@ class CppPropagationBackend:
                     raise UnsupportedBackendError(
                         "frame='interaction_exact' eigendecomposition failed."
                     ) from exc
-        return self._plan_from_qobjs(
-            static_operator,
-            operators,
-            iq,
-            t_axis,
-            np.asarray(lo_freqs, dtype=np.float64),
-            modes[0] if modes else 1,
+        if plan is None:
+            plan = self._plan_from_qobjs(
+                static_operator,
+                operators,
+                iq,
+                t_axis,
+                np.asarray(lo_freqs, dtype=np.float64),
+                native_mode,
+            )
+        return self._attach_polynomial_coefficients(
+            plan,
+            coefficient_order,
+            polynomial=polynomial,
+            effective_order=effective_order,
+            output_t_axis=output_t_axis,
+            output_indices=output_indices,
+            control_modes=control_modes,
         )
 
     def _build_rwa_plan(self) -> _NativePlan:
@@ -1263,7 +2179,7 @@ class CppPropagationBackend:
             raise UnsupportedBackendError("cpp_fast expects mode='rf' and performs its own RWA transform.")
         if (
             prepared.static_hamiltonian.shape[0] != prepared.static_hamiltonian.shape[1]
-            or prepared.static_hamiltonian.issuper
+            or getattr(prepared.static_hamiltonian, "issuper", False)
         ):
             raise UnsupportedBackendError(
                 "cpp_fast requires a square operator Hamiltonian, not a superoperator."
@@ -1287,7 +2203,7 @@ class CppPropagationBackend:
         active_vectors = eigenvectors[:, :active_levels]
         active_values = eigenvalues[:active_levels]
         drive_matrix = _qobj_matrix(term.operator)
-        if term.operator.issuper:
+        if getattr(term.operator, "issuper", False):
             raise UnsupportedBackendError("cpp_fast does not support superoperator drive terms.")
         drive_matrix = active_vectors.conj().T @ drive_matrix @ active_vectors
         drive_scale = max(1e-30, float(np.linalg.norm(drive_matrix)))
@@ -1350,9 +2266,7 @@ class CppPropagationBackend:
         )
 
     def _payload(self, states: Sequence[qt.Qobj]) -> _NativePayload:
-        if self._plan is None:
-            self._plan = self._build_plan()
-        plan = self._plan
+        plan = self._ensure_plan()
         if plan.matrix_format == "csr":
             if plan.sparse_kernel in {"fused", "interaction"}:
                 assert plan.fused_csr is not None
@@ -1382,7 +2296,7 @@ class CppPropagationBackend:
             vector = _qobj_matrix(state)
             if vector.shape != (full_dimension, 1):
                 raise ValueError("Initial state dimension does not match the Hamiltonian.")
-            if metadata is not None:
+            if metadata is not None and "basis_transform" in metadata:
                 active_vectors = metadata["basis_transform"]
                 full_basis = metadata["full_basis"]
                 active_levels = int(metadata["active_levels"])
@@ -1423,7 +2337,7 @@ class CppPropagationBackend:
 
     @staticmethod
     def _apply_frame(vector: np.ndarray, time: float, metadata):
-        if metadata is None:
+        if metadata is None or "frame_omega" not in metadata:
             return vector
         result = np.array(vector, dtype=np.complex128, copy=True)
         omega = float(metadata["frame_omega"])
@@ -1457,6 +2371,39 @@ class CppPropagationBackend:
                     result[:, column] /= norm
         return result
 
+    @staticmethod
+    def _invoke_native(function, *args, **kwargs):
+        """Call a kernel, retaining compatibility with older extensions."""
+        try:
+            return function(*args, **kwargs)
+        except TypeError as error:
+            legacy = dict(kwargs)
+            # These keywords were added after the original optional module.
+            # They are safe to omit only for their exact default semantics.
+            if legacy.get("sparse_expm") == 1:
+                legacy.pop("sparse_expm", None)
+            if legacy.get("iq_polynomial") is None:
+                legacy.pop("iq_polynomial", None)
+            if legacy.get("coefficient_order") == 1:
+                legacy.pop("coefficient_order", None)
+            modes = legacy.get("control_modes")
+            if modes is None or (
+                isinstance(modes, np.ndarray)
+                and (modes.size == 0 or np.all(modes == modes.flat[0]))
+            ):
+                legacy.pop("control_modes", None)
+            if len(legacy) == len(kwargs):
+                raise
+            # Do not hide a TypeError from a genuinely active new feature.
+            if kwargs.get("iq_polynomial") is not None:
+                raise
+            if kwargs.get("coefficient_order", 1) != 1:
+                raise
+            modes = kwargs.get("control_modes")
+            if isinstance(modes, np.ndarray) and modes.size > 0 and not np.all(modes == modes.flat[0]):
+                raise
+            return function(*args, **legacy)
+
     def _call_native(self, payload: _NativePayload):
         plan = payload.plan
         common = {
@@ -1465,6 +2412,14 @@ class CppPropagationBackend:
             "rtol": float(self.prepared.options.rtol),
             "max_steps": int(self.prepared.options.extra.get("native_max_steps", 2_000_000)),
             "store_trajectory": bool(self.prepared.options.store_states),
+            "sparse_expm": {
+                "off": 0,
+                "auto": 1,
+                "on": 2,
+            }.get(str(getattr(self.prepared.options, "sparse_expm", "auto")).lower(), 1),
+            "iq_polynomial": plan.iq_polynomial,
+            "coefficient_order": int(plan.coefficient_order),
+            "control_modes": plan.control_modes,
         }
         if plan.frame == "interaction_exact":
             if _native_propagate_interaction_csr is None or plan.fused_csr is None:
@@ -1476,7 +2431,7 @@ class CppPropagationBackend:
                     "interaction-picture plan is missing diagonal energies."
                 )
             _, control_values, indices, indptr = plan.fused_csr
-            return _native_propagate_interaction_csr(
+            return self._invoke_native(_native_propagate_interaction_csr,
                 plan.interaction_energies,
                 control_values,
                 indices,
@@ -1491,7 +2446,7 @@ class CppPropagationBackend:
             if _native_propagate_fused_csr is None or plan.fused_csr is None:
                 raise BackendUnavailable("The native fused CSR kernel is unavailable.")
             static_values, control_values, indices, indptr = plan.fused_csr
-            return _native_propagate_fused_csr(
+            return self._invoke_native(_native_propagate_fused_csr,
                 static_values,
                 indices,
                 indptr,
@@ -1510,7 +2465,7 @@ class CppPropagationBackend:
                 or plan.controls_banded is None
             ):
                 raise BackendUnavailable("The native banded kernel is unavailable.")
-            return _native_propagate_banded(
+            return self._invoke_native(_native_propagate_banded,
                 plan.h0_banded,
                 plan.controls_banded,
                 plan.band_offsets,
@@ -1525,7 +2480,7 @@ class CppPropagationBackend:
                 raise BackendUnavailable("The native CSR kernel is unavailable.")
             h0_data, h0_indices, h0_indptr = plan.h0_csr
             controls_data, controls_indices, controls_indptr, controls_offsets = plan.controls_csr
-            return _native_propagate_csr(
+            return self._invoke_native(_native_propagate_csr,
                 h0_data,
                 h0_indices,
                 h0_indptr,
@@ -1540,7 +2495,7 @@ class CppPropagationBackend:
                 **common,
             )
         assert plan.static_matrix is not None and plan.controls is not None
-        return _native_propagate(
+        return self._invoke_native(_native_propagate,
             plan.static_matrix,
             plan.controls,
             plan.iq,
@@ -1555,7 +2510,24 @@ class CppPropagationBackend:
         resolved["matrix_format"] = plan.matrix_format
         resolved["sparse_kernel"] = plan.sparse_kernel
         resolved["frame"] = plan.frame
+        resolved.setdefault("block_decomposed", False)
+        resolved["sparse_expm"] = str(
+            getattr(self.prepared.options, "sparse_expm", "auto")
+        ).lower()
+        resolved["coefficient_order"] = int(plan.coefficient_order)
+        resolved["source_sample_count"] = int(plan.t_axis.size)
+        resolved["output_sample_count"] = int(
+            plan.output_t_axis.size
+            if plan.output_t_axis is not None
+            else plan.t_axis.size
+        )
         if plan.metadata is not None:
+            for key in ("interaction_block_count", "interaction_block_max"):
+                if key in plan.metadata:
+                    resolved[key] = plan.metadata[key]
+        resolved["plan_cache_hit"] = bool(self._plan_cache_hit)
+        resolved["plan_cache_entries"] = native_plan_cache_info()["entries"]
+        if plan.metadata is not None and "basis_transform" in plan.metadata:
             resolved.update(
                 {
                     "backend": "cpp_rwa",
@@ -1571,6 +2543,9 @@ class CppPropagationBackend:
         return resolved
 
     def propagate(self, initial_state: qt.Qobj) -> NativePropagationResult:
+        block_result = self._propagate_blockwise([initial_state])
+        if block_result is not None:
+            return block_result.results[0]
         payload = self._payload([initial_state])
         final, trajectory, stats = self._call_native(payload)
         n = payload.initial_matrix.shape[0]
@@ -1602,12 +2577,20 @@ class CppPropagationBackend:
                 [self._normalize_output(item, payload.normalize_columns) for item in trajectory_array],
                 axis=0,
             )
+            output_indices = payload.plan.output_indices
+            if output_indices is not None:
+                trajectory_array = trajectory_array[output_indices]
             states = [qt.Qobj(item[:, 0], dims=payload.dims[0]) for item in trajectory_array]
         resolved_stats = self._resolved_stats(stats, payload.plan)
         return NativePropagationResult(
             final_state=state,
             states=states,
-            times=np.array(payload.plan.t_axis, copy=True),
+            times=np.array(
+                payload.plan.output_t_axis
+                if payload.plan.output_t_axis is not None
+                else payload.plan.t_axis,
+                copy=True,
+            ),
             stats=resolved_stats,
         )
 
@@ -1615,6 +2598,9 @@ class CppPropagationBackend:
         states = list(initial_states)
         if not states:
             return BatchPropagationResult([], [], np.array(self.prepared.tlist, copy=True), {})
+        block_result = self._propagate_blockwise(states)
+        if block_result is not None:
+            return block_result
         payload = self._payload(states)
         final, trajectory, stats = self._call_native(payload)
         n, batch_count = payload.initial_matrix.shape
@@ -1648,6 +2634,9 @@ class CppPropagationBackend:
                 [self._normalize_output(item, payload.normalize_columns) for item in trajectory_array],
                 axis=0,
             )
+            output_indices = payload.plan.output_indices
+            if output_indices is not None:
+                trajectory_array = trajectory_array[output_indices]
         resolved_stats = self._resolved_stats(stats, payload.plan)
         per_state_results = []
         for index, state in enumerate(final_states):
@@ -1662,15 +2651,189 @@ class CppPropagationBackend:
                         if trajectory_array is not None
                         else []
                     ),
-                    times=np.array(payload.plan.t_axis, copy=True),
+                    times=np.array(
+                        payload.plan.output_t_axis
+                        if payload.plan.output_t_axis is not None
+                        else payload.plan.t_axis,
+                        copy=True,
+                    ),
                     stats=dict(resolved_stats),
                 )
             )
         return BatchPropagationResult(
             final_states=final_states,
             results=per_state_results,
-            times=np.array(payload.plan.t_axis, copy=True),
+            times=np.array(
+                payload.plan.output_t_axis
+                if payload.plan.output_t_axis is not None
+                else payload.plan.t_axis,
+                copy=True,
+            ),
             stats=resolved_stats,
+        )
+
+
+class LindbladCppPropagationBackend:
+    """Exact native path for static-collapse Lindblad evolution.
+
+    The wrapper vectorizes the density matrix once and delegates all numerical
+    work to :class:`CppPropagationBackend`.  It intentionally accepts only
+    static collapse operators; unsupported time-dependent forms remain on the
+    QuTiP route instead of being sampled or silently altered.
+    """
+
+    def __init__(self, prepared) -> None:
+        if not cpp_backend_available():
+            raise BackendUnavailable(
+                "The optional C++ backend is not built. "
+                "Install the native build dependencies and set PYSUQU_BUILD_NATIVE=1."
+            )
+        if not prepared.c_ops:
+            raise ValueError("LindbladCppPropagationBackend requires at least one collapse operator")
+        if prepared.backend == "cpp_rwa":
+            raise UnsupportedBackendError(
+                "the approximate RWA path cannot be combined with native Lindblad propagation"
+            )
+        frame = str(getattr(prepared.options, "frame", "lab")).lower()
+        if frame == "interaction_exact":
+            raise UnsupportedBackendError(
+                "interaction_exact is currently defined for coherent ket propagation only"
+            )
+        dimension = int(prepared.static_hamiltonian.shape[0])
+        if prepared.static_hamiltonian.shape != (dimension, dimension):
+            raise UnsupportedBackendError("native Lindblad propagation requires a square Hamiltonian")
+        effective_static, effective_drives = _lindblad_effective_operators(
+            prepared.static_hamiltonian,
+            prepared.drive_terms,
+            prepared.c_ops,
+        )
+        extra = dict(getattr(prepared.options, "extra", {}) or {})
+        # A density-vector's Euclidean norm is not its trace.  Disable the ket
+        # adapter's optional norm correction and preserve the Lindblad trace
+        # exactly as produced by the numerical integrator.
+        extra["normalize_output"] = False
+        proxy_options = replace(
+            prepared.options,
+            backend="cpp",
+            frame="lab",
+            block_decompose="off",
+            extra=extra,
+        )
+        self.prepared = prepared
+        self.dimension = dimension
+        self._proxy = PreparedPropagation(
+            effective_static,
+            effective_drives,
+            prepared.tlist,
+            c_ops=[],
+            options=proxy_options,
+            args=prepared.args,
+            backend="cpp",
+        )
+        self._backend = CppPropagationBackend.from_prepared(self._proxy)
+
+    def _density(self, state: qt.Qobj) -> Tuple[qt.Qobj, Any]:
+        if not isinstance(state, qt.Qobj):
+            raise TypeError("initial_state must be a qutip.Qobj")
+        if state.shape != (self.dimension, self.dimension) and not state.isket:
+            raise ValueError("initial state dimension does not match the Hamiltonian")
+        if state.isket:
+            if state.shape[0] != self.dimension:
+                raise ValueError("initial state dimension does not match the Hamiltonian")
+            density = state * state.dag()
+        elif state.isoper and state.shape == (self.dimension, self.dimension):
+            density = state
+        else:
+            raise UnsupportedBackendError(
+                "native Lindblad propagation accepts ket or density-matrix initial states"
+            )
+        values = np.asarray(density.full(), dtype=np.complex128)
+        if not np.all(np.isfinite(values)):
+            raise ValueError("initial density matrix must contain finite values")
+        return density, density.dims
+
+    def _vector_state(self, density: qt.Qobj) -> qt.Qobj:
+        vector = np.asarray(density.full(), dtype=np.complex128).reshape(-1, order="F")
+        return qt.Qobj(
+            np.ascontiguousarray(vector[:, np.newaxis], dtype=np.complex128),
+            dims=[[self.dimension * self.dimension], [1]],
+        )
+
+    def _density_state(self, vector_state: qt.Qobj, dims) -> qt.Qobj:
+        vector = np.asarray(vector_state.full(), dtype=np.complex128).reshape(-1)
+        if vector.size != self.dimension * self.dimension:
+            raise ValueError("native Lindblad result has an invalid vector dimension")
+        matrix = np.asarray(
+            vector.reshape((self.dimension, self.dimension), order="F"),
+            dtype=np.complex128,
+        )
+        return qt.Qobj(matrix, dims=dims)
+
+    def propagate(self, initial_state: qt.Qobj) -> NativePropagationResult:
+        density, dims = self._density(initial_state)
+        result = self._backend.propagate(self._vector_state(density))
+        states = [self._density_state(item, dims) for item in result.states]
+        stats = dict(result.stats or {})
+        stats.update(
+            {
+                "open_system": "lindblad",
+                "liouvillian_dimension": self.dimension * self.dimension,
+                "collapse_operators": len(self.prepared.c_ops),
+            }
+        )
+        return NativePropagationResult(
+            final_state=self._density_state(result.final_state, dims),
+            states=states,
+            times=np.array(result.times, copy=True),
+            stats=stats,
+        )
+
+    def propagate_batch(self, initial_states: Sequence[qt.Qobj]) -> BatchPropagationResult:
+        states = list(initial_states)
+        if not states:
+            return BatchPropagationResult([], [], np.array(self.prepared.tlist, copy=True), {})
+        densities = []
+        dims = []
+        for state in states:
+            density, state_dims = self._density(state)
+            densities.append(self._vector_state(density))
+            dims.append(state_dims)
+        result = self._backend.propagate_batch(densities)
+        final_states = [
+            self._density_state(state, dims[index])
+            for index, state in enumerate(result.final_states)
+        ]
+        per_state = []
+        for index, item in enumerate(result.results):
+            stats = dict(item.stats or {})
+            stats.update(
+                {
+                    "open_system": "lindblad",
+                    "liouvillian_dimension": self.dimension * self.dimension,
+                    "collapse_operators": len(self.prepared.c_ops),
+                }
+            )
+            per_state.append(
+                NativePropagationResult(
+                    final_state=final_states[index],
+                    states=[self._density_state(value, dims[index]) for value in item.states],
+                    times=np.array(item.times, copy=True),
+                    stats=stats,
+                )
+            )
+        stats = dict(result.stats or {})
+        stats.update(
+            {
+                "open_system": "lindblad",
+                "liouvillian_dimension": self.dimension * self.dimension,
+                "collapse_operators": len(self.prepared.c_ops),
+            }
+        )
+        return BatchPropagationResult(
+            final_states=final_states,
+            results=per_state,
+            times=np.array(result.times, copy=True),
+            stats=stats,
         )
 
 
@@ -1682,4 +2845,8 @@ __all__ = [
     "cpp_csr_backend_available",
     "cpp_fused_csr_backend_available",
     "cpp_interaction_backend_available",
+    "LindbladCppPropagationBackend",
+    "cpp_lindblad_backend_available",
+    "clear_native_plan_cache",
+    "native_plan_cache_info",
 ]

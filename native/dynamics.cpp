@@ -176,11 +176,15 @@ struct Problem {
     const cdouble* iq{nullptr};
     const double* t_axis{nullptr};
     const double* lo_freqs{nullptr};
+    const std::int64_t* control_modes{nullptr};
+    const cdouble* iq_polynomial{nullptr};
     int n{0};
     int control_count{0};
     int sample_count{0};
     int batch_count{0};
     int mode{0};
+    int coefficient_order{1};
+    int polynomial_interval_count{0};
     double atol{1e-8};
     double rtol{1e-6};
     std::int64_t max_steps{2000000};
@@ -188,6 +192,11 @@ struct Problem {
     std::int64_t rhs_evaluations{0};
     std::int64_t exponential_evaluations{0};
     std::int64_t exponential_cache_hits{0};
+    std::int64_t krylov_evaluations{0};
+    std::int64_t krylov_iterations{0};
+    bool krylov_used{false};
+    // 0=off, 1=automatic for high-dimensional sparse problems, 2=explicit.
+    int sparse_expm_mode{1};
     std::int64_t diagonal_interval_evaluations{0};
     std::int64_t zero_interval_evaluations{0};
     bool whole_trace_exponential{false};
@@ -244,6 +253,24 @@ struct Problem {
     std::vector<cdouble> interaction_deltas;
     std::vector<double> interaction_unique_deltas;
     std::vector<std::int64_t> interaction_phase_indices;
+
+    int mode_for_control(int control) const {
+        if (control_modes != nullptr
+            && control >= 0
+            && control < control_count) {
+            return static_cast<int>(control_modes[control]);
+        }
+        return mode == 2 ? 0 : mode;
+    }
+
+    bool has_rf_control() const {
+        for (int control = 0; control < control_count; ++control) {
+            if (mode_for_control(control) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     void prepare_frequency_cache() {
         unique_angular_freqs.clear();
@@ -599,7 +626,21 @@ struct Problem {
             const double angular_frequency = angular_freqs.empty()
                 ? 2.0 * kPi * lo_freqs[control]
                 : angular_freqs[static_cast<std::size_t>(control)];
-            if (mode == 1) {
+            if (mode_for_control(control) == 1) {
+                if (iq_polynomial != nullptr && polynomial_interval_count > 0) {
+                    const std::size_t stride = static_cast<std::size_t>(coefficient_order + 1);
+                    for (int interval = 0; interval < polynomial_interval_count; ++interval) {
+                        const std::size_t base = (
+                            static_cast<std::size_t>(control) * polynomial_interval_count
+                            + static_cast<std::size_t>(interval)) * stride;
+                        for (int power = 1; power <= coefficient_order; ++power) {
+                            if (iq_polynomial[base + static_cast<std::size_t>(power)]
+                                != cdouble(0.0, 0.0)) {
+                                return false;
+                            }
+                        }
+                    }
+                }
                 for (int sample = 1; sample < sample_count; ++sample) {
                     if (iq[static_cast<std::size_t>(control) * sample_count + sample]
                         != first) {
@@ -607,6 +648,20 @@ struct Problem {
                     }
                 }
             } else if (angular_frequency == 0.0) {
+                if (iq_polynomial != nullptr && polynomial_interval_count > 0) {
+                    const std::size_t stride = static_cast<std::size_t>(coefficient_order + 1);
+                    for (int interval = 0; interval < polynomial_interval_count; ++interval) {
+                        const std::size_t base = (
+                            static_cast<std::size_t>(control) * polynomial_interval_count
+                            + static_cast<std::size_t>(interval)) * stride;
+                        for (int power = 1; power <= coefficient_order; ++power) {
+                            if (iq_polynomial[base + static_cast<std::size_t>(power)]
+                                != cdouble(0.0, 0.0)) {
+                                return false;
+                            }
+                        }
+                    }
+                }
                 for (int sample = 1; sample < sample_count; ++sample) {
                     if (iq[static_cast<std::size_t>(control) * sample_count + sample].real()
                         != first.real()) {
@@ -616,10 +671,25 @@ struct Problem {
             } else {
                 // A non-zero carrier is constant only when the envelope is
                 // identically zero; otherwise the RF coefficient oscillates.
-                for (int sample = 0; sample < sample_count; ++sample) {
-                    if (iq[static_cast<std::size_t>(control) * sample_count + sample]
-                        != cdouble(0.0, 0.0)) {
-                        return false;
+                if (iq_polynomial != nullptr && polynomial_interval_count > 0) {
+                    const std::size_t stride = static_cast<std::size_t>(coefficient_order + 1);
+                    for (int interval = 0; interval < polynomial_interval_count; ++interval) {
+                        const std::size_t base = (
+                            static_cast<std::size_t>(control) * polynomial_interval_count
+                            + static_cast<std::size_t>(interval)) * stride;
+                        for (int power = 0; power <= coefficient_order; ++power) {
+                            if (iq_polynomial[base + static_cast<std::size_t>(power)]
+                                != cdouble(0.0, 0.0)) {
+                                return false;
+                            }
+                        }
+                    }
+                } else {
+                    for (int sample = 0; sample < sample_count; ++sample) {
+                        if (iq[static_cast<std::size_t>(control) * sample_count + sample]
+                            != cdouble(0.0, 0.0)) {
+                            return false;
+                        }
                     }
                 }
             }
@@ -629,7 +699,7 @@ struct Problem {
 
     cdouble constant_coefficient(int control) const {
         const cdouble value = iq[static_cast<std::size_t>(control) * sample_count];
-        if (mode == 1) {
+        if (mode_for_control(control) == 1) {
             return value;
         }
         const double angular_frequency = angular_freqs.empty()
@@ -655,7 +725,37 @@ struct Problem {
             const double angular_frequency = angular_freqs.empty()
                 ? 2.0 * kPi * lo_freqs[control]
                 : angular_freqs[static_cast<std::size_t>(control)];
-            if (mode == 1) {
+            if (iq_polynomial != nullptr && polynomial_interval_count > 0) {
+                const std::size_t stride = static_cast<std::size_t>(coefficient_order + 1);
+                const std::size_t base = (
+                    static_cast<std::size_t>(control) * polynomial_interval_count
+                    + static_cast<std::size_t>(std::min(sample, polynomial_interval_count - 1)))
+                    * stride;
+                bool constant = true;
+                for (int power = 1; power <= coefficient_order; ++power) {
+                    if (iq_polynomial[base + static_cast<std::size_t>(power)]
+                        != cdouble(0.0, 0.0)) {
+                        constant = false;
+                        break;
+                    }
+                }
+                const cdouble value = iq_polynomial[base];
+                if (mode_for_control(control) == 1) {
+                    if (!constant) {
+                        return false;
+                    }
+                    scales_out[static_cast<std::size_t>(control)] = value;
+                } else if (value == cdouble(0.0, 0.0) && constant) {
+                    scales_out[static_cast<std::size_t>(control)] = cdouble(0.0, 0.0);
+                } else if (angular_frequency == 0.0 && constant) {
+                    scales_out[static_cast<std::size_t>(control)] =
+                        cdouble(value.real(), 0.0);
+                } else {
+                    return false;
+                }
+                continue;
+            }
+            if (mode_for_control(control) == 1) {
                 if (left != right) {
                     return false;
                 }
@@ -849,6 +949,91 @@ struct Problem {
         }
     }
 
+    // Apply the constant Hamiltonian to one vector without materialising a
+    // dense matrix.  This is used by the high-dimensional Krylov exponential
+    // action and preserves the exact CSR/banded/fused arithmetic order.
+    void apply_constant_single(
+        const cdouble* input,
+        cdouble* output,
+        const std::vector<cdouble>& scales) const {
+        std::fill(output, output + n, cdouble(0.0, 0.0));
+        if (!sparse && !banded && !fused_sparse) {
+            for (int row = 0; row < n; ++row) {
+                cdouble value(0.0, 0.0);
+                for (int column = 0; column < n; ++column) {
+                    const std::size_t matrix_index =
+                        static_cast<std::size_t>(row) * n + column;
+                    cdouble matrix_value = h0[matrix_index];
+                    for (int control = 0; control < control_count; ++control) {
+                        const cdouble scale = scales[static_cast<std::size_t>(control)];
+                        if (scale != cdouble(0.0, 0.0)) {
+                            matrix_value += scale * controls[
+                                static_cast<std::size_t>(control) * n * n + matrix_index];
+                        }
+                    }
+                    value += matrix_value * input[column];
+                }
+                output[row] = cdouble(0.0, -1.0) * value;
+            }
+            return;
+        }
+        if (sparse) {
+            for (int row = 0; row < n; ++row) {
+                for (std::int64_t entry = h0_sparse.indptr[row];
+                     entry < h0_sparse.indptr[row + 1]; ++entry) {
+                    output[row] += h0_sparse.data[entry]
+                        * input[static_cast<int>(h0_sparse.indices[entry])];
+                }
+                for (int control = 0; control < control_count; ++control) {
+                    const cdouble scale = scales[static_cast<std::size_t>(control)];
+                    if (scale == cdouble(0.0, 0.0)) {
+                        continue;
+                    }
+                    const SparseMatrixView& matrix = controls_sparse[
+                        static_cast<std::size_t>(control)];
+                    for (std::int64_t entry = matrix.indptr[row];
+                         entry < matrix.indptr[row + 1]; ++entry) {
+                        output[row] += scale * matrix.data[entry]
+                            * input[static_cast<int>(matrix.indices[entry])];
+                    }
+                }
+            }
+        } else if (banded) {
+            for (const BandedEntry& entry : banded_entries) {
+                cdouble value = h0_banded[entry.value_index];
+                for (int control = 0; control < control_count; ++control) {
+                    const cdouble scale = scales[static_cast<std::size_t>(control)];
+                    if (scale == cdouble(0.0, 0.0)) {
+                        continue;
+                    }
+                    value += scale * controls_banded[
+                        (static_cast<std::size_t>(control) * band_count + entry.band)
+                            * n + entry.row];
+                }
+                output[entry.row] += value * input[entry.column];
+            }
+        } else {
+            for (int row = 0; row < n; ++row) {
+                for (std::int64_t entry = fused_indptr[row];
+                     entry < fused_indptr[row + 1]; ++entry) {
+                    cdouble value = fused_static[entry];
+                    for (int control = 0; control < control_count; ++control) {
+                        const cdouble scale = scales[static_cast<std::size_t>(control)];
+                        if (scale != cdouble(0.0, 0.0)) {
+                            value += scale * fused_controls[
+                                static_cast<std::size_t>(control) * fused_nnz + entry];
+                        }
+                    }
+                    output[row] += value
+                        * input[static_cast<int>(fused_indices[entry])];
+                }
+            }
+        }
+        for (int row = 0; row < n; ++row) {
+            output[row] *= cdouble(0.0, -1.0);
+        }
+    }
+
     bool interpolation_coordinates(double t, int& left, double& fraction) const {
         if (t < t0 || t > t_last) {
             return false;
@@ -872,6 +1057,16 @@ struct Problem {
                     ? (t - interval_start) / interval_dt
                     : 0.0;
                 fraction = std::min(1.0, std::max(0.0, fraction));
+                // QuTiP's order-0 interpolator selects the most recent
+                // sample at an exact knot.  The interval-local fast path is
+                // otherwise allowed to reuse the preceding interval.
+                if (iq_polynomial != nullptr
+                    && coefficient_order == 0
+                    && source_interval + 1 < sample_count - 1
+                    && fraction >= 1.0) {
+                    left = source_interval + 1;
+                    fraction = 0.0;
+                }
             }
         }
         if (left < 0) {
@@ -903,7 +1098,26 @@ struct Problem {
     }
 
     cdouble interpolated_value(int control, int left, double fraction) const {
+        if (left >= sample_count - 1) {
+            return iq[static_cast<std::size_t>(control) * sample_count
+                       + static_cast<std::size_t>(sample_count - 1)];
+        }
         const int right = std::min(sample_count - 1, left + 1);
+        if (iq_polynomial != nullptr && polynomial_interval_count > 0) {
+            const int order = std::max(0, coefficient_order);
+            const std::size_t base = (
+                static_cast<std::size_t>(control) * polynomial_interval_count
+                + static_cast<std::size_t>(std::min(
+                    left,
+                    polynomial_interval_count - 1)))
+                * static_cast<std::size_t>(order + 1);
+            cdouble value = iq_polynomial[base + static_cast<std::size_t>(order)];
+            for (int power = order - 1; power >= 0; --power) {
+                value = value * fraction
+                    + iq_polynomial[base + static_cast<std::size_t>(power)];
+            }
+            return value;
+        }
         const cdouble left_value = iq[control * sample_count + left];
         cdouble value = left_value;
         if (right != left) {
@@ -919,7 +1133,7 @@ struct Problem {
     }
 
     cdouble physical_coefficient(int control, cdouble value, double t) const {
-        if (mode == 1) {
+        if (mode_for_control(control) == 1) {
             return value;
         }
         const double angular_frequency = angular_freqs.empty()
@@ -936,7 +1150,7 @@ struct Problem {
     }
 
     void fill_carrier_phases(double t, Workspace& workspace) const {
-        if (mode == 1 || unique_angular_freqs.empty()) {
+        if (!has_rf_control() || unique_angular_freqs.empty()) {
             return;
         }
         if (workspace.carrier_phase_valid && workspace.carrier_phase_time == t) {
@@ -958,7 +1172,7 @@ struct Problem {
         cdouble value,
         const Workspace& workspace,
         double time) const {
-        if (mode == 1) {
+        if (mode_for_control(control) == 1) {
             return value;
         }
         const double angular_frequency = angular_freqs.empty()
@@ -1650,6 +1864,170 @@ bool matrix_exponential(const Matrix& input, int n, Matrix& result) {
     return true;
 }
 
+double vector_two_norm(const std::vector<cdouble>& values) {
+    long double sum = 0.0L;
+    for (const cdouble value : values) {
+        const long double magnitude = static_cast<long double>(std::abs(value));
+        sum += magnitude * magnitude;
+    }
+    return std::sqrt(static_cast<double>(sum));
+}
+
+cdouble vector_inner_product(
+    const cdouble* left,
+    const cdouble* right,
+    int size) {
+    cdouble result(0.0, 0.0);
+    for (int index = 0; index < size; ++index) {
+        result += std::conj(left[index]) * right[index];
+    }
+    return result;
+}
+
+// Compute exp(-i H dt) v with an Arnoldi basis generated exclusively through
+// the sparse operator action.  Acceptance requires both the standard Arnoldi
+// residual estimate and agreement with the preceding Krylov dimension.  If
+// either certificate cannot be met within the bounded basis, the caller
+// falls back to the adaptive RK path rather than returning an unchecked result.
+bool krylov_exponential_action(
+    Problem& problem,
+    const std::vector<cdouble>& input,
+    const std::vector<cdouble>& scales,
+    double dt,
+    double tolerance,
+    int max_dimension,
+    std::vector<cdouble>& output,
+    int& used_dimension,
+    double& residual) {
+    const int n = problem.n;
+    output.assign(static_cast<std::size_t>(n), cdouble(0.0, 0.0));
+    used_dimension = 0;
+    residual = std::numeric_limits<double>::infinity();
+    if (input.size() != static_cast<std::size_t>(n)
+        || !std::isfinite(dt)
+        || !std::isfinite(tolerance)
+        || tolerance <= 0.0
+        || max_dimension < 1) {
+        return false;
+    }
+    const double input_norm = vector_two_norm(input);
+    if (!std::isfinite(input_norm)) {
+        return false;
+    }
+    if (input_norm == 0.0 || dt == 0.0) {
+        output = input;
+        used_dimension = 0;
+        residual = 0.0;
+        return true;
+    }
+    max_dimension = std::min(max_dimension, n);
+    const std::size_t basis_stride = static_cast<std::size_t>(n);
+    std::vector<cdouble> basis(
+        static_cast<std::size_t>(max_dimension + 1) * basis_stride,
+        cdouble(0.0, 0.0));
+    for (int index = 0; index < n; ++index) {
+        basis[static_cast<std::size_t>(index)] =
+            input[static_cast<std::size_t>(index)] / input_norm;
+    }
+    Matrix hessenberg(
+        static_cast<std::size_t>(max_dimension + 1) * max_dimension,
+        cdouble(0.0, 0.0));
+    std::vector<cdouble> work(static_cast<std::size_t>(n));
+    std::vector<cdouble> previous(static_cast<std::size_t>(n));
+    std::vector<cdouble> candidate(static_cast<std::size_t>(n));
+    bool have_previous = false;
+    const double scaled_tolerance = std::max(
+        tolerance + problem.rtol * input_norm,
+        32.0 * std::numeric_limits<double>::epsilon() * input_norm);
+
+    for (int column = 0; column < max_dimension; ++column) {
+        problem.apply_constant_single(
+            basis.data() + static_cast<std::size_t>(column) * basis_stride,
+            work.data(),
+            scales);
+        for (int pass = 0; pass < 2; ++pass) {
+            for (int row = 0; row <= column; ++row) {
+                const cdouble coefficient = vector_inner_product(
+                    basis.data() + static_cast<std::size_t>(row) * basis_stride,
+                    work.data(),
+                    n);
+                if (pass == 0) {
+                    hessenberg[static_cast<std::size_t>(row) * max_dimension + column] =
+                        coefficient;
+                } else {
+                    hessenberg[static_cast<std::size_t>(row) * max_dimension + column] +=
+                        coefficient;
+                }
+                for (int index = 0; index < n; ++index) {
+                    work[static_cast<std::size_t>(index)] -= coefficient
+                        * basis[static_cast<std::size_t>(row) * basis_stride + index];
+                }
+            }
+        }
+        const double subdiagonal = vector_two_norm(work);
+        hessenberg[static_cast<std::size_t>(column + 1) * max_dimension + column] =
+            cdouble(subdiagonal, 0.0);
+        const int dimension = column + 1;
+
+        Matrix small_matrix(
+            static_cast<std::size_t>(dimension) * dimension,
+            cdouble(0.0, 0.0));
+        for (int row = 0; row < dimension; ++row) {
+            for (int col = 0; col < dimension; ++col) {
+                small_matrix[static_cast<std::size_t>(row) * dimension + col] =
+                    hessenberg[static_cast<std::size_t>(row) * max_dimension + col]
+                    * dt;
+            }
+        }
+        Matrix small_exponential;
+        if (!matrix_exponential(small_matrix, dimension, small_exponential)) {
+            return false;
+        }
+        for (int index = 0; index < n; ++index) {
+            cdouble value(0.0, 0.0);
+            for (int row = 0; row < dimension; ++row) {
+                value += basis[static_cast<std::size_t>(row) * basis_stride + index]
+                    * small_exponential[static_cast<std::size_t>(row) * dimension];
+            }
+            candidate[static_cast<std::size_t>(index)] = input_norm * value;
+        }
+        residual = input_norm * std::abs(
+            subdiagonal * small_exponential[static_cast<std::size_t>(dimension - 1) * dimension]
+            * dt);
+        double difference = std::numeric_limits<double>::infinity();
+        if (have_previous) {
+            difference = 0.0;
+            for (int index = 0; index < n; ++index) {
+                difference = std::max(
+                    difference,
+                    std::abs(candidate[static_cast<std::size_t>(index)]
+                             - previous[static_cast<std::size_t>(index)]));
+            }
+        }
+        // A tiny subdiagonal is an exact Krylov breakdown: the generated
+        // subspace is invariant and the current exponential is complete.
+        const bool breakdown = subdiagonal <=
+            64.0 * std::numeric_limits<double>::epsilon();
+        if (breakdown || (dimension >= 4
+                          && residual <= scaled_tolerance
+                          && (!have_previous || difference <= scaled_tolerance))) {
+            output = candidate;
+            used_dimension = dimension;
+            return true;
+        }
+        previous = candidate;
+        have_previous = true;
+        if (subdiagonal <= 0.0 || !std::isfinite(subdiagonal)) {
+            return false;
+        }
+        for (int index = 0; index < n; ++index) {
+            basis[static_cast<std::size_t>(dimension) * basis_stride + index] =
+                work[static_cast<std::size_t>(index)] / subdiagonal;
+        }
+    }
+    return false;
+}
+
 void apply_matrix_to_state(
     const Matrix& matrix,
     int n,
@@ -1717,7 +2095,7 @@ bool integrate_interval(
         && std::abs(workspace.fsal_time - start)
             <= 8.0 * std::numeric_limits<double>::epsilon()
                 * std::max(1.0, std::abs(start));
-    if (!problem.interaction_picture && problem.mode == 0 && problem.max_frequency > 0.0) {
+    if (!problem.interaction_picture && problem.has_rf_control() && problem.max_frequency > 0.0) {
         // Give the first trial step enough resolution for a lab-frame carrier;
         // the embedded error estimate then expands or contracts it as needed.
         step = std::min(step, 0.1 / problem.max_frequency);
@@ -1900,6 +2278,73 @@ cdouble integrate_rf_linear(
     return cdouble(integral.real(), 0.0);
 }
 
+cdouble integrate_rf_polynomial(
+    const cdouble* coefficients,
+    int order,
+    double t0,
+    double t1,
+    double angular_frequency) {
+    const double dt = t1 - t0;
+    if (!(dt > 0.0) || coefficients == nullptr) {
+        return cdouble(0.0, 0.0);
+    }
+    if (angular_frequency == 0.0) {
+        cdouble integral(0.0, 0.0);
+        for (int power = 0; power <= order; ++power) {
+            integral += coefficients[power] * (dt / static_cast<double>(power + 1));
+        }
+        return cdouble(integral.real(), 0.0);
+    }
+    const double x = angular_frequency * dt;
+    cdouble carrier;
+    double carrier_sine = 0.0;
+    double carrier_cosine = 0.0;
+    sine_cosine(angular_frequency * t0, carrier_sine, carrier_cosine);
+    carrier = cdouble(carrier_cosine, carrier_sine);
+    cdouble scaled_integral(0.0, 0.0);
+    // The normalized-coordinate moments are evaluated by a short convergent
+    // series for small |x| and by integration-by-parts recurrence otherwise.
+    for (int power = 0; power <= order; ++power) {
+        cdouble moment(0.0, 0.0);
+        if (std::abs(x) < 0.25) {
+            cdouble term(1.0, 0.0);
+            for (int k = 0; k <= 24; ++k) {
+                if (k > 0) {
+                    term *= cdouble(0.0, x) / static_cast<double>(k);
+                }
+                moment += term / static_cast<double>(power + k + 1);
+                if (std::abs(term) < 2.0e-18) {
+                    break;
+                }
+            }
+            moment *= dt;
+        } else {
+            cdouble i0;
+            double sine = 0.0;
+            double cosine = 0.0;
+            sine_cosine(x, sine, cosine);
+            const cdouble phase(cosine, sine);
+            const cdouble iw(0.0, angular_frequency);
+            i0 = (phase - cdouble(1.0, 0.0)) / iw;
+            if (power == 0) {
+                moment = i0;
+            } else {
+                cdouble previous = i0;
+                for (int p = 1; p <= power; ++p) {
+                    const double endpoint_power = std::pow(dt, static_cast<double>(p));
+                    moment = phase * endpoint_power / iw
+                        - static_cast<double>(p) * previous / iw;
+                    previous = moment;
+                }
+            }
+            moment /= std::pow(dt, static_cast<double>(power));
+        }
+        scaled_integral += coefficients[power] * moment;
+    }
+    const cdouble integral = carrier * scaled_integral;
+    return cdouble(integral.real(), 0.0);
+}
+
 cdouble integrate_control_interval(
     const Problem& problem,
     int control,
@@ -1907,12 +2352,38 @@ cdouble integrate_control_interval(
     double start,
     double end) {
     const double dt = end - start;
+    if (problem.iq_polynomial != nullptr
+        && problem.polynomial_interval_count > 0
+        && sample < problem.polynomial_interval_count) {
+        const std::size_t base = (
+            static_cast<std::size_t>(control) * problem.polynomial_interval_count
+            + static_cast<std::size_t>(sample))
+            * static_cast<std::size_t>(problem.coefficient_order + 1);
+        const cdouble* coefficients = problem.iq_polynomial + base;
+        if (problem.mode_for_control(control) == 1) {
+            cdouble integral(0.0, 0.0);
+            for (int power = 0; power <= problem.coefficient_order; ++power) {
+                integral += coefficients[power]
+                    * (dt / static_cast<double>(power + 1));
+            }
+            return integral;
+        }
+        const double angular_frequency = problem.angular_freqs.empty()
+            ? 2.0 * kPi * problem.lo_freqs[control]
+            : problem.angular_freqs[static_cast<std::size_t>(control)];
+        return integrate_rf_polynomial(
+            coefficients,
+            problem.coefficient_order,
+            start,
+            end,
+            angular_frequency);
+    }
     const cdouble left = problem.iq[
         static_cast<std::size_t>(control) * problem.sample_count + sample];
     const cdouble right = problem.iq[
         static_cast<std::size_t>(control) * problem.sample_count
         + std::min(sample + 1, problem.sample_count - 1)];
-    if (problem.mode == 1) {
+    if (problem.mode_for_control(control) == 1) {
         return 0.5 * dt * (left + right);
     }
     const double angular_frequency = problem.angular_freqs.empty()
@@ -2086,6 +2557,108 @@ bool run_constant_exponential(
     return true;
 }
 
+bool run_constant_krylov(
+    Problem& problem,
+    std::vector<cdouble>& state,
+    bool store_trajectory,
+    std::vector<cdouble>& trajectory,
+    std::string& error_message) {
+    (void)error_message;
+    if (!(problem.sparse || problem.banded || problem.fused_sparse)
+        || problem.interaction_picture
+        || problem.sparse_expm_mode == 0
+        || (problem.n <= kMaxDenseExponentialDimension
+            && problem.sparse_expm_mode != 2)
+        || !problem.has_constant_coefficients()) {
+        return false;
+    }
+    std::vector<cdouble> scales(
+        static_cast<std::size_t>(problem.control_count), cdouble(0.0, 0.0));
+    for (int control = 0; control < problem.control_count; ++control) {
+        scales[static_cast<std::size_t>(control)] =
+            problem.constant_coefficient(control);
+    }
+    // The small projected exponential is dense, but the physical operator
+    // action remains sparse.  A bounded basis keeps memory proportional to
+    // n*max_dimension and guarantees a deterministic fallback for difficult
+    // non-normal matrices.
+    constexpr int kMaxKrylovDimension = 96;
+    const double tolerance = problem.atol;
+    std::vector<cdouble> working = state;
+    std::vector<cdouble> local_trajectory;
+    if (store_trajectory) {
+        local_trajectory.reserve(
+            static_cast<std::size_t>(problem.sample_count) * working.size());
+        local_trajectory.insert(local_trajectory.end(), working.begin(), working.end());
+    }
+    std::vector<cdouble> input(static_cast<std::size_t>(problem.n));
+    std::vector<cdouble> output(static_cast<std::size_t>(problem.n));
+    std::vector<cdouble> next(working.size(), cdouble(0.0, 0.0));
+    bool success = true;
+    Py_BEGIN_ALLOW_THREADS
+    try {
+        for (int sample = 0; sample + 1 < problem.sample_count; ++sample) {
+            const double dt = problem.t_axis[sample + 1] - problem.t_axis[sample];
+            if (!(dt > 0.0) || !std::isfinite(dt)) {
+                success = false;
+                break;
+            }
+            for (int batch = 0; batch < problem.batch_count && success; ++batch) {
+                for (int row = 0; row < problem.n; ++row) {
+                    input[static_cast<std::size_t>(row)] = working[
+                        static_cast<std::size_t>(row) * problem.batch_count + batch];
+                }
+                int used_dimension = 0;
+                double residual = 0.0;
+                if (!krylov_exponential_action(
+                        problem,
+                        input,
+                        scales,
+                        dt,
+                        tolerance,
+                        kMaxKrylovDimension,
+                        output,
+                        used_dimension,
+                        residual)) {
+                    success = false;
+                    break;
+                }
+                problem.krylov_evaluations += 1;
+                problem.krylov_iterations += used_dimension;
+                for (int row = 0; row < problem.n; ++row) {
+                    next[static_cast<std::size_t>(row) * problem.batch_count + batch] =
+                        output[static_cast<std::size_t>(row)];
+                }
+            }
+            if (!success) {
+                break;
+            }
+            working.swap(next);
+            if (store_trajectory) {
+                local_trajectory.insert(local_trajectory.end(), working.begin(), working.end());
+            }
+        }
+    } catch (...) {
+        success = false;
+    }
+    Py_END_ALLOW_THREADS
+    if (!success) {
+        return false;
+    }
+    state.swap(working);
+    if (store_trajectory) {
+        trajectory.swap(local_trajectory);
+    }
+    problem.krylov_used = true;
+    problem.attempted_steps = std::max<std::int64_t>(
+        0,
+        static_cast<std::int64_t>(problem.sample_count) - 1);
+    problem.rhs_evaluations = 0;
+    problem.max_error = 0.0;
+    problem.max_trial_error = 0.0;
+    return true;
+}
+
 void apply_interaction_frame(
     const Problem& problem,
     std::vector<cdouble>& state,
@@ -2209,6 +2782,24 @@ bool run_integration(
             store_trajectory,
             trajectory,
             error_message);
+    }
+    if ((problem.sparse || problem.banded || problem.fused_sparse)
+        && problem.sparse_expm_mode != 0
+        && (problem.n > kMaxDenseExponentialDimension
+            || problem.sparse_expm_mode == 2)
+        && problem.has_constant_coefficients()) {
+        if (run_constant_krylov(
+                problem,
+                state,
+                store_trajectory,
+                trajectory,
+                error_message)) {
+            return true;
+        }
+        // A failed certificate leaves ``state`` and ``trajectory`` untouched;
+        // continue with the established adaptive RK implementation.
+        problem.krylov_evaluations = 0;
+        problem.krylov_iterations = 0;
     }
     if (problem.has_constant_coefficients()) {
         if (run_constant_exponential(
@@ -2405,6 +2996,15 @@ PyObject* make_native_result(
     value = PyLong_FromLongLong(problem.exponential_cache_hits);
     PyDict_SetItemString(stats, "exponential_cache_hits", value);
     Py_DECREF(value);
+    value = PyLong_FromLongLong(problem.krylov_evaluations);
+    PyDict_SetItemString(stats, "krylov_evaluations", value);
+    Py_DECREF(value);
+    value = PyLong_FromLongLong(problem.krylov_iterations);
+    PyDict_SetItemString(stats, "krylov_iterations", value);
+    Py_DECREF(value);
+    value = PyLong_FromLong(problem.sparse_expm_mode);
+    PyDict_SetItemString(stats, "sparse_expm_mode", value);
+    Py_DECREF(value);
     value = PyLong_FromLongLong(problem.diagonal_interval_evaluations);
     PyDict_SetItemString(stats, "diagonal_interval_evaluations", value);
     Py_DECREF(value);
@@ -2413,6 +3013,9 @@ PyObject* make_native_result(
     Py_DECREF(value);
     value = PyBool_FromLong(problem.interaction_dense ? 1 : 0);
     PyDict_SetItemString(stats, "interaction_dense", value);
+    Py_DECREF(value);
+    value = PyLong_FromLong(problem.mode);
+    PyDict_SetItemString(stats, "mode", value);
     Py_DECREF(value);
     const char* integrator_name = problem.sparse
         ? "cpp_dopri5_csr"
@@ -2433,6 +3036,9 @@ PyObject* make_native_result(
     if (problem.interaction_picture) {
         integrator_name = "cpp_interaction_exact_csr";
     }
+    if (problem.krylov_used) {
+        integrator_name = "cpp_constant_krylov_csr";
+    }
     value = PyUnicode_FromString(integrator_name);
     PyDict_SetItemString(stats, "integrator", value);
     Py_DECREF(value);
@@ -2450,6 +3056,16 @@ PyObject* make_native_result(
     return result;
 }
 
+bool validate_polynomial_view(
+    const BufferView& view,
+    int control_count,
+    int interval_count,
+    int coefficient_order);
+
+bool validate_control_modes_view(
+    const BufferView& view,
+    int control_count);
+
 PyObject* native_propagate(PyObject*, PyObject* args, PyObject* kwargs) {
     PyObject* h0_object = nullptr;
     PyObject* controls_object = nullptr;
@@ -2462,14 +3078,19 @@ PyObject* native_propagate(PyObject*, PyObject* args, PyObject* kwargs) {
     double rtol = 1e-6;
     long long max_steps = 2000000;
     int store_trajectory = 0;
+    int sparse_expm = 1;
+    PyObject* iq_polynomial_object = Py_None;
+    int coefficient_order = 1;
+    PyObject* control_modes_object = Py_None;
     static const char* keywords[] = {
         "h0", "controls", "iq", "t_axis", "initial_states", "lo_freqs",
-        "mode", "atol", "rtol", "max_steps", "store_trajectory", nullptr
+        "mode", "atol", "rtol", "max_steps", "store_trajectory", "sparse_expm",
+        "iq_polynomial", "coefficient_order", "control_modes", nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOO|iddLi",
+            "OOOOOO|iddLiiOiO",
             const_cast<char**>(keywords),
             &h0_object,
             &controls_object,
@@ -2481,11 +3102,15 @@ PyObject* native_propagate(PyObject*, PyObject* args, PyObject* kwargs) {
             &atol,
             &rtol,
             &max_steps,
-            &store_trajectory)) {
+            &store_trajectory,
+            &sparse_expm,
+            &iq_polynomial_object,
+            &coefficient_order,
+            &control_modes_object)) {
         return nullptr;
     }
-    if (mode != 0 && mode != 1) {
-        PyErr_SetString(PyExc_ValueError, "mode must be 0 (RF) or 1 (complex envelope)");
+    if (mode != 0 && mode != 1 && mode != 2) {
+        PyErr_SetString(PyExc_ValueError, "mode must be 0 (RF), 1 (complex envelope), or 2 (mixed)");
         return nullptr;
     }
     if (!std::isfinite(atol) || !std::isfinite(rtol)
@@ -2495,14 +3120,38 @@ PyObject* native_propagate(PyObject*, PyObject* args, PyObject* kwargs) {
             "atol and rtol must be finite and positive; max_steps must be positive");
         return nullptr;
     }
+    if (sparse_expm < 0 || sparse_expm > 2) {
+        PyErr_SetString(PyExc_ValueError, "sparse_expm must be 0 (off), 1 (auto), or 2 (on)");
+        return nullptr;
+    }
+    if (coefficient_order < 0 || coefficient_order > 3) {
+        PyErr_SetString(PyExc_ValueError, "coefficient_order must be between 0 and 3");
+        return nullptr;
+    }
 
     BufferView h0_view, controls_view, iq_view, t_view, initial_view, lo_view;
+    BufferView iq_polynomial_view;
+    const bool has_polynomial = iq_polynomial_object != Py_None;
+    BufferView control_modes_view;
+    const bool has_control_modes = control_modes_object != Py_None;
     if (!h0_view.acquire(h0_object, "h0", 2, sizeof(cdouble))
         || !controls_view.acquire(controls_object, "controls", 3, sizeof(cdouble))
         || !iq_view.acquire(iq_object, "iq", 2, sizeof(cdouble))
         || !t_view.acquire(t_axis_object, "t_axis", 1, sizeof(double))
         || !initial_view.acquire(initial_object, "initial_states", 2, sizeof(cdouble))
-        || !lo_view.acquire(lo_freqs_object, "lo_freqs", 1, sizeof(double))) {
+        || !lo_view.acquire(lo_freqs_object, "lo_freqs", 1, sizeof(double))
+        || (has_polynomial
+            && !iq_polynomial_view.acquire(
+                iq_polynomial_object,
+                "iq_polynomial",
+                3,
+                sizeof(cdouble)))
+        || (has_control_modes
+            && !control_modes_view.acquire(
+                control_modes_object,
+                "control_modes",
+                1,
+                sizeof(std::int64_t)))) {
         return nullptr;
     }
 
@@ -2525,6 +3174,28 @@ PyObject* native_propagate(PyObject*, PyObject* args, PyObject* kwargs) {
         || initial_rows != problem.n || problem.batch_count < 1
         || t_count != problem.sample_count || lo_count != problem.control_count) {
         PyErr_SetString(PyExc_ValueError, "native propagation array shapes are inconsistent");
+        return nullptr;
+    }
+    if (has_polynomial) {
+        if (!validate_polynomial_view(
+                iq_polynomial_view,
+                problem.control_count,
+                std::max(0, problem.sample_count - 1),
+                coefficient_order)) {
+            return nullptr;
+        }
+    } else if (coefficient_order != 1 && problem.control_count > 0) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "iq_polynomial is required when coefficient_order is not 1");
+        return nullptr;
+    }
+    if (has_control_modes) {
+        if (!validate_control_modes_view(control_modes_view, problem.control_count)) {
+            return nullptr;
+        }
+    } else if (mode == 2 && problem.control_count > 0) {
+        PyErr_SetString(PyExc_ValueError, "control_modes is required for mixed mode");
         return nullptr;
     }
     const std::size_t h0_size = static_cast<std::size_t>(problem.n) * problem.n;
@@ -2576,6 +3247,15 @@ PyObject* native_propagate(PyObject*, PyObject* args, PyObject* kwargs) {
     problem.atol = atol;
     problem.rtol = rtol;
     problem.max_steps = static_cast<std::int64_t>(max_steps);
+    problem.sparse_expm_mode = sparse_expm;
+    problem.coefficient_order = coefficient_order;
+    problem.polynomial_interval_count = std::max(0, problem.sample_count - 1);
+    problem.iq_polynomial = has_polynomial
+        ? iq_polynomial_view.data<cdouble>()
+        : nullptr;
+    problem.control_modes = has_control_modes
+        ? control_modes_view.data<std::int64_t>()
+        : nullptr;
     problem.t0 = problem.t_axis[0];
     problem.t_last = problem.t_axis[problem.sample_count - 1];
     problem.detect_diagonal_dense();
@@ -2698,6 +3378,53 @@ bool validate_sparse_matrix(
     return true;
 }
 
+bool validate_control_modes_view(
+    const BufferView& view,
+    int control_count) {
+    if (view.view.ndim != 1
+        || view.view.shape[0] != static_cast<Py_ssize_t>(control_count)) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "control_modes must have shape (control_count,)");
+        return false;
+    }
+    const auto* modes = view.data<std::int64_t>();
+    for (int control = 0; control < control_count; ++control) {
+        if (modes[control] != 0 && modes[control] != 1) {
+            PyErr_SetString(PyExc_ValueError, "control_modes entries must be 0 (RF) or 1 (complex envelope)");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool validate_polynomial_view(
+    const BufferView& view,
+    int control_count,
+    int interval_count,
+    int coefficient_order) {
+    if (view.view.ndim != 3
+        || view.view.shape[0] != static_cast<Py_ssize_t>(control_count)
+        || view.view.shape[1] != static_cast<Py_ssize_t>(interval_count)
+        || view.view.shape[2] != static_cast<Py_ssize_t>(coefficient_order + 1)) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "iq_polynomial must have shape (control_count, sample_count-1, coefficient_order+1)");
+        return false;
+    }
+    const std::size_t size = static_cast<std::size_t>(control_count)
+        * static_cast<std::size_t>(interval_count)
+        * static_cast<std::size_t>(coefficient_order + 1);
+    const cdouble* values = view.data<cdouble>();
+    for (std::size_t index = 0; index < size; ++index) {
+        if (!finite_value(values[index])) {
+            PyErr_SetString(PyExc_ValueError, "iq_polynomial must contain only finite values");
+            return false;
+        }
+    }
+    return true;
+}
+
 PyObject* native_propagate_csr(PyObject*, PyObject* args, PyObject* kwargs) {
     PyObject* h0_data_object = nullptr;
     PyObject* h0_indices_object = nullptr;
@@ -2715,16 +3442,21 @@ PyObject* native_propagate_csr(PyObject*, PyObject* args, PyObject* kwargs) {
     double rtol = 1e-6;
     long long max_steps = 2000000;
     int store_trajectory = 0;
+    int sparse_expm = 1;
+    PyObject* iq_polynomial_object = Py_None;
+    int coefficient_order = 1;
+    PyObject* control_modes_object = Py_None;
     static const char* keywords[] = {
         "h0_data", "h0_indices", "h0_indptr",
         "controls_data", "controls_indices", "controls_indptr", "controls_offsets",
         "iq", "t_axis", "initial_states", "lo_freqs",
-        "mode", "atol", "rtol", "max_steps", "store_trajectory", nullptr
+        "mode", "atol", "rtol", "max_steps", "store_trajectory", "sparse_expm",
+        "iq_polynomial", "coefficient_order", "control_modes", nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOOOOOO|iddLi",
+            "OOOOOOOOOOO|iddLiiOiO",
             const_cast<char**>(keywords),
             &h0_data_object,
             &h0_indices_object,
@@ -2741,11 +3473,15 @@ PyObject* native_propagate_csr(PyObject*, PyObject* args, PyObject* kwargs) {
             &atol,
             &rtol,
             &max_steps,
-            &store_trajectory)) {
+            &store_trajectory,
+            &sparse_expm,
+            &iq_polynomial_object,
+            &coefficient_order,
+            &control_modes_object)) {
         return nullptr;
     }
-    if (mode != 0 && mode != 1) {
-        PyErr_SetString(PyExc_ValueError, "mode must be 0 (RF) or 1 (complex envelope)");
+    if (mode != 0 && mode != 1 && mode != 2) {
+        PyErr_SetString(PyExc_ValueError, "mode must be 0 (RF), 1 (complex envelope), or 2 (mixed)");
         return nullptr;
     }
     if (!std::isfinite(atol) || !std::isfinite(rtol)
@@ -2755,10 +3491,22 @@ PyObject* native_propagate_csr(PyObject*, PyObject* args, PyObject* kwargs) {
             "atol and rtol must be finite and positive; max_steps must be positive");
         return nullptr;
     }
+    if (sparse_expm < 0 || sparse_expm > 2) {
+        PyErr_SetString(PyExc_ValueError, "sparse_expm must be 0 (off), 1 (auto), or 2 (on)");
+        return nullptr;
+    }
+    if (coefficient_order < 0 || coefficient_order > 3) {
+        PyErr_SetString(PyExc_ValueError, "coefficient_order must be between 0 and 3");
+        return nullptr;
+    }
 
     BufferView h0_data_view, h0_indices_view, h0_indptr_view;
     BufferView controls_data_view, controls_indices_view, controls_indptr_view, controls_offsets_view;
     BufferView iq_view, t_view, initial_view, lo_view;
+    BufferView iq_polynomial_view;
+    const bool has_polynomial = iq_polynomial_object != Py_None;
+    BufferView control_modes_view;
+    const bool has_control_modes = control_modes_object != Py_None;
     if (!h0_data_view.acquire(h0_data_object, "h0_data", 1, sizeof(cdouble))
         || !h0_indices_view.acquire(h0_indices_object, "h0_indices", 1, sizeof(std::int64_t))
         || !h0_indptr_view.acquire(h0_indptr_object, "h0_indptr", 1, sizeof(std::int64_t))
@@ -2769,7 +3517,19 @@ PyObject* native_propagate_csr(PyObject*, PyObject* args, PyObject* kwargs) {
         || !iq_view.acquire(iq_object, "iq", 2, sizeof(cdouble))
         || !t_view.acquire(t_axis_object, "t_axis", 1, sizeof(double))
         || !initial_view.acquire(initial_object, "initial_states", 2, sizeof(cdouble))
-        || !lo_view.acquire(lo_freqs_object, "lo_freqs", 1, sizeof(double))) {
+        || !lo_view.acquire(lo_freqs_object, "lo_freqs", 1, sizeof(double))
+        || (has_polynomial
+            && !iq_polynomial_view.acquire(
+                iq_polynomial_object,
+                "iq_polynomial",
+                3,
+                sizeof(cdouble)))
+        || (has_control_modes
+            && !control_modes_view.acquire(
+                control_modes_object,
+                "control_modes",
+                1,
+                sizeof(std::int64_t)))) {
         return nullptr;
     }
 
@@ -2787,6 +3547,28 @@ PyObject* native_propagate_csr(PyObject*, PyObject* args, PyObject* kwargs) {
         || initial_view.view.shape[0] != static_cast<Py_ssize_t>(n)
         || sample_count < 1 || batch_count < 1) {
         PyErr_SetString(PyExc_ValueError, "sparse propagation array shapes are inconsistent");
+        return nullptr;
+    }
+    if (has_polynomial) {
+        if (!validate_polynomial_view(
+                iq_polynomial_view,
+                control_count,
+                std::max(0, sample_count - 1),
+                coefficient_order)) {
+            return nullptr;
+        }
+    } else if (coefficient_order != 1 && control_count > 0) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "iq_polynomial is required when coefficient_order is not 1");
+        return nullptr;
+    }
+    if (has_control_modes) {
+        if (!validate_control_modes_view(control_modes_view, control_count)) {
+            return nullptr;
+        }
+    } else if (mode == 2 && control_count > 0) {
+        PyErr_SetString(PyExc_ValueError, "control_modes is required for mixed mode");
         return nullptr;
     }
 
@@ -2877,6 +3659,15 @@ PyObject* native_propagate_csr(PyObject*, PyObject* args, PyObject* kwargs) {
     problem.atol = atol;
     problem.rtol = rtol;
     problem.max_steps = static_cast<std::int64_t>(max_steps);
+    problem.sparse_expm_mode = sparse_expm;
+    problem.coefficient_order = coefficient_order;
+    problem.polynomial_interval_count = std::max(0, sample_count - 1);
+    problem.iq_polynomial = has_polynomial
+        ? iq_polynomial_view.data<cdouble>()
+        : nullptr;
+    problem.control_modes = has_control_modes
+        ? control_modes_view.data<std::int64_t>()
+        : nullptr;
     problem.t0 = problem.t_axis[0];
     problem.t_last = problem.t_axis[sample_count - 1];
     problem.sparse = true;
@@ -2984,15 +3775,20 @@ PyObject* native_propagate_interaction_csr(PyObject*, PyObject* args, PyObject* 
     double rtol = 1e-6;
     long long max_steps = 2000000;
     int store_trajectory = 0;
+    int sparse_expm = 1;
+    PyObject* iq_polynomial_object = Py_None;
+    int coefficient_order = 1;
+    PyObject* control_modes_object = Py_None;
     static const char* keywords[] = {
         "diagonal_energies", "controls_data", "indices", "indptr",
         "iq", "t_axis", "initial_states", "lo_freqs",
-        "mode", "atol", "rtol", "max_steps", "store_trajectory", nullptr
+        "mode", "atol", "rtol", "max_steps", "store_trajectory", "sparse_expm",
+        "iq_polynomial", "coefficient_order", "control_modes", nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOOO|iddLi",
+            "OOOOOOOO|iddLiiOiO",
             const_cast<char**>(keywords),
             &energies_object,
             &controls_object,
@@ -3006,11 +3802,15 @@ PyObject* native_propagate_interaction_csr(PyObject*, PyObject* args, PyObject* 
             &atol,
             &rtol,
             &max_steps,
-            &store_trajectory)) {
+            &store_trajectory,
+            &sparse_expm,
+            &iq_polynomial_object,
+            &coefficient_order,
+            &control_modes_object)) {
         return nullptr;
     }
-    if (mode != 0 && mode != 1) {
-        PyErr_SetString(PyExc_ValueError, "mode must be 0 (RF) or 1 (complex envelope)");
+    if (mode != 0 && mode != 1 && mode != 2) {
+        PyErr_SetString(PyExc_ValueError, "mode must be 0 (RF), 1 (complex envelope), or 2 (mixed)");
         return nullptr;
     }
     if (!std::isfinite(atol) || !std::isfinite(rtol)
@@ -3020,9 +3820,21 @@ PyObject* native_propagate_interaction_csr(PyObject*, PyObject* args, PyObject* 
             "atol and rtol must be finite and positive; max_steps must be positive");
         return nullptr;
     }
+    if (sparse_expm < 0 || sparse_expm > 2) {
+        PyErr_SetString(PyExc_ValueError, "sparse_expm must be 0 (off), 1 (auto), or 2 (on)");
+        return nullptr;
+    }
+    if (coefficient_order < 0 || coefficient_order > 3) {
+        PyErr_SetString(PyExc_ValueError, "coefficient_order must be between 0 and 3");
+        return nullptr;
+    }
 
     BufferView energies_view, controls_view, indices_view, indptr_view;
     BufferView iq_view, t_view, initial_view, lo_view;
+    BufferView iq_polynomial_view;
+    const bool has_polynomial = iq_polynomial_object != Py_None;
+    BufferView control_modes_view;
+    const bool has_control_modes = control_modes_object != Py_None;
     if (!energies_view.acquire(energies_object, "diagonal_energies", 1, sizeof(cdouble))
         || !controls_view.acquire(controls_object, "controls_data", 2, sizeof(cdouble))
         || !indices_view.acquire(indices_object, "indices", 1, sizeof(std::int64_t))
@@ -3030,7 +3842,19 @@ PyObject* native_propagate_interaction_csr(PyObject*, PyObject* args, PyObject* 
         || !iq_view.acquire(iq_object, "iq", 2, sizeof(cdouble))
         || !t_view.acquire(t_axis_object, "t_axis", 1, sizeof(double))
         || !initial_view.acquire(initial_object, "initial_states", 2, sizeof(cdouble))
-        || !lo_view.acquire(lo_freqs_object, "lo_freqs", 1, sizeof(double))) {
+        || !lo_view.acquire(lo_freqs_object, "lo_freqs", 1, sizeof(double))
+        || (has_polynomial
+            && !iq_polynomial_view.acquire(
+                iq_polynomial_object,
+                "iq_polynomial",
+                3,
+                sizeof(cdouble)))
+        || (has_control_modes
+            && !control_modes_view.acquire(
+                control_modes_object,
+                "control_modes",
+                1,
+                sizeof(std::int64_t)))) {
         return nullptr;
     }
 
@@ -3050,6 +3874,28 @@ PyObject* native_propagate_interaction_csr(PyObject*, PyObject* args, PyObject* 
         || sample_count < 1
         || batch_count < 1) {
         PyErr_SetString(PyExc_ValueError, "interaction CSR array shapes are inconsistent");
+        return nullptr;
+    }
+    if (has_polynomial) {
+        if (!validate_polynomial_view(
+                iq_polynomial_view,
+                control_count,
+                std::max(0, sample_count - 1),
+                coefficient_order)) {
+            return nullptr;
+        }
+    } else if (coefficient_order != 1 && control_count > 0) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "iq_polynomial is required when coefficient_order is not 1");
+        return nullptr;
+    }
+    if (has_control_modes) {
+        if (!validate_control_modes_view(control_modes_view, control_count)) {
+            return nullptr;
+        }
+    } else if (mode == 2 && control_count > 0) {
+        PyErr_SetString(PyExc_ValueError, "control_modes is required for mixed mode");
         return nullptr;
     }
 
@@ -3134,6 +3980,15 @@ PyObject* native_propagate_interaction_csr(PyObject*, PyObject* args, PyObject* 
     problem.atol = atol;
     problem.rtol = rtol;
     problem.max_steps = static_cast<std::int64_t>(max_steps);
+    problem.sparse_expm_mode = sparse_expm;
+    problem.coefficient_order = coefficient_order;
+    problem.polynomial_interval_count = std::max(0, sample_count - 1);
+    problem.iq_polynomial = has_polynomial
+        ? iq_polynomial_view.data<cdouble>()
+        : nullptr;
+    problem.control_modes = has_control_modes
+        ? control_modes_view.data<std::int64_t>()
+        : nullptr;
     problem.t0 = problem.t_axis[0];
     problem.t_last = problem.t_axis[sample_count - 1];
     problem.interaction_picture = true;
@@ -3218,15 +4073,20 @@ PyObject* native_propagate_banded(PyObject*, PyObject* args, PyObject* kwargs) {
     double rtol = 1e-6;
     long long max_steps = 2000000;
     int store_trajectory = 0;
+    int sparse_expm = 1;
+    PyObject* iq_polynomial_object = Py_None;
+    int coefficient_order = 1;
+    PyObject* control_modes_object = Py_None;
     static const char* keywords[] = {
         "h0_banded", "controls_banded", "band_offsets",
         "iq", "t_axis", "initial_states", "lo_freqs",
-        "mode", "atol", "rtol", "max_steps", "store_trajectory", nullptr
+        "mode", "atol", "rtol", "max_steps", "store_trajectory", "sparse_expm",
+        "iq_polynomial", "coefficient_order", "control_modes", nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOO|iddLi",
+            "OOOOOOO|iddLiiOiO",
             const_cast<char**>(keywords),
             &h0_banded_object,
             &controls_banded_object,
@@ -3239,11 +4099,15 @@ PyObject* native_propagate_banded(PyObject*, PyObject* args, PyObject* kwargs) {
             &atol,
             &rtol,
             &max_steps,
-            &store_trajectory)) {
+            &store_trajectory,
+            &sparse_expm,
+            &iq_polynomial_object,
+            &coefficient_order,
+            &control_modes_object)) {
         return nullptr;
     }
-    if (mode != 0 && mode != 1) {
-        PyErr_SetString(PyExc_ValueError, "mode must be 0 (RF) or 1 (complex envelope)");
+    if (mode != 0 && mode != 1 && mode != 2) {
+        PyErr_SetString(PyExc_ValueError, "mode must be 0 (RF), 1 (complex envelope), or 2 (mixed)");
         return nullptr;
     }
     if (!std::isfinite(atol) || !std::isfinite(rtol)
@@ -3253,16 +4117,40 @@ PyObject* native_propagate_banded(PyObject*, PyObject* args, PyObject* kwargs) {
             "atol and rtol must be finite and positive; max_steps must be positive");
         return nullptr;
     }
+    if (sparse_expm < 0 || sparse_expm > 2) {
+        PyErr_SetString(PyExc_ValueError, "sparse_expm must be 0 (off), 1 (auto), or 2 (on)");
+        return nullptr;
+    }
+    if (coefficient_order < 0 || coefficient_order > 3) {
+        PyErr_SetString(PyExc_ValueError, "coefficient_order must be between 0 and 3");
+        return nullptr;
+    }
 
     BufferView h0_view, controls_view, offsets_view;
     BufferView iq_view, t_view, initial_view, lo_view;
+    BufferView iq_polynomial_view;
+    const bool has_polynomial = iq_polynomial_object != Py_None;
+    BufferView control_modes_view;
+    const bool has_control_modes = control_modes_object != Py_None;
     if (!h0_view.acquire(h0_banded_object, "h0_banded", 2, sizeof(cdouble))
         || !controls_view.acquire(controls_banded_object, "controls_banded", 3, sizeof(cdouble))
         || !offsets_view.acquire(band_offsets_object, "band_offsets", 1, sizeof(std::int64_t))
         || !iq_view.acquire(iq_object, "iq", 2, sizeof(cdouble))
         || !t_view.acquire(t_axis_object, "t_axis", 1, sizeof(double))
         || !initial_view.acquire(initial_object, "initial_states", 2, sizeof(cdouble))
-        || !lo_view.acquire(lo_freqs_object, "lo_freqs", 1, sizeof(double))) {
+        || !lo_view.acquire(lo_freqs_object, "lo_freqs", 1, sizeof(double))
+        || (has_polynomial
+            && !iq_polynomial_view.acquire(
+                iq_polynomial_object,
+                "iq_polynomial",
+                3,
+                sizeof(cdouble)))
+        || (has_control_modes
+            && !control_modes_view.acquire(
+                control_modes_object,
+                "control_modes",
+                1,
+                sizeof(std::int64_t)))) {
         return nullptr;
     }
 
@@ -3287,7 +4175,28 @@ PyObject* native_propagate_banded(PyObject*, PyObject* args, PyObject* kwargs) {
         PyErr_SetString(PyExc_ValueError, "banded propagation array shapes are inconsistent");
         return nullptr;
     }
-
+    if (has_polynomial) {
+        if (!validate_polynomial_view(
+                iq_polynomial_view,
+                control_count,
+                std::max(0, sample_count - 1),
+                coefficient_order)) {
+            return nullptr;
+        }
+    } else if (coefficient_order != 1 && control_count > 0) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "iq_polynomial is required when coefficient_order is not 1");
+        return nullptr;
+    }
+    if (has_control_modes) {
+        if (!validate_control_modes_view(control_modes_view, control_count)) {
+            return nullptr;
+        }
+    } else if (mode == 2 && control_count > 0) {
+        PyErr_SetString(PyExc_ValueError, "control_modes is required for mixed mode");
+        return nullptr;
+    }
     const auto* band_offsets = offsets_view.data<std::int64_t>();
     for (int band = 0; band < band_count; ++band) {
         if (band_offsets[band] < -static_cast<std::int64_t>(n - 1)
@@ -3352,6 +4261,15 @@ PyObject* native_propagate_banded(PyObject*, PyObject* args, PyObject* kwargs) {
     problem.atol = atol;
     problem.rtol = rtol;
     problem.max_steps = static_cast<std::int64_t>(max_steps);
+    problem.sparse_expm_mode = sparse_expm;
+    problem.coefficient_order = coefficient_order;
+    problem.polynomial_interval_count = std::max(0, sample_count - 1);
+    problem.iq_polynomial = has_polynomial
+        ? iq_polynomial_view.data<cdouble>()
+        : nullptr;
+    problem.control_modes = has_control_modes
+        ? control_modes_view.data<std::int64_t>()
+        : nullptr;
     problem.t0 = problem.t_axis[0];
     problem.t_last = problem.t_axis[sample_count - 1];
     problem.banded = true;
@@ -3429,15 +4347,20 @@ PyObject* native_propagate_fused_csr(PyObject*, PyObject* args, PyObject* kwargs
     double rtol = 1e-6;
     long long max_steps = 2000000;
     int store_trajectory = 0;
+    int sparse_expm = 1;
+    PyObject* iq_polynomial_object = Py_None;
+    int coefficient_order = 1;
+    PyObject* control_modes_object = Py_None;
     static const char* keywords[] = {
         "static_data", "indices", "indptr", "controls_data",
         "iq", "t_axis", "initial_states", "lo_freqs",
-        "mode", "atol", "rtol", "max_steps", "store_trajectory", nullptr
+        "mode", "atol", "rtol", "max_steps", "store_trajectory", "sparse_expm",
+        "iq_polynomial", "coefficient_order", "control_modes", nullptr
     };
     if (!PyArg_ParseTupleAndKeywords(
             args,
             kwargs,
-            "OOOOOOOO|iddLi",
+            "OOOOOOOO|iddLiiOiO",
             const_cast<char**>(keywords),
             &static_data_object,
             &indices_object,
@@ -3451,11 +4374,15 @@ PyObject* native_propagate_fused_csr(PyObject*, PyObject* args, PyObject* kwargs
             &atol,
             &rtol,
             &max_steps,
-            &store_trajectory)) {
+            &store_trajectory,
+            &sparse_expm,
+            &iq_polynomial_object,
+            &coefficient_order,
+            &control_modes_object)) {
         return nullptr;
     }
-    if (mode != 0 && mode != 1) {
-        PyErr_SetString(PyExc_ValueError, "mode must be 0 (RF) or 1 (complex envelope)");
+    if (mode != 0 && mode != 1 && mode != 2) {
+        PyErr_SetString(PyExc_ValueError, "mode must be 0 (RF), 1 (complex envelope), or 2 (mixed)");
         return nullptr;
     }
     if (!std::isfinite(atol) || !std::isfinite(rtol)
@@ -3465,9 +4392,21 @@ PyObject* native_propagate_fused_csr(PyObject*, PyObject* args, PyObject* kwargs
             "atol and rtol must be finite and positive; max_steps must be positive");
         return nullptr;
     }
+    if (sparse_expm < 0 || sparse_expm > 2) {
+        PyErr_SetString(PyExc_ValueError, "sparse_expm must be 0 (off), 1 (auto), or 2 (on)");
+        return nullptr;
+    }
+    if (coefficient_order < 0 || coefficient_order > 3) {
+        PyErr_SetString(PyExc_ValueError, "coefficient_order must be between 0 and 3");
+        return nullptr;
+    }
 
     BufferView static_view, indices_view, indptr_view, controls_view;
     BufferView iq_view, t_view, initial_view, lo_view;
+    BufferView iq_polynomial_view;
+    const bool has_polynomial = iq_polynomial_object != Py_None;
+    BufferView control_modes_view;
+    const bool has_control_modes = control_modes_object != Py_None;
     if (!static_view.acquire(static_data_object, "static_data", 1, sizeof(cdouble))
         || !indices_view.acquire(indices_object, "indices", 1, sizeof(std::int64_t))
         || !indptr_view.acquire(indptr_object, "indptr", 1, sizeof(std::int64_t))
@@ -3475,7 +4414,19 @@ PyObject* native_propagate_fused_csr(PyObject*, PyObject* args, PyObject* kwargs
         || !iq_view.acquire(iq_object, "iq", 2, sizeof(cdouble))
         || !t_view.acquire(t_axis_object, "t_axis", 1, sizeof(double))
         || !initial_view.acquire(initial_object, "initial_states", 2, sizeof(cdouble))
-        || !lo_view.acquire(lo_freqs_object, "lo_freqs", 1, sizeof(double))) {
+        || !lo_view.acquire(lo_freqs_object, "lo_freqs", 1, sizeof(double))
+        || (has_polynomial
+            && !iq_polynomial_view.acquire(
+                iq_polynomial_object,
+                "iq_polynomial",
+                3,
+                sizeof(cdouble)))
+        || (has_control_modes
+            && !control_modes_view.acquire(
+                control_modes_object,
+                "control_modes",
+                1,
+                sizeof(std::int64_t)))) {
         return nullptr;
     }
 
@@ -3498,7 +4449,28 @@ PyObject* native_propagate_fused_csr(PyObject*, PyObject* args, PyObject* kwargs
         PyErr_SetString(PyExc_ValueError, "fused CSR propagation array shapes are inconsistent");
         return nullptr;
     }
-
+    if (has_polynomial) {
+        if (!validate_polynomial_view(
+                iq_polynomial_view,
+                control_count,
+                std::max(0, sample_count - 1),
+                coefficient_order)) {
+            return nullptr;
+        }
+    } else if (coefficient_order != 1 && control_count > 0) {
+        PyErr_SetString(
+            PyExc_ValueError,
+            "iq_polynomial is required when coefficient_order is not 1");
+        return nullptr;
+    }
+    if (has_control_modes) {
+        if (!validate_control_modes_view(control_modes_view, control_count)) {
+            return nullptr;
+        }
+    } else if (mode == 2 && control_count > 0) {
+        PyErr_SetString(PyExc_ValueError, "control_modes is required for mixed mode");
+        return nullptr;
+    }
     const auto* indptr = indptr_view.data<std::int64_t>();
     const auto* indices = indices_view.data<std::int64_t>();
     if (indptr[0] != 0 || indptr[n] != nnz) {
@@ -3567,6 +4539,15 @@ PyObject* native_propagate_fused_csr(PyObject*, PyObject* args, PyObject* kwargs
     problem.atol = atol;
     problem.rtol = rtol;
     problem.max_steps = static_cast<std::int64_t>(max_steps);
+    problem.sparse_expm_mode = sparse_expm;
+    problem.coefficient_order = coefficient_order;
+    problem.polynomial_interval_count = std::max(0, sample_count - 1);
+    problem.iq_polynomial = has_polynomial
+        ? iq_polynomial_view.data<cdouble>()
+        : nullptr;
+    problem.control_modes = has_control_modes
+        ? control_modes_view.data<std::int64_t>()
+        : nullptr;
     problem.t0 = problem.t_axis[0];
     problem.t_last = problem.t_axis[sample_count - 1];
     problem.fused_sparse = true;
