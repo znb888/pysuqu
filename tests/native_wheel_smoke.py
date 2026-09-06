@@ -52,7 +52,8 @@ def main(argv=None):
     if args.native and result.skipped:
         print('Native wheel validation must not skip numerical tests.', file=sys.stderr)
         return 1
-    print('Validated pysuqu', pysuqu.__version__, 'with QuTiP', qutip.__version__)
+    if result.wasSuccessful():
+        print('Validated pysuqu', pysuqu.__version__, 'with QuTiP', qutip.__version__)
     return 0 if result.wasSuccessful() else 1
 
 
