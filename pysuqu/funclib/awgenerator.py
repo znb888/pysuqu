@@ -1529,35 +1529,89 @@ class WaveformGenerator:
         Returns:
             Callable[[float, dict], float|complex]: The time-dependent coefficient function.
         """
+        trace = self.get_solver_trace(schedule, mode=mode, chain=chain, plane=plane)
+        if mode == 'complex_envelope':
+            return self._trace_to_qutip_func(trace)
+        return self.trace_to_qutip_rf_func(trace)
+
+    def get_solver_trace(
+        self,
+        schedule: 'ChannelSchedule',
+        mode: Literal['rf', 'complex_envelope'] = 'rf',
+        chain: Optional[Any] = None,
+        plane: Literal['awg', 'qubit'] = 'qubit',
+    ):
+        """Return the SignalTrace used to construct a solver's drive.
+
+        RF mode retains the IQ envelope and its LO frequency when possible so
+        solvers can mix the carrier at query time. A chain that requires RF
+        input instead returns an ``rf_real`` trace for direct interpolation.
+
+        ``plane`` selects the AWG or qubit reference plane (default: qubit).
+        At the qubit plane, ``chain`` overrides the schedule's transmission.
+        The trace contains aligned 1D ``t_axis`` (ns) and ``values`` arrays,
+        with amplitudes in the schedule's units, sample rate in samples/ns,
+        and ``lo_freq`` in GHz. Invalid modes, planes, or chains raise errors.
+        """
         if plane not in ('awg', 'qubit'):
             raise ValueError(f"Unsupported waveform plane: {plane}")
         if mode not in ('rf', 'complex_envelope'):
-            raise ValueError(f"Unsupported QuTiP drive mode: {mode}")
-
-        if mode == 'complex_envelope':
-            trace = (
-                self.generate_awg_output(schedule, mode='iq')
-                if plane == 'awg'
-                else self.generate_qubit_output(schedule, chain=chain, mode='iq')
-            )
-            return self._trace_to_qutip_func(trace)
+            raise ValueError(f"Unsupported solver drive mode: {mode}")
 
         # Mix the carrier at solver query time whenever the chain accepts IQ. This
         # preserves the continuous LO even when the sampled envelope is below the
         # RF Nyquist rate.
         try:
-            trace = (
+            return (
                 self.generate_awg_output(schedule, mode='iq')
                 if plane == 'awg'
                 else self.generate_qubit_output(schedule, chain=chain, mode='iq')
             )
-            return self.trace_to_qutip_rf_func(trace)
         except ValueError as exc:
-            if plane == 'awg' or not self._chain_requires_rf_fallback(exc):
+            if mode != 'rf' or plane == 'awg' or not self._chain_requires_rf_fallback(exc):
                 raise
 
-        trace = self.generate_qubit_output(schedule, chain=chain, mode='rf')
-        return self._trace_to_qutip_func(trace)
+        return self.generate_qubit_output(schedule, chain=chain, mode='rf')
+
+    def get_solver_trace_bundle(
+        self,
+        schedules: Union[
+            Dict[str, 'ChannelSchedule'],
+            List['ChannelSchedule'],
+            Tuple['ChannelSchedule', ...],
+        ],
+        mode: Literal['rf', 'complex_envelope'] = 'rf',
+        chain: Optional[Any] = None,
+        plane: Literal['awg', 'qubit'] = 'qubit',
+    ):
+        """Return solver traces after applying the whole bundle's chain.
+
+        Dictionary inputs return traces keyed by physical output channel.
+        List and tuple inputs return a tuple in the propagated bundle's order.
+        RF mode follows the carrier-preserving rules of ``get_solver_trace``.
+        All traces share an aligned time grid in ns and retain the amplitude
+        units of their schedules. ``chain`` overrides schedule-level chains
+        at the qubit plane; the AWG plane bypasses transmission. Empty inputs
+        and invalid modes or planes raise ValueError.
+        """
+        if plane not in ('awg', 'qubit'):
+            raise ValueError(f"Unsupported waveform plane: {plane}")
+        if mode not in ('rf', 'complex_envelope'):
+            raise ValueError(f"Unsupported solver drive mode: {mode}")
+
+        try:
+            bundle = (
+                self.generate_awg_bundle(schedules, mode='iq')
+                if plane == 'awg'
+                else self.generate_qubit_bundle(schedules, chain=chain, mode='iq')
+            )
+        except ValueError as exc:
+            if mode != 'rf' or plane == 'awg' or not self._chain_requires_rf_fallback(exc):
+                raise
+            bundle = self.generate_qubit_bundle(schedules, chain=chain, mode='rf')
+
+        traces = {name: bundle[name] for name in bundle.order}
+        return traces if isinstance(schedules, dict) else tuple(traces.values())
 
     @staticmethod
     def _trace_to_qutip_func(trace) -> Callable:
@@ -1702,37 +1756,20 @@ class WaveformGenerator:
         plane: Literal['awg', 'qubit'] = 'qubit',
     ) -> Dict[str, Callable]:
         """Compile a bundle into QuTiP callbacks keyed by output channel."""
-        if plane not in ('awg', 'qubit'):
-            raise ValueError(f"Unsupported waveform plane: {plane}")
-        if mode not in ('rf', 'complex_envelope'):
-            raise ValueError(f"Unsupported QuTiP drive mode: {mode}")
-
-        if mode == 'complex_envelope':
-            trace_mode = 'iq'
-        else:
-            try:
-                bundle = (
-                    self.generate_awg_bundle(schedules, mode='iq')
-                    if plane == 'awg'
-                    else self.generate_qubit_bundle(schedules, chain=chain, mode='iq')
-                )
-                return {
-                    name: self.trace_to_qutip_rf_func(bundle[name])
-                    for name in bundle.order
-                }
-            except ValueError as exc:
-                if plane == 'awg' or not self._chain_requires_rf_fallback(exc):
-                    raise
-                trace_mode = 'rf'
-
-        bundle = (
-            self.generate_awg_bundle(schedules, mode=trace_mode)
-            if plane == 'awg'
-            else self.generate_qubit_bundle(schedules, chain=chain, mode=trace_mode)
+        traces = self.get_solver_trace_bundle(
+            self._normalize_schedule_collection(schedules),
+            mode=mode,
+            chain=chain,
+            plane=plane,
+        )
+        convert = (
+            self._trace_to_qutip_func
+            if mode == 'complex_envelope'
+            else self.trace_to_qutip_rf_func
         )
         return {
-            name: self._trace_to_qutip_func(bundle[name])
-            for name in bundle.order
+            name: convert(trace)
+            for name, trace in traces.items()
         }
 
 

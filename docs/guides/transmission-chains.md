@@ -127,6 +127,27 @@ template trace. For an IQ trace, physical-frequency evaluation normally uses
 
 ## Gate And Multi-Drive Integration
 
+`WaveformGenerator.get_solver_trace()` returns a sampled `SignalTrace` using
+the same waveform and transmission rules as `get_qutip_func()`. For example,
+using the generator and channel above:
+
+```python
+trace = generator.get_solver_trace(channel, mode="rf")
+traces = generator.get_solver_trace_bundle({"drive": channel}, mode="rf")
+```
+
+The default reference plane is `qubit`; select `plane="awg"` to obtain the
+trace before its transmission chain. In `rf` mode, IQ-compatible chains retain
+the complex envelope and `lo_freq` so a solver can mix the carrier continuously.
+RF-only chains return sampled `rf_real` traces. `mode="complex_envelope"`
+requires an IQ-compatible chain and leaves the LO unmixed.
+
+The bundle method applies transmission to the complete collection, including
+MIMO mixing. Dictionary inputs return traces keyed by physical output channel;
+list and tuple inputs return a tuple in the propagated output order. Existing
+`get_qutip_bundle_funcs()` calls continue to return callbacks keyed by output
+channel for all three input forms.
+
 `SingleQubitGate` resolves transmission chains in this order:
 
 1. Explicit `transmission_chain=` argument.

@@ -449,6 +449,172 @@ class TransmissionPlottingTests(unittest.TestCase):
             self.generator.plot_schedule(make_schedule(), plane='invalid')
 
 
+class SolverTraceTests(unittest.TestCase):
+    def setUp(self):
+        self.rng = np.random.default_rng(761923)
+        self.generator = WaveformGenerator(total_time=2.0, sample_rate=4.0)
+        self.amplitudes = self.rng.uniform(0.15, 0.85, size=2)
+        self.lo_freq = self.rng.uniform(2.7, 3.4)
+        self.loss_db = self.rng.uniform(2.0, 9.0)
+        self.schedules = {
+            name: make_schedule(name, amplitude=amplitude, lo_freq=self.lo_freq)
+            for name, amplitude in zip(('input_b', 'input_a'), self.amplitudes)
+        }
+        self.schedule_collections = (
+            self.schedules, list(self.schedules.values()), tuple(self.schedules.values()),
+        )
+        self.query_time = 2.5 * self.generator.dt
+
+    def test_single_trace_preserves_envelope_carrier_and_chain_precedence(self):
+        schedule = self.schedules['input_b']
+        schedule.transmission_chain = AttenuatorStage(loss_db=self.loss_db)
+        override = AttenuatorStage(loss_db=self.rng.uniform(10.0, 16.0))
+        for mode in ('rf', 'complex_envelope'):
+            for plane in ('awg', 'qubit'):
+                for chain in (None, override):
+                    with self.subTest(mode=mode, plane=plane, chain=chain):
+                        trace = self.generator.get_solver_trace(
+                            schedule, mode=mode, plane=plane, chain=chain,
+                        )
+                        loss = (chain or schedule.transmission_chain).loss_db
+                        gain = 1.0 if plane == 'awg' else 10.0 ** (-loss / 20.0)
+                        expected = self.amplitudes[0] * gain
+                        self.assertIsInstance(trace, SignalTrace)
+                        self.assertEqual(trace.domain, 'iq_complex')
+                        self.assertEqual(trace.plane, f'{plane}_iq')
+                        self.assertEqual(trace.lo_freq, self.lo_freq)
+                        np.testing.assert_array_equal(trace.t_axis, self.generator.t_axis)
+                        np.testing.assert_allclose(trace.values, expected)
+                        callback = self.generator.get_qutip_func(
+                            schedule, mode=mode, plane=plane, chain=chain,
+                        )
+                        if mode == 'rf':
+                            expected *= np.cos(2 * np.pi * self.lo_freq * self.query_time)
+                        self.assertAlmostEqual(callback(self.query_time), expected)
+
+    def test_bundle_preserves_mimo_outputs_for_mapping_and_sequence_inputs(self):
+        matrix = self.rng.uniform(0.05, 0.4, size=(2, 2))
+        network = TouchstoneNetwork(
+            frequencies=np.array([0.0, self.lo_freq + self.generator.sample_rate]),
+            s_parameters=np.repeat(matrix[np.newaxis, :, :], 2, axis=0),
+            path='synthetic_solver.s2p',
+        )
+        outputs = ('output_b', 'output_a')
+        chain = BundleTransmissionChain(stages=[MIMOTouchstoneStage(
+            network=network,
+            input_ports=(1, 2), output_ports=(1, 2),
+            input_channels=tuple(self.schedules), output_channels=outputs,
+        )])
+        expected = matrix @ self.amplitudes
+        for schedules in self.schedule_collections:
+            for mode in ('rf', 'complex_envelope'):
+                with self.subTest(collection=type(schedules).__name__, mode=mode):
+                    traces = self.generator.get_solver_trace_bundle(
+                        schedules, chain=chain, mode=mode,
+                    )
+                    if isinstance(schedules, dict):
+                        self.assertEqual(tuple(traces), outputs)
+                        ordered = tuple(traces.values())
+                    else:
+                        self.assertIsInstance(traces, tuple)
+                        ordered = traces
+                    self.assertEqual(len(ordered), len(outputs))
+                    callbacks = self.generator.get_qutip_bundle_funcs(
+                        schedules, chain=chain, mode=mode,
+                    )
+                    self.assertEqual(tuple(callbacks), outputs)
+                    for index, trace in enumerate(ordered):
+                        self.assertEqual(trace.domain, 'iq_complex')
+                        self.assertEqual(trace.plane, 'qubit_iq')
+                        np.testing.assert_allclose(trace.values, expected[index])
+                        value = expected[index]
+                        if mode == 'rf':
+                            value *= np.cos(2 * np.pi * self.lo_freq * self.query_time)
+                        self.assertAlmostEqual(callbacks[outputs[index]](self.query_time), value)
+
+    def test_bundle_awg_plane_preserves_order_and_ignores_qubit_chain(self):
+        chain = AttenuatorStage(loss_db=self.loss_db, domain='rf_real')
+        for schedules in self.schedule_collections:
+            for mode in ('rf', 'complex_envelope'):
+                with self.subTest(collection=type(schedules).__name__, mode=mode):
+                    traces = self.generator.get_solver_trace_bundle(
+                        schedules, mode=mode, plane='awg', chain=chain,
+                    )
+                    if isinstance(schedules, dict):
+                        self.assertEqual(tuple(traces), tuple(self.schedules))
+                        traces = tuple(traces.values())
+                    for trace, amplitude in zip(traces, self.amplitudes):
+                        self.assertEqual(trace.domain, 'iq_complex')
+                        self.assertEqual(trace.plane, 'awg_iq')
+                        np.testing.assert_allclose(trace.values, amplitude)
+
+    def test_rf_only_chain_returns_sampled_rf_for_single_and_bundle(self):
+        chain = AttenuatorStage(loss_db=self.loss_db, domain='rf_real')
+        gain = 10.0 ** (-self.loss_db / 20.0)
+        single = self.generator.get_solver_trace(self.schedules['input_b'], chain=chain)
+        np.testing.assert_allclose(
+            single.values,
+            gain * self.amplitudes[0] * np.cos(2 * np.pi * self.lo_freq * single.t_axis),
+        )
+        self.assertEqual(single.domain, 'rf_real')
+        for schedules in self.schedule_collections:
+            with self.subTest(collection=type(schedules).__name__):
+                traces = self.generator.get_solver_trace_bundle(schedules, chain=chain)
+                if isinstance(schedules, dict):
+                    traces = tuple(traces.values())
+                callbacks = self.generator.get_qutip_bundle_funcs(schedules, chain=chain)
+                for trace, name, amplitude in zip(traces, self.schedules, self.amplitudes):
+                    expected = gain * amplitude * np.cos(2 * np.pi * self.lo_freq * trace.t_axis)
+                    self.assertEqual(trace.domain, 'rf_real')
+                    self.assertEqual(trace.plane, 'qubit_rf')
+                    np.testing.assert_allclose(trace.values, expected)
+                    self.assertAlmostEqual(
+                        callbacks[name](self.query_time),
+                        np.interp(self.query_time, trace.t_axis, expected),
+                    )
+        for method, value in (
+            (self.generator.get_solver_trace, self.schedules['input_b']),
+            (self.generator.get_solver_trace_bundle, self.schedules),
+        ):
+            with self.subTest(method=method.__name__):
+                with self.assertRaisesRegex(ValueError, 'expects rf_real'):
+                    method(value, mode='complex_envelope', chain=chain)
+
+    def test_invalid_transmission_is_not_retried_as_rf(self):
+        chain = AttenuatorStage(domain='iq_complex', output_plane='baseband')
+        for method, value, producer in (
+            (self.generator.get_solver_trace, self.schedules['input_b'], 'generate_qubit_output'),
+            (self.generator.get_solver_trace_bundle, self.schedules, 'generate_qubit_bundle'),
+        ):
+            with self.subTest(method=method.__name__):
+                with patch.object(
+                    self.generator, producer, wraps=getattr(self.generator, producer),
+                ) as generate:
+                    with self.assertRaisesRegex(ValueError, 'plane baseband'):
+                        method(value, chain=chain)
+                    self.assertEqual(generate.call_count, 1)
+
+    def test_solver_modes_planes_and_collections_are_validated(self):
+        for method, value in (
+            (self.generator.get_solver_trace, self.schedules['input_b']),
+            (self.generator.get_solver_trace_bundle, self.schedules),
+            (self.generator.get_solver_trace_bundle, list(self.schedules.values())),
+        ):
+            with self.subTest(method=method.__name__, collection=type(value).__name__):
+                with self.assertRaisesRegex(ValueError, 'drive mode'):
+                    method(value, mode='invalid')
+                with self.assertRaisesRegex(ValueError, 'waveform plane'):
+                    method(value, plane='invalid')
+        for schedules in ({}, [], ()):
+            with self.assertRaisesRegex(ValueError, 'At least one'):
+                self.generator.get_solver_trace_bundle(schedules)
+        with self.assertRaisesRegex(TypeError, 'ChannelSchedule'):
+            self.generator.get_solver_trace_bundle({'input': object()})
+        schedule = self.schedules['input_b']
+        with self.assertRaisesRegex(ValueError, 'Duplicate channel name'):
+            self.generator.get_solver_trace_bundle([schedule, schedule])
+
+
 class QutipCompilationTests(unittest.TestCase):
     def setUp(self):
         self.generator = WaveformGenerator(total_time=2.0, sample_rate=4.0)
