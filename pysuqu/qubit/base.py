@@ -1,5 +1,7 @@
 """Base qubit classes extracted from the legacy qubit monolith."""
 
+from __future__ import annotations
+
 import math
 from abc import abstractmethod
 from collections import OrderedDict

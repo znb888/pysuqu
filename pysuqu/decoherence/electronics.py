@@ -5,6 +5,8 @@ Author: Naibin Zhou
 USTC
 Since 2025-12-11
 '''
+from __future__ import annotations
+
 # import
 from functools import lru_cache
 from types import MappingProxyType

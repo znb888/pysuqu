@@ -5,6 +5,8 @@ Author: Naibin Zhou
 USTC
 Since 2023-12-05
 '''
+from __future__ import annotations
+
 # import
 from collections import OrderedDict
 from dataclasses import dataclass

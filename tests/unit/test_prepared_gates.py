@@ -29,7 +29,7 @@ class PreparedGateTests(unittest.TestCase):
                 shape_type='gaussian', sigma=float(rng.uniform(0.6, 0.9)),
             ))],
         )
-        self.options = {'atol': 1e-10, 'rtol': 1e-8, 'store_states': False}
+        self.options = {'atol': 1e-12, 'rtol': 1e-10, 'nsteps': 100000, 'store_states': False}
 
     def backends(self):
         return ('qutip_compiled', 'cpp') if native_backend_available() else ('qutip_compiled',)

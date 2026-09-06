@@ -1,5 +1,7 @@
 """Circuit-topology helpers extracted from the legacy qubit base layer."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Literal, Sequence, Union
