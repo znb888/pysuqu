@@ -20,6 +20,13 @@ from copy import copy
 # local lib
 from .base import AbstractQubit, Phi0, e, pi
 from .solver import HamiltonianEvo
+from .propagation import (
+    DriveTerm,
+    PreparedPropagation,
+    PropagationOptions,
+    UnsupportedBackendError,
+    _PROFILE_METHODS,
+)
 from ..funclib.awgenerator import *
 from ..funclib import truncate_hilbert_space
 from ..funclib.transmission import TransmissionChain
@@ -85,17 +92,127 @@ class GateBase:
         print('AWG initialized. ')
 
     @staticmethod
-    def _default_solver_options(overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    def _default_solver_options(
+        overrides: Optional[Dict[str, Any]] = None,
+        *,
+        include_internal: bool = True,
+    ) -> Dict[str, Any]:
         """Shared QuTiP solver defaults used by gate-level simulation helpers."""
+        if isinstance(overrides, PropagationOptions):
+            resolved_qutip_options = overrides.qutip_options()
+            override_values = dict(overrides.extra)
+            override_values.update(
+                {
+                    "backend": overrides.backend,
+                    # A profile is meaningful even when the caller leaves
+                    # method unset; resolve it before forwarding to QuTiP.
+                    "method": resolved_qutip_options.get("method"),
+                    "atol": overrides.atol,
+                    "rtol": overrides.rtol,
+                    "nsteps": overrides.nsteps,
+                    "store_states": overrides.store_states,
+                    "coefficient_order": overrides.coefficient_order,
+                    "use_solver_class": overrides.use_solver_class,
+                    "matrix_format": overrides.matrix_format,
+                    "frame": overrides.frame,
+                    "sparse_kernel": overrides.sparse_kernel,
+                    "plan_cache_size": overrides.plan_cache_size,
+                    "block_decompose": overrides.block_decompose,
+                    "sparse_expm": overrides.sparse_expm,
+                    "parallel": overrides.parallel,
+                    "profile": overrides.profile,
+                    "sparse_threshold": overrides.sparse_threshold,
+                }
+            )
+            if overrides.store_final_state is not None:
+                override_values["store_final_state"] = overrides.store_final_state
+            if overrides.rf_oversample is not None:
+                override_values["rf_oversample"] = overrides.rf_oversample
+        else:
+            override_values = dict(overrides or {})
+            if "profile" in override_values:
+                profile = override_values["profile"]
+                if profile not in _PROFILE_METHODS:
+                    raise ValueError(
+                        "profile must be 'reference', 'fast', 'fast_exact', 'fallback', or 'stiff'"
+                    )
+                profile_method = _PROFILE_METHODS[profile]
+                if override_values.get("method") is None and profile_method is not None:
+                    override_values["method"] = profile_method
         options = {
             "nsteps": 5000,
             "atol": 1e-8,
             "rtol": 1e-6,
             "store_states": True,
         }
-        if overrides:
-            options.update(overrides)
+        if override_values:
+            if include_internal:
+                options.update(override_values)
+            else:
+                options.update(
+                    {
+                        key: value
+                        for key, value in override_values.items()
+                        if key not in {
+                            'active_levels',
+                            'active_levels_tol',
+                            'backend',
+                            'coefficient_order',
+                            'matrix_format',
+                            'frame',
+                            'profile',
+                            'sparse_threshold',
+                            'sparse_kernel',
+                            'plan_cache_size',
+                            'block_decompose',
+                            'sparse_expm',
+                            'parallel',
+                            'native_max_steps',
+                            'rf_oversample',
+                            'rwa_max_discarded_ratio',
+                            'use_solver_class',
+                        }
+                    }
+                )
+        if options.get("store_states") is False and "store_final_state" not in options:
+            options["store_final_state"] = True
+        if options.get("method") is None:
+            options.pop("method", None)
         return options
+
+    @staticmethod
+    def _options_mapping(options: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Normalize a solver options mapping or ``PropagationOptions`` instance."""
+        if isinstance(options, PropagationOptions):
+            resolved_qutip_options = options.qutip_options()
+            values = dict(options.extra)
+            values.update(
+                {
+                    "backend": options.backend,
+                    "method": resolved_qutip_options.get("method"),
+                    "atol": options.atol,
+                    "rtol": options.rtol,
+                    "nsteps": options.nsteps,
+                    "store_states": options.store_states,
+                    "coefficient_order": options.coefficient_order,
+                    "use_solver_class": options.use_solver_class,
+                    "matrix_format": options.matrix_format,
+                    "frame": options.frame,
+                    "sparse_kernel": options.sparse_kernel,
+                    "plan_cache_size": options.plan_cache_size,
+                    "block_decompose": options.block_decompose,
+                    "sparse_expm": options.sparse_expm,
+                    "parallel": options.parallel,
+                    "profile": options.profile,
+                    "sparse_threshold": options.sparse_threshold,
+                }
+            )
+            if options.store_final_state is not None:
+                values["store_final_state"] = options.store_final_state
+            if options.rf_oversample is not None:
+                values["rf_oversample"] = options.rf_oversample
+            return values
+        return dict(options or {})
 
     def _default_solver_args(self, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Merge explicit solver args with gate-owned decoherence kwargs when available."""
@@ -183,6 +300,7 @@ class GateBase:
         e_ops: Optional[list] = None,
         options: Optional[Dict[str, Any]] = None,
         args: Optional[Dict[str, Any]] = None,
+        backend: str = 'qutip',
     ) -> qt.Result:
         """Run a gate-level simulation driven by a propagated schedule bundle."""
         use_gate_hamiltonian = static_hamiltonian is None
@@ -190,6 +308,58 @@ class GateBase:
             initial_state,
             allow_gate_parser=use_gate_hamiltonian,
         )
+
+        if backend not in {'qutip', 'reference', 'qutip_reference'}:
+            resolved_static_hamiltonian = (
+                self.qubit.get_hamiltonian()
+                if static_hamiltonian is None
+                else static_hamiltonian
+            )
+            trace_bundle = self.awg.get_solver_trace_bundle(
+                schedules,
+                mode=mode,
+                chain=transmission_chain,
+                plane=plane,
+            )
+            drive_funcs = trace_bundle
+            if isinstance(drive_operators, dict):
+                if not isinstance(trace_bundle, dict):
+                    raise TypeError("Mapping drive_operators require mapping schedules.")
+                resolved_order = channel_order or tuple(trace_bundle.keys())
+            else:
+                if isinstance(trace_bundle, dict):
+                    raise TypeError("Sequence drive_operators require sequence schedules.")
+                resolved_order = channel_order or tuple(range(len(drive_operators)))
+            normalized_terms = HamiltonianEvo._normalize_drive_terms(
+                drive_operators,
+                drive_funcs,
+                channel_order=resolved_order,
+            )
+            terms = [
+                DriveTerm(operator, trace, mode=mode)
+                for _name, operator, trace in normalized_terms
+            ]
+            get_c_ops = getattr(self, '_get_c_ops', None)
+            resolved_c_ops = (
+                get_c_ops()
+                if c_ops is None and static_hamiltonian is None and callable(get_c_ops)
+                else ([] if c_ops is None else list(c_ops))
+            )
+            prepared = PreparedPropagation(
+                resolved_static_hamiltonian,
+                terms,
+                self.awg.t_axis if tlist is None else tlist,
+                c_ops=resolved_c_ops,
+                options=self._default_solver_options(options),
+                args=(
+                    self._default_solver_args(args)
+                    if static_hamiltonian is None
+                    else dict(args or {})
+                ),
+                backend=backend,
+            )
+            return prepared.propagate(psi0, e_ops=e_ops or [])
+
         h_total, _ = self.build_multidrive_hamiltonian(
             schedules=schedules,
             drive_operators=drive_operators,
@@ -217,7 +387,7 @@ class GateBase:
             self.awg.t_axis if tlist is None else tlist,
             c_ops=resolved_c_ops,
             e_ops=[] if e_ops is None else e_ops,
-            options=self._default_solver_options(options),
+            options=self._default_solver_options(options, include_internal=False),
             args=resolved_args,
         )
 
@@ -442,8 +612,11 @@ class SingleQubitGate(GateBase):
             c_ops.append(np.sqrt(rate_phi1) * n)
 
         if Tphi2 is not None and Tphi2 > 0:
-            def coeff_tphi2(t, args):
-                return np.sqrt(2 * t) / args['Tphi2']
+            def coeff_tphi2(t, *callback_args, **callback_kwargs):
+                solver_args = callback_kwargs
+                if callback_args and isinstance(callback_args[0], dict):
+                    solver_args = callback_args[0]
+                return np.sqrt(2 * t) / solver_args['Tphi2']
             
             c_ops.append([n, coeff_tphi2])
 
@@ -517,7 +690,96 @@ class SingleQubitGate(GateBase):
         if channel_chain is not None:
             return channel_chain
         return getattr(self, 'transmission_chain', None)
-        
+
+    def prepare_trace_propagator(
+        self,
+        trace,
+        *,
+        couple_term: float = 0.5e-12,
+        couple_type: Literal['induc', 'capac'] = 'induc',
+        mode: Literal['rf', 'complex_envelope'] = 'rf',
+        c_ops: Optional[Sequence[Any]] = None,
+        options: Optional[Dict[str, Any]] = None,
+        args: Optional[Dict[str, Any]] = None,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
+        backend: str = 'qutip_compiled',
+    ) -> PreparedPropagation:
+        """Prepare a reusable propagation context for one solver-facing trace.
+
+        The returned object owns the static Hamiltonian, drive operator, trace
+        grid, and solver options.  Reusing it for several initial states avoids
+        rebuilding ``QobjEvo`` and, for the native backend, keeps all data in
+        contiguous arrays across the language boundary.
+        """
+        trace_domain = getattr(trace, 'domain', None)
+        if trace_domain not in {'rf_real', 'iq_complex'}:
+            raise ValueError(
+                "prepare_trace_propagator expects an rf_real or iq_complex trace."
+            )
+        H_static = self.qubit.get_hamiltonian()
+        H_drive = self.get_drive_hamiltonian(
+            couple_term=couple_term,
+            couple_type=couple_type,
+            induc_phi_model=induc_phi_model,
+        )
+        resolved_options = self._default_solver_options(options)
+        resolved_args = self._default_solver_args(args)
+        get_c_ops = getattr(self, '_get_c_ops', None)
+        resolved_c_ops = get_c_ops() if c_ops is None and callable(get_c_ops) else (
+            [] if c_ops is None else list(c_ops)
+        )
+        return PreparedPropagation(
+            H_static,
+            [DriveTerm(H_drive, trace, mode=mode)],
+            np.asarray(trace.t_axis, dtype=np.float64),
+            c_ops=resolved_c_ops,
+            options=resolved_options,
+            args=resolved_args,
+            backend=backend,
+        )
+
+    def prepare_propagator(
+        self,
+        channel: Optional[ChannelSchedule] = None,
+        *,
+        transmission_chain: Optional[TransmissionChain] = None,
+        mode: Literal['rf', 'complex_envelope'] = 'rf',
+        plane: Literal['awg', 'qubit'] = 'qubit',
+        couple_term: float = 0.5e-12,
+        couple_type: Literal['induc', 'capac'] = 'induc',
+        c_ops: Optional[Sequence[Any]] = None,
+        options: Optional[Dict[str, Any]] = None,
+        args: Optional[Dict[str, Any]] = None,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
+        backend: str = 'qutip_compiled',
+    ) -> PreparedPropagation:
+        """Compile a channel and return a reusable prepared propagator."""
+        if channel is None:
+            if getattr(self, 'pulse_channel', None) is None:
+                raise ValueError("No channel loaded! Please pass a ChannelSchedule.")
+            channel = self.pulse_channel
+        active_chain = self._resolve_transmission_chain(
+            channel,
+            transmission_chain=transmission_chain,
+        )
+        trace = self.awg.get_solver_trace(
+            channel,
+            mode=mode,
+            chain=active_chain,
+            plane=plane,
+        )
+        return self.prepare_trace_propagator(
+            trace,
+            couple_term=couple_term,
+            couple_type=couple_type,
+            mode=mode,
+            c_ops=c_ops,
+            options=options,
+            args=args,
+            induc_phi_model=induc_phi_model,
+            backend=backend,
+        )
+
     def run_simulation(
         self, 
         channel: Union[ChannelSchedule, None] = None,
@@ -540,11 +802,34 @@ class SingleQubitGate(GateBase):
             if self.pulse_channel is None:
                 raise ValueError("No channel loaded! Please call .load_channel() first or pass 'pulse_channel' argument.")
             channel = self.pulse_channel
-        
+
+        backend = kwargs.pop('backend', 'qutip')
+        mode = kwargs.pop('mode', 'rf')
+        plane = kwargs.pop('plane', 'qubit')
+        options = kwargs.pop('options', None)
+        args = kwargs.pop('args', None)
+
         psi0 = self._parse_initial_state(initial_state_input)
         c_term = kwargs.get('couple_term', 0.5e-12)
         c_type = kwargs.get('couple_type', 'induc')
         induc_phi_model = kwargs.get('induc_phi_model', 'exact')
+
+        if backend not in {'qutip', 'reference', 'qutip_reference'}:
+            prepared = self.prepare_propagator(
+                channel,
+                transmission_chain=transmission_chain,
+                mode=mode,
+                plane=plane,
+                couple_term=c_term,
+                couple_type=c_type,
+                c_ops=c_ops,
+                options=options,
+                args=args,
+                induc_phi_model=induc_phi_model,
+                backend=backend,
+            )
+            return prepared.propagate(psi0)
+
         active_chain = self._resolve_transmission_chain(
             channel,
             transmission_chain=transmission_chain,
@@ -556,12 +841,17 @@ class SingleQubitGate(GateBase):
             couple_type=c_type,
             induc_phi_model=induc_phi_model,
         )
-        drive_func = self.awg.get_qutip_func(channel, chain=active_chain)
+        drive_options = {'chain': active_chain}
+        if mode != 'rf':
+            drive_options['mode'] = mode
+        if plane != 'qubit':
+            drive_options['plane'] = plane
+        drive_func = self.awg.get_qutip_func(channel, **drive_options)
         resolved_c_ops = self._get_c_ops() if c_ops is None else list(c_ops)
         
         H_total = [H_static, [H_drive, drive_func]]
-        opts = self._default_solver_options()
-        solver_args = self._default_solver_args()
+        opts = self._default_solver_options(options, include_internal=False)
+        solver_args = self._default_solver_args(args)
         
         result = qt.mesolve(
             H_total, psi0, self.awg.t_axis,
@@ -580,6 +870,8 @@ class SingleQubitGate(GateBase):
         args: Optional[Dict[str, Any]] = None,
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
         c_ops: Optional[Sequence[qt.Qobj]] = None,
+        backend: str = 'qutip',
+        mode: Literal['rf', 'complex_envelope'] = 'rf',
     ) -> qt.Result:
         """
         Evolve the qubit directly under one solver-facing waveform trace.
@@ -588,6 +880,20 @@ class SingleQubitGate(GateBase):
         ``domain``. ``rf_real`` traces are interpolated directly; ``iq_complex``
         traces are analytically mixed to RF using ``trace.lo_freq``.
         """
+        if backend not in {'qutip', 'reference', 'qutip_reference'}:
+            prepared = self.prepare_trace_propagator(
+                trace,
+                couple_term=couple_term,
+                couple_type=couple_type,
+                options=options,
+                args=args,
+                induc_phi_model=induc_phi_model,
+                c_ops=c_ops,
+                backend=backend,
+                mode=mode,
+            )
+            return prepared.propagate(self._parse_initial_state(initial_state_input))
+
         H_total, t_axis, resolved_options, resolved_args = self._prepare_trace_simulation(
             trace,
             couple_term=couple_term,
@@ -595,6 +901,7 @@ class SingleQubitGate(GateBase):
             options=options,
             args=args,
             induc_phi_model=induc_phi_model,
+            mode=mode,
         )
         psi0 = self._parse_initial_state(initial_state_input)
         resolved_c_ops = self._get_c_ops() if c_ops is None else list(c_ops)
@@ -618,6 +925,7 @@ class SingleQubitGate(GateBase):
         options: Optional[Dict[str, Any]],
         args: Optional[Dict[str, Any]],
         induc_phi_model: Literal['exact', 'linear'],
+        mode: Literal['rf', 'complex_envelope'],
     ) -> tuple[list[Any], np.ndarray, Dict[str, Any], Dict[str, Any]]:
         """Prepare one trace-dependent solver context reusable across initial states."""
         trace_domain = getattr(trace, 'domain', None)
@@ -626,6 +934,8 @@ class SingleQubitGate(GateBase):
                 "run_trace_simulation expects an rf_real or iq_complex trace. "
                 "Use a trace with t_axis, values, domain, and optional lo_freq first."
             )
+        if mode not in {'rf', 'complex_envelope'}:
+            raise ValueError("mode must be either 'rf' or 'complex_envelope'.")
 
         H_static = self.qubit.get_hamiltonian()
         H_drive = self.get_drive_hamiltonian(
@@ -633,11 +943,13 @@ class SingleQubitGate(GateBase):
             couple_type=couple_type,
             induc_phi_model=induc_phi_model,
         )
-        if trace_domain == 'iq_complex':
+        if mode == 'complex_envelope':
+            drive_func = self.awg.trace_to_qutip_func(trace)
+        elif trace_domain == 'iq_complex':
             drive_func = self.awg.trace_to_qutip_rf_func(trace)
         else:
             drive_func = self.awg.trace_to_qutip_func(trace)
-        resolved_options = self._default_solver_options(options)
+        resolved_options = self._default_solver_options(options, include_internal=False)
         resolved_args = self._default_solver_args(args)
         return (
             [H_static, [H_drive, drive_func]],
@@ -780,8 +1092,11 @@ class SingleQubitGate(GateBase):
         is_print: bool = True,
     ) -> Dict[str, float]:
         """Project the final state into the qubit eigenbasis before evaluating fidelity."""
-        final_state = result.states[-1]
-        t_final = result.times[-1]
+        final_state = self._result_final_state(result)
+        times = getattr(result, 'times', None)
+        if times is None or len(times) == 0:
+            raise ValueError("Solver result does not contain a time axis.")
+        t_final = times[-1]
 
         if final_state.isket:
             rho = final_state * final_state.dag()
@@ -800,7 +1115,9 @@ class SingleQubitGate(GateBase):
                 [np.conj(rho01) * np.exp(1j * phase_factor), pop1],
             ]
         )
-        leakage = 1.0 - np.real(pop0 + pop1)
+        # Numerical integration can leave a tiny negative leakage (for example -4e-16)
+        # even when the projected population is exactly one.  Leakage is a probability.
+        leakage = max(0.0, float(1.0 - np.real(pop0 + pop1)))
 
         rho_target = self._resolve_target_qubit_density(target_state)
         fid_val = qt.fidelity(rho_qubit_rot, rho_target)**2
@@ -941,6 +1258,7 @@ class SingleQubitGate(GateBase):
         unitarize: bool = False,
         make_su2: bool = False,
         store_trajectories: bool = True,
+        backend: str = 'qutip',
     ) -> Dict[str, Any]:
         """Extract the projected 2x2 process matrix and diagnostics for one pulse schedule."""
         if channel is None:
@@ -952,48 +1270,66 @@ class SingleQubitGate(GateBase):
             raise ValueError("frame must be either 'rotating' or 'lab'.")
 
         basis_states = self._computational_basis_states()
-        active_chain = self._resolve_transmission_chain(
-            channel,
-            transmission_chain=transmission_chain,
-        )
-        H_static = self.qubit.get_hamiltonian()
-        H_drive = self.get_drive_hamiltonian(
-            couple_term=couple_term,
-            couple_type=couple_type,
-            induc_phi_model=induc_phi_model,
-        )
-        drive_func = self.awg.get_qutip_func(channel, chain=active_chain)
-        H_total = [H_static, [H_drive, drive_func]]
-        solver_options = dict(options or {})
-        if not store_trajectories:
-            solver_options.update(store_states=False, store_final_state=True)
-        resolved_options = self._default_solver_options(solver_options)
-        resolved_args = self._default_solver_args(args)
+        active_chain = self._resolve_transmission_chain(channel, transmission_chain=transmission_chain)
+
+        propagation_options = self._options_mapping(options)
+        if not store_trajectories or backend not in {'qutip', 'reference', 'qutip_reference'}:
+            propagation_options.update(store_states=False, store_final_state=True)
+        prepared = None
+        if backend in {'qutip', 'reference', 'qutip_reference'}:
+            h_static = self.qubit.get_hamiltonian()
+            h_drive = self.get_drive_hamiltonian(
+                couple_term=couple_term, couple_type=couple_type,
+                induc_phi_model=induc_phi_model,
+            )
+            drive_func = self.awg.get_qutip_func(channel, chain=active_chain)
+            h_total = [h_static, [h_drive, drive_func]]
+            solver_options = self._default_solver_options(propagation_options, include_internal=False)
+            solver_args = self._default_solver_args(args)
+        else:
+            prepared = self.prepare_propagator(
+                channel,
+                transmission_chain=active_chain,
+                couple_term=couple_term,
+                couple_type=couple_type,
+                c_ops=[],
+                options=propagation_options,
+                args=args,
+                induc_phi_model=induc_phi_model,
+                backend=backend,
+            )
 
         columns = []
         leakages = []
         results = []
-        for initial_state in basis_states:
-            result = qt.mesolve(
-                H_total,
-                initial_state,
-                self.awg.t_axis,
-                c_ops=[],
-                e_ops=[],
-                options=resolved_options,
-                args=resolved_args,
-            )
-            results.append(result)
-            coeffs = self._project_ket_to_qubit_coefficients(
-                self._result_final_state(result),
-                basis_states,
-            )
+        if prepared is not None and prepared.backend in {'cpp', 'cpp_rwa'}:
+            # A unitary is defined by two columns.  Keep both columns in one
+            # native integration so coefficient evaluation and matrix assembly
+            # happen once instead of once per basis state.
+            batch = prepared.propagate_batch(basis_states)
+            results = batch.results
+            final_states = batch.final_states
+        else:
+            final_states = []
+            for initial_state in basis_states:
+                if prepared is None:
+                    result = qt.mesolve(
+                        h_total, initial_state, self.awg.t_axis,
+                        c_ops=[], e_ops=[], options=solver_options, args=solver_args,
+                    )
+                else:
+                    result = prepared.propagate(initial_state)
+                results.append(result)
+                final_states.append(self._result_final_state(result))
+
+        for final_state in final_states:
+            coeffs = self._project_ket_to_qubit_coefficients(final_state, basis_states)
             columns.append(coeffs)
             subspace_probability = float(np.real(np.vdot(coeffs, coeffs)))
             leakages.append(max(0.0, 1.0 - subspace_probability))
 
         raw_matrix = np.column_stack(columns)
-        t_final = results[0].times[-1] if results else self.awg.t_axis[-1]
+        t_final = self.awg.t_axis[-1] if prepared is None else prepared.tlist[-1]
         if frame == 'rotating':
             phase_factor = 2 * pi * self.qubit.qubit_f01 * t_final
             raw_matrix = np.diag([1.0, np.exp(1j * phase_factor)]) @ raw_matrix
@@ -1035,6 +1371,8 @@ class SingleQubitGate(GateBase):
         unitarize: bool = False,
         make_su2: bool = False,
         store_trajectories: bool = True,
+        backend: str = 'qutip',
+        sample_times: Optional[Sequence[float]] = None,
     ) -> Dict[str, Any]:
         """Extract a projected 2x2 process matrix from one solver-facing waveform trace."""
         if frame not in {'rotating', 'lab'}:
@@ -1045,39 +1383,117 @@ class SingleQubitGate(GateBase):
         columns = []
         leakages = []
         results = []
-        solver_options = dict(options or {})
+        solver_options = self._options_mapping(options)
         if not store_trajectories:
             solver_options.update(store_states=False, store_final_state=True)
-        H_total, t_axis, resolved_options, resolved_args = self._prepare_trace_simulation(
+        elif backend not in {'qutip', 'reference', 'qutip_reference'}:
+            solver_options.update(store_states=False, store_final_state=True)
+
+        # Sequence workflows need states at gate boundaries.  Keep the ordinary path on the
+        # prepared/native backend, but extend the QuTiP integration grid when boundary samples
+        # are requested so the projected matrices refer to the exact requested times.
+        boundary_times = None
+        trace_t_axis = np.asarray(trace.t_axis, dtype=np.float64)
+        solver_t_axis = trace_t_axis
+        if sample_times is not None:
+            boundary_times = np.asarray(sample_times, dtype=np.float64).reshape(-1)
+            if boundary_times.size and (
+                not np.all(np.isfinite(boundary_times))
+                or not np.all(np.diff(boundary_times) > 0.0)
+            ):
+                raise ValueError("sample_times must be a strictly increasing finite sequence.")
+            if boundary_times.size and (
+                boundary_times[0] < trace_t_axis[0]
+                or boundary_times[-1] > trace_t_axis[-1]
+            ):
+                raise ValueError("sample_times must lie inside the trace time axis.")
+            solver_t_axis = np.unique(np.concatenate((trace_t_axis, boundary_times)))
+            solver_options.update(store_states=True, store_final_state=True)
+
+        prepared = self.prepare_trace_propagator(
             trace,
             couple_term=couple_term,
             couple_type=couple_type,
             options=solver_options,
             args=args,
             induc_phi_model=induc_phi_model,
+            c_ops=[],
+            backend=backend,
         )
 
-        for initial_state_input in basis_inputs:
-            result = qt.mesolve(
-                H_total,
-                self._parse_initial_state(initial_state_input),
-                t_axis,
-                c_ops=[],
-                e_ops=[],
-                options=resolved_options,
-                args=resolved_args,
+        if boundary_times is not None and not np.array_equal(solver_t_axis, trace_t_axis):
+            if prepared.backend in {'cpp', 'cpp_rwa'}:
+                raise UnsupportedBackendError(
+                    "sample_times with non-grid boundaries requires a QuTiP backend; "
+                    "use backend='qutip' or omit sample_times."
+                )
+            prepared = PreparedPropagation(
+                prepared.static_hamiltonian,
+                prepared.drive_terms,
+                solver_t_axis,
+                c_ops=prepared.c_ops,
+                options=prepared.options,
+                args=prepared.args,
+                backend=backend,
             )
-            results.append(result)
-            coeffs = self._project_ket_to_qubit_coefficients(
-                self._result_final_state(result),
-                basis_states,
+
+        if prepared.backend in {'cpp', 'cpp_rwa'}:
+            batch = prepared.propagate_batch(
+                [self._parse_initial_state(item) for item in basis_inputs]
             )
+            results = batch.results
+            final_states = batch.final_states
+        else:
+            final_states = []
+            for initial_state_input in basis_inputs:
+                result = prepared.propagate(self._parse_initial_state(initial_state_input))
+                results.append(result)
+                final_states.append(self._result_final_state(result))
+
+        for final_state in final_states:
+            coeffs = self._project_ket_to_qubit_coefficients(final_state, basis_states)
             columns.append(coeffs)
             subspace_probability = float(np.real(np.vdot(coeffs, coeffs)))
             leakages.append(max(0.0, 1.0 - subspace_probability))
 
+        boundary_raw_unitaries = []
+        boundary_unitaries = []
+        boundary_leakages = []
+        if boundary_times is not None:
+            for boundary_time in boundary_times:
+                boundary_columns = []
+                boundary_leakage_values = []
+                for result in results:
+                    states = getattr(result, 'states', None)
+                    if states is None or len(states) == 0:
+                        raise ValueError(
+                            "The solver did not return states required for boundary sampling."
+                        )
+                    index = int(np.argmin(np.abs(np.asarray(result.times) - boundary_time)))
+                    if not np.isclose(float(result.times[index]), boundary_time, atol=1e-10, rtol=0.0):
+                        raise ValueError("A requested boundary time was not represented in solver output.")
+                    coeffs = self._project_ket_to_qubit_coefficients(states[index], basis_states)
+                    boundary_columns.append(coeffs)
+                    subspace_probability = float(np.real(np.vdot(coeffs, coeffs)))
+                    boundary_leakage_values.append(max(0.0, 1.0 - subspace_probability))
+
+                boundary_raw_matrix = np.column_stack(boundary_columns)
+                if frame == 'rotating':
+                    phase_factor = 2 * pi * self.qubit.qubit_f01 * boundary_time
+                    boundary_raw_matrix = np.diag(
+                        [1.0, np.exp(1j * phase_factor)]
+                    ) @ boundary_raw_matrix
+                boundary_matrix = boundary_raw_matrix
+                if unitarize:
+                    boundary_matrix = self._nearest_unitary(boundary_matrix)
+                if make_su2:
+                    boundary_matrix = self._strip_global_phase(boundary_matrix)
+                boundary_raw_unitaries.append(qt.Qobj(boundary_raw_matrix, dims=[[2], [2]]))
+                boundary_unitaries.append(qt.Qobj(boundary_matrix, dims=[[2], [2]]))
+                boundary_leakages.append(boundary_leakage_values)
+
         raw_matrix = np.column_stack(columns)
-        t_final = results[0].times[-1] if results else np.asarray(trace.t_axis, dtype=np.float64)[-1]
+        t_final = prepared.tlist[-1]
         if frame == 'rotating':
             phase_factor = 2 * pi * self.qubit.qubit_f01 * t_final
             raw_matrix = np.diag([1.0, np.exp(1j * phase_factor)]) @ raw_matrix
@@ -1095,7 +1511,7 @@ class SingleQubitGate(GateBase):
         survival_probability = float(np.real(np.trace(gram)) / 2.0)
         unitarity_error = float(np.linalg.norm(gram - identity))
 
-        return {
+        payload = {
             "unitary": unitary,
             "raw_unitary": raw_unitary,
             "leakage_by_basis": leakages,
@@ -1105,6 +1521,15 @@ class SingleQubitGate(GateBase):
             "frame": frame,
             "basis_results": results,
         }
+        if boundary_times is not None:
+            payload.update(
+                boundary_times=boundary_times,
+                boundary_unitaries=boundary_unitaries,
+                boundary_raw_unitaries=boundary_raw_unitaries,
+                boundary_leakage_by_basis=boundary_leakages,
+                boundary_average_leakage=[float(np.mean(values)) for values in boundary_leakages],
+            )
+        return payload
 
     def extract_trace_channel_payload(
         self,
@@ -1118,6 +1543,7 @@ class SingleQubitGate(GateBase):
         args: Optional[Dict[str, Any]] = None,
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
         store_trajectories: bool = True,
+        backend: str = 'qutip',
     ) -> Dict[str, Any]:
         """Reconstruct the projected computational channel from four physical inputs."""
         if frame not in {'rotating', 'lab'}:
@@ -1131,34 +1557,40 @@ class SingleQubitGate(GateBase):
         )
         projected_outputs: list[np.ndarray] = []
         results = []
-        solver_options = dict(options or {})
+        solver_options = self._options_mapping(options)
         if not store_trajectories:
             solver_options.update(store_states=False, store_final_state=True)
-        H_total, t_axis, resolved_options, resolved_args = self._prepare_trace_simulation(
+        elif backend not in {'qutip', 'reference', 'qutip_reference'}:
+            solver_options.update(store_states=False, store_final_state=True)
+        resolved_c_ops = [] if c_ops is None else list(c_ops)
+        prepared = self.prepare_trace_propagator(
             trace,
             couple_term=couple_term,
             couple_type=couple_type,
             options=solver_options,
             args=args,
             induc_phi_model=induc_phi_model,
+            c_ops=resolved_c_ops,
+            backend=backend,
         )
-        resolved_c_ops = [] if c_ops is None else list(c_ops)
-        for coefficients in input_coefficients:
-            result = qt.mesolve(
-                H_total,
-                self._parse_initial_state(coefficients),
-                t_axis,
-                c_ops=resolved_c_ops,
-                e_ops=[],
-                options=resolved_options,
-                args=resolved_args,
-            )
-            results.append(result)
-            final_state = self._result_final_state(result)
+
+        input_states = [self._parse_initial_state(coefficients) for coefficients in input_coefficients]
+        if prepared.backend in {'cpp', 'cpp_rwa'}:
+            batch = prepared.propagate_batch(input_states)
+            results = batch.results
+            final_states = batch.final_states
+        else:
+            final_states = []
+            for input_state in input_states:
+                result = prepared.propagate(input_state)
+                results.append(result)
+                final_states.append(self._result_final_state(result))
+
+        for result, final_state in zip(results, final_states):
             final_density = final_state * final_state.dag() if final_state.isket else final_state
             projected = self._project_operator_to_qubit_subspace(final_density, basis_states)
             if frame == 'rotating':
-                t_final = float(result.times[-1])
+                t_final = float(prepared.tlist[-1])
                 rotation = np.diag([1.0, np.exp(2j * pi * self.qubit.qubit_f01 * t_final)])
                 projected = rotation @ projected @ rotation.conj().T
             projected_outputs.append(np.asarray(projected, dtype=np.complex128))
@@ -1274,6 +1706,7 @@ class SingleQubitGate(GateBase):
         args: Optional[Dict[str, Any]] = None,
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
         store_trajectories: bool = True,
+        backend: str = 'qutip',
     ) -> Dict[str, Any]:
         """Reconstruct and score a dissipative trace channel."""
         payload = self.extract_trace_channel_payload(
@@ -1286,6 +1719,7 @@ class SingleQubitGate(GateBase):
             args=args,
             induc_phi_model=induc_phi_model,
             store_trajectories=store_trajectories,
+            backend=backend,
         )
         return {
             **self.score_trace_channel_payload(payload, target_unitary=target_unitary),
@@ -1349,6 +1783,17 @@ class SingleQubitGate(GateBase):
                 f"{clip_note}"
             )
 
+        observed_backends = set()
+        if payload is not None:
+            for result in payload.get("basis_results", ()):
+                stats = getattr(result, "stats", None)
+                if not isinstance(stats, dict):
+                    continue
+                if stats.get("backend"):
+                    observed_backends.add(str(stats["backend"]))
+                if stats.get("backend_fallback"):
+                    observed_backends.add(str(stats["backend_fallback"]))
+
         return {
             "fidelity": average_gate_fidelity,
             "average_gate_fidelity": average_gate_fidelity,
@@ -1364,6 +1809,7 @@ class SingleQubitGate(GateBase):
             "raw_unitary": raw_unitary,
             "target_unitary": target,
             "frame": frame,
+            "propagation_backends": tuple(sorted(observed_backends)),
         }
 
     def extract_evolution_unitary(
@@ -1380,6 +1826,7 @@ class SingleQubitGate(GateBase):
         unitarize: bool = False,
         make_su2: bool = False,
         store_trajectories: bool = True,
+        backend: str = 'qutip',
     ) -> qt.Qobj:
         """
         Extract the 2x2 evolution matrix projected onto the computational eigenstate subspace.
@@ -1401,6 +1848,7 @@ class SingleQubitGate(GateBase):
             unitarize=unitarize,
             make_su2=make_su2,
             store_trajectories=store_trajectories,
+            backend=backend,
         )
         return payload["unitary"]
 
@@ -1417,6 +1865,7 @@ class SingleQubitGate(GateBase):
         unitarize: bool = False,
         make_su2: bool = False,
         store_trajectories: bool = True,
+        backend: str = 'qutip',
     ) -> qt.Qobj:
         """
         Extract the 2x2 computational-subspace process matrix from a drive trace.
@@ -1436,6 +1885,7 @@ class SingleQubitGate(GateBase):
             unitarize=unitarize,
             make_su2=make_su2,
             store_trajectories=store_trajectories,
+            backend=backend,
         )
         return payload["unitary"]
 
@@ -1456,6 +1906,7 @@ class SingleQubitGate(GateBase):
         make_su2: bool = False,
         store_trajectories: bool = True,
         is_print: bool = True,
+        backend: str = 'qutip',
     ) -> Dict[str, Any]:
         """
         Compute gate-level fidelity against a target unitary in the 2D computational subspace.
@@ -1498,6 +1949,7 @@ class SingleQubitGate(GateBase):
                 unitarize=unitarize,
                 make_su2=make_su2,
                 store_trajectories=store_trajectories,
+                backend=backend,
             )
             actual_unitary = payload["unitary"]
             raw_unitary = payload["raw_unitary"]
@@ -1541,6 +1993,7 @@ class SingleQubitGate(GateBase):
         make_su2: bool = False,
         store_trajectories: bool = True,
         is_print: bool = True,
+        backend: str = 'qutip',
     ) -> Dict[str, Any]:
         """
         Compute gate-level unitary fidelity for one already-synthesized drive trace.
@@ -1565,6 +2018,7 @@ class SingleQubitGate(GateBase):
                 unitarize=unitarize,
                 make_su2=make_su2,
                 store_trajectories=store_trajectories,
+                backend=backend,
             )
             actual_unitary = payload["unitary"]
             raw_unitary = payload["raw_unitary"]
@@ -1592,6 +2046,183 @@ class SingleQubitGate(GateBase):
             is_print=is_print,
         )
 
+    def calculate_trace_sequence_unitary_fidelity(
+        self,
+        trace,
+        target_unitaries,
+        *,
+        boundary_times: Optional[Sequence[float]] = None,
+        couple_term: float = 0.5e-12,
+        couple_type: Literal['induc', 'capac'] = 'induc',
+        frame: Literal['rotating', 'lab'] = 'rotating',
+        options: Optional[Dict[str, Any]] = None,
+        args: Optional[Dict[str, Any]] = None,
+        induc_phi_model: Literal['exact', 'linear'] = 'exact',
+        unitarize: bool = False,
+        make_su2: bool = False,
+        store_trajectories: bool = False,
+        max_prefix_condition_number: float = 1e8,
+        is_print: bool = False,
+        backend: str = 'qutip',
+    ) -> Dict[str, Any]:
+        """Score a short sequence of the same primitive gate family.
+
+        ``target_unitaries`` contains one ideal 2x2 gate per pulse, for example
+        ``R_phi(pi/2)`` with different ``phi`` values.  The complete waveform is propagated
+        once (two computational-basis states), so residual tails and filter memory between
+        neighbouring pulses are retained.  When ``boundary_times`` are supplied, the method
+        also reports prefix and conditional gate fidelities at those boundaries.  The latter
+        uses ``A_j @ pinv(A_{j-1})`` (implemented as a least-squares solve) and is marked
+        ``ill_conditioned`` when the previous projected prefix is nearly singular because of
+        leakage.  This is a finite-memory diagnostic, not a long-sequence RB decay fit.
+        """
+        if isinstance(target_unitaries, qt.Qobj):
+            target_items = [target_unitaries]
+        else:
+            target_array = np.asarray(target_unitaries, dtype=object)
+            if target_array.shape == (2, 2):
+                target_items = [target_unitaries]
+            elif target_array.ndim == 3 and target_array.shape[1:] == (2, 2):
+                target_items = [target_array[index] for index in range(target_array.shape[0])]
+            else:
+                target_items = list(target_unitaries)
+        if not target_items:
+            raise ValueError("target_unitaries must contain at least one 2x2 unitary.")
+        if not np.isfinite(max_prefix_condition_number) or max_prefix_condition_number <= 0.0:
+            raise ValueError("max_prefix_condition_number must be a positive finite number.")
+
+        targets = [
+            self._resolve_target_qubit_unitary(item, make_su2=make_su2)
+            for item in target_items
+        ]
+        target_matrices = [np.asarray(target.full(), dtype=np.complex128) for target in targets]
+        target_sequence_matrix = np.eye(2, dtype=np.complex128)
+        for target_matrix in target_matrices:
+            target_sequence_matrix = target_matrix @ target_sequence_matrix
+
+        payload = self._extract_trace_unitary_payload(
+            trace,
+            couple_term=couple_term,
+            couple_type=couple_type,
+            frame=frame,
+            options=options,
+            args=args,
+            induc_phi_model=induc_phi_model,
+            unitarize=unitarize,
+            make_su2=make_su2,
+            store_trajectories=store_trajectories,
+            sample_times=boundary_times,
+            backend=backend,
+        )
+        sequence_score = self._score_unitary_fidelity(
+            actual_unitary=payload["unitary"],
+            raw_unitary=payload["raw_unitary"],
+            target_unitary=target_sequence_matrix,
+            payload=payload,
+            frame=frame,
+            make_su2=make_su2,
+            is_print=is_print,
+        )
+        result = {
+            **sequence_score,
+            "sequence_length": len(targets),
+            "sequence_unitary": payload["unitary"],
+            "target_sequence_unitary": qt.Qobj(target_sequence_matrix, dims=[[2], [2]]),
+            "sequence_payload": payload,
+            "boundary_metrics": [],
+        }
+
+        if boundary_times is None:
+            return result
+        boundary_values = np.asarray(boundary_times, dtype=np.float64).reshape(-1)
+        if len(boundary_values) != len(targets):
+            raise ValueError(
+                "boundary_times must have exactly one entry per target unitary."
+            )
+
+        previous_actual = np.eye(2, dtype=np.complex128)
+        previous_ideal = np.eye(2, dtype=np.complex128)
+        boundary_metrics = []
+        for index, target in enumerate(targets):
+            raw_prefix = np.asarray(
+                payload["boundary_raw_unitaries"][index].full(), dtype=np.complex128
+            )
+            prefix = np.asarray(
+                payload["boundary_unitaries"][index].full(), dtype=np.complex128
+            )
+            condition_number = float(np.linalg.cond(previous_actual))
+            conditional_status = "ok"
+            conditional_score = None
+            if not np.isfinite(condition_number) or condition_number > max_prefix_condition_number:
+                conditional_status = "ill_conditioned"
+            else:
+                conditional_raw = np.linalg.lstsq(
+                    previous_actual.T,
+                    raw_prefix.T,
+                    rcond=None,
+                )[0].T
+                conditional_matrix = conditional_raw
+                if unitarize:
+                    conditional_matrix = self._nearest_unitary(conditional_matrix)
+                if make_su2:
+                    conditional_matrix = self._strip_global_phase(conditional_matrix)
+                conditional_score = self._score_unitary_fidelity(
+                    actual_unitary=qt.Qobj(conditional_matrix, dims=[[2], [2]]),
+                    raw_unitary=qt.Qobj(conditional_raw, dims=[[2], [2]]),
+                    target_unitary=target,
+                    payload=None,
+                    frame=frame,
+                    make_su2=make_su2,
+                    is_print=False,
+                )
+
+            ideal_prefix = target_matrices[index] @ previous_ideal
+            prefix_score = self._score_unitary_fidelity(
+                actual_unitary=qt.Qobj(prefix, dims=[[2], [2]]),
+                raw_unitary=qt.Qobj(raw_prefix, dims=[[2], [2]]),
+                target_unitary=ideal_prefix,
+                payload={
+                    "average_leakage": payload["boundary_average_leakage"][index],
+                    "unitarity_error": float(
+                        np.linalg.norm(raw_prefix.conj().T @ raw_prefix - np.eye(2))
+                    ),
+                },
+                frame=frame,
+                make_su2=make_su2,
+                is_print=False,
+            )
+            boundary_metrics.append(
+                {
+                    "index": index,
+                    "time": float(boundary_values[index]),
+                    "conditional_status": conditional_status,
+                    "conditional_condition_number": condition_number,
+                    "conditional_average_gate_fidelity": (
+                        None
+                        if conditional_score is None
+                        else conditional_score["average_gate_fidelity"]
+                    ),
+                    "conditional_process_fidelity": (
+                        None
+                        if conditional_score is None
+                        else conditional_score["process_fidelity"]
+                    ),
+                    "conditional_average_leakage": (
+                        None
+                        if conditional_score is None
+                        else conditional_score["average_leakage"]
+                    ),
+                    "prefix_average_gate_fidelity": prefix_score["average_gate_fidelity"],
+                    "prefix_process_fidelity": prefix_score["process_fidelity"],
+                    "prefix_average_leakage": prefix_score["average_leakage"],
+                }
+            )
+            previous_actual = raw_prefix
+            previous_ideal = ideal_prefix
+
+        result["boundary_metrics"] = boundary_metrics
+        return result
+
     def calculate_fidelity(
         self, 
         channel: ChannelSchedule = None, 
@@ -1603,6 +2234,9 @@ class SingleQubitGate(GateBase):
         is_print: bool = True,
         transmission_chain: Optional[TransmissionChain] = None,
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
+        backend: str = 'qutip',
+        options: Optional[Dict[str, Any]] = None,
+        args: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, float]:
         """
         Compute single-input-state fidelity, leakage, and phase error for one schedule.
@@ -1632,6 +2266,9 @@ class SingleQubitGate(GateBase):
                 couple_term=couple_term,
                 couple_type=couple_type,
                 induc_phi_model=induc_phi_model,
+                backend=backend,
+                options=options,
+                args=args,
             )
         else:
             res = result
@@ -1654,6 +2291,7 @@ class SingleQubitGate(GateBase):
         options: Optional[Dict[str, Any]] = None,
         args: Optional[Dict[str, Any]] = None,
         induc_phi_model: Literal['exact', 'linear'] = 'exact',
+        backend: str = 'qutip',
     ) -> Dict[str, float]:
         """Compute state-transfer fidelity for an already propagated drive trace."""
         if result is None:
@@ -1665,6 +2303,7 @@ class SingleQubitGate(GateBase):
                 options=options,
                 args=args,
                 induc_phi_model=induc_phi_model,
+                **({'backend': backend} if backend != 'qutip' else {}),
             )
 
         return self._summarize_fidelity_metrics(

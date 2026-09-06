@@ -219,6 +219,7 @@ class QubitBase(HamiltonianEvo):
         self._Hamiltonian = hamiltonian
         self._energylevels = energylevels
         self._eigenstates = eigenstates
+        self._eigenstates_canonical = False
         self._pending_exact_core_template = None
 
         active_template = getattr(self, '_active_exact_solve_template', None)
@@ -575,6 +576,7 @@ class QubitBase(HamiltonianEvo):
         self._Hamiltonian = self._hamiltonian
         self._energylevels = owned_template.core.energylevels
         self._eigenstates = owned_template.core.eigenstates
+        self._eigenstates_canonical = False
         self._pending_exact_core_template = owned_template.pending_core
         self._destroyors_state = owned_template.auxiliary.destroyors
         self._n_operators_state = owned_template.auxiliary.number_operators
@@ -2104,6 +2106,7 @@ class AbstractQubit(QubitBase):
         self._Hamiltonian = self._hamiltonian
         self._energylevels = np.array(template['energylevels'], copy=True)
         self._eigenstates = self._clone_qobj_list(template['eigenstates'])
+        self._eigenstates_canonical = False
         self.destroyors = self._clone_qobj_list(template['destroyors'])
         self.n_operators = self._clone_qobj_list(template['number_operators'])
         self.phi_operators = self._clone_qobj_list(template['phase_operators'])

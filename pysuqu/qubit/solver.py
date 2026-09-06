@@ -10,6 +10,7 @@ import qutip as qt
 from qutip import Qobj, expect, ket2dm
 
 from ..funclib import cal_product_state, truncate_precision
+from .propagation import DriveTerm, PreparedPropagation
 from .compatibility import (
     _hamiltonian_evo_hamiltonian_evolution,
     _hamiltonian_evo_set_inistate,
@@ -116,7 +117,37 @@ class HamiltonianEvo:
 
     def _solve_hamiltonian_eigensystem(self, hamiltonian: Qobj):
         """Solve one Hamiltonian eigensystem without touching the structured solver container."""
-        return hamiltonian.eigenstates()
+        eigenvalues, eigenstates = hamiltonian.eigenstates()
+        return eigenvalues, self._canonicalize_eigenstates(eigenstates)
+
+    @staticmethod
+    def _canonicalize_eigenstates(eigenstates):
+        """Give each eigenket a deterministic phase independent of QuTiP's eigensolver."""
+        canonical = []
+        for state in eigenstates:
+            if not isinstance(state, Qobj) or not getattr(state, "isket", False):
+                canonical.append(state)
+                continue
+
+            values = np.asarray(state.full(), dtype=np.complex128).reshape(-1)
+            if values.size == 0:
+                canonical.append(state)
+                continue
+            pivot = int(np.argmax(np.abs(values)))
+            pivot_value = values[pivot]
+            if abs(pivot_value) > 0.0:
+                phase = np.conj(pivot_value) / abs(pivot_value)
+                state = phase * state
+            canonical.append(state)
+        return canonical
+
+    def _ensure_canonical_eigenstates(self) -> None:
+        """Normalize phases for templates restored without a fresh eigensolve."""
+        self._materialize_exact_core_state_if_needed()
+        if getattr(self, "_eigenstates_canonical", False):
+            return
+        self._eigenstates = self._canonicalize_eigenstates(self._eigenstates)
+        self._eigenstates_canonical = True
 
     def _materialize_exact_core_state_if_needed(self) -> None:
         """Realize deferred exact-template core state before a core-state read or mutation."""
@@ -145,6 +176,8 @@ class HamiltonianEvo:
             )
         else:
             self._energylevels, self._eigenstates = cached_eigensystem
+        self._eigenstates = self._canonicalize_eigenstates(self._eigenstates)
+        self._eigenstates_canonical = True
         self._solver_result = self._build_solver_result(
             hamiltonian,
             self._energylevels,
@@ -192,13 +225,13 @@ class HamiltonianEvo:
     @property
     def eigenstates(self):
         """Eigenstates."""
-        self._materialize_exact_core_state_if_needed()
+        self._ensure_canonical_eigenstates()
         return [truncate_precision(state) for state in self._eigenstates]
 
     @property
     def solver_result(self) -> SpectrumResult:
         """Structured view of the latest solver output."""
-        self._materialize_exact_core_state_if_needed()
+        self._ensure_canonical_eigenstates()
         materialize_exact_auxiliary_state = getattr(self, '_materialize_pending_exact_auxiliary_state', None)
         if self._solver_result is None and callable(materialize_exact_auxiliary_state):
             materialize_exact_auxiliary_state()
@@ -218,7 +251,7 @@ class HamiltonianEvo:
 
     def get_eigenstate(self, label=None) -> Union[List[Qobj], Qobj]:
         """Get eigenstate(s)."""
-        self._materialize_exact_core_state_if_needed()
+        self._ensure_canonical_eigenstates()
         if label is None:
             return [truncate_precision(state) for state in self._eigenstates]
         return truncate_precision(self._eigenstates[label])
@@ -314,8 +347,42 @@ class HamiltonianEvo:
         options: Union[dict, None] = None,
         args: Union[dict, None] = None,
         static_hamiltonian: Union[Qobj, None] = None,
+        backend: str = 'qutip',
+        drive_traces=None,
+        mode: str = 'rf',
     ):
-        """Convenience wrapper around ``qutip.mesolve`` for multi-drive Hamiltonians."""
+        """Solve a multi-drive Hamiltonian with the selected backend.
+
+        The historical callable-based interface remains the default.  Prepared
+        backends require ``drive_traces`` (a mapping or ordered sequence of
+        ``SignalTrace`` objects) so they can avoid Python callbacks inside the
+        integrator.
+        """
+        if backend not in {'qutip', 'reference', 'qutip_reference'}:
+            if drive_traces is None:
+                raise ValueError(
+                    "drive_traces are required when using a prepared propagation backend."
+                )
+            normalized = self._normalize_drive_terms(
+                drive_operators,
+                drive_traces,
+                channel_order=channel_order,
+            )
+            terms = [
+                DriveTerm(operator, trace, mode=mode)
+                for _name, operator, trace in normalized
+            ]
+            prepared = PreparedPropagation(
+                self.get_hamiltonian() if static_hamiltonian is None else static_hamiltonian,
+                terms,
+                tlist,
+                c_ops=c_ops or [],
+                options=options or {},
+                args=args or {},
+                backend=backend,
+            )
+            return prepared.propagate(initial_state, e_ops=e_ops or [])
+
         h_total = self.build_time_dependent_hamiltonian(
             drive_operators=drive_operators,
             drive_funcs=drive_funcs,
