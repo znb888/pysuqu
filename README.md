@@ -35,7 +35,8 @@ For most users, install from PyPI:
 pip install pysuqu
 ```
 
-`pysuqu` supports Python `3.8+`.
+`pysuqu` supports Python `3.9+` and QuTiP `5+`. Native wheels include the optional
+C++ backend; a platform-independent wheel also supports compiler-free QuTiP use.
 
 If you want the latest repository version for development:
 
@@ -55,16 +56,17 @@ pip install -e .
   S-parameters, digital precorrection, and multi-line MIMO propagation
 - `demo/` for end-to-end notebook examples
 
-### What's New In 2.0.4
+### What's New In 2.1.0
 
-Version `2.0.4` adds an end-to-end control-line simulation workflow:
+Version `2.1.0` adds prepared propagation and optional C++ simulation acceleration:
 
-- composable attenuation, delay, transfer-function, FIR, IIR, and SOS stages
-- Touchstone S-parameter parsing for single-path and multi-line MIMO models
-- transmission-aware AWG compilation, gate simulation, and signal diagnostics
-- derivative-based precorrection plus a runnable synthetic Touchstone tutorial
+- reusable QuTiP and native contexts, state batches, and gate-fidelity integration
+- dense and structured sparse kernels, exact interaction frames, and Krylov actions
+- static-collapse Lindblad evolution without an explicit Kronecker Liouvillian
+- explicit backend selection, capability-aware fallback, and opt-in RWA models
+- a runnable synthetic tutorial, comparative benchmarks, and tested native wheels
 
-See the [2.0.4 release notes](https://github.com/znb888/pysuqu/blob/main/docs/releases/2.0.4.md)
+See the [2.1.0 release notes](https://github.com/znb888/pysuqu/blob/main/docs/releases/2.1.0.md)
 for the complete public summary.
 
 ### Quick Start
@@ -96,6 +98,7 @@ best next stop.
 - [Documentation index](https://github.com/znb888/pysuqu/blob/main/docs/README.md)
 - [Demo notebooks](https://github.com/znb888/pysuqu/blob/main/demo/README.md)
 - [Transmission-chain guide](https://github.com/znb888/pysuqu/blob/main/docs/guides/transmission-chains.md)
+- [Propagation backend guide](https://github.com/znb888/pysuqu/blob/main/docs/guides/propagation-backends.md)
 - [Module map](https://github.com/znb888/pysuqu/blob/main/docs/architecture/module-map.md)
 
 ### Public API Notes
@@ -120,7 +123,8 @@ best next stop.
 pip install pysuqu
 ```
 
-`pysuqu` 支持 Python `3.8+`。
+`pysuqu` 支持 Python `3.9+` 和 QuTiP `5+`。原生 wheel 包含可选 C++ 后端；
+平台无关 wheel 也支持无需编译器的 QuTiP 仿真。
 
 如果你想基于仓库开发，安装方式如下：
 
@@ -138,16 +142,17 @@ pip install -e .
 - 传输链仿真：AWG/量子比特参考面、Touchstone S 参数、数字预校正与多线 MIMO 传播
 - `demo/`：端到端 notebook 示例
 
-### 2.0.4 新增内容
+### 2.1.0 新增内容
 
-`2.0.4` 增加了端到端控制链路仿真工作流：
+`2.1.0` 增加了可复用传播上下文和可选 C++ 仿真加速：
 
-- 可组合的衰减、延时、传递函数、FIR、IIR 和 SOS 级联模型
-- 面向单路径与多线 MIMO 模型的 Touchstone S 参数解析
-- 支持传输链的 AWG 编译、门仿真与信号诊断
-- 基于导数的预校正，以及可直接运行的合成 Touchstone 教程
+- 可复用的 QuTiP 与原生传播、批量初态演化和门保真度接口
+- 稠密与结构化稀疏内核、精确相互作用绘景和 Krylov 指数作用
+- 无需显式构造 Kronecker Liouvillian 的静态耗散 Lindblad 演化
+- 明确的后端选择、按能力回退，以及需要显式启用的 RWA 近似
+- 可运行的合成参数教程、对照基准和经过测试的原生 wheel
 
-完整说明见 [2.0.4 发布说明](https://github.com/znb888/pysuqu/blob/main/docs/releases/2.0.4.md)。
+完整说明见 [2.1.0 发布说明](https://github.com/znb888/pysuqu/blob/main/docs/releases/2.1.0.md)。
 
 ### 快速开始
 
@@ -176,6 +181,7 @@ print(qubit.get_energylevel()[:3])
 - [文档索引](https://github.com/znb888/pysuqu/blob/main/docs/README.md)
 - [Demo 说明](https://github.com/znb888/pysuqu/blob/main/demo/README.md)
 - [传输链指南](https://github.com/znb888/pysuqu/blob/main/docs/guides/transmission-chains.md)
+- [传播后端指南](https://github.com/znb888/pysuqu/blob/main/docs/guides/propagation-backends.md)
 - [模块地图](https://github.com/znb888/pysuqu/blob/main/docs/architecture/module-map.md)
 
 ### 公共 API 说明

@@ -1,13 +1,14 @@
-name: Publish Python package
+name: Build and publish Python package
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to publish, for example v2.0.1"
+        description: "Existing release tag to publish, for example v2.1.0"
         required: true
         type: string
 
@@ -20,76 +21,130 @@ env:
 jobs:
   test:
     name: Run public tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
-
       - name: Install package and test dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt
-          python -m pip install -e .
-
+        run: python -m pip install -e . nbformat nbclient ipykernel
       - name: Run unit tests
         run: python -m unittest discover -s tests/unit -p "test_*.py"
-
       - name: Run functional tests
         run: python -m unittest discover -s tests/functional -p "test_*.py"
-
       - name: Run regression tests
         run: python -m unittest discover -s tests/regression -p "test_*.py"
+      - name: Execute the propagation tutorial
+        run: |
+          python - <<'PY'
+          import nbformat
+          from nbclient import NotebookClient
+          notebook = nbformat.read("demo/demo_06_native_propagation.ipynb", as_version=4)
+          nbformat.validate(notebook)
+          NotebookClient(notebook, timeout=120, kernel_name="python3").execute()
+          PY
+      - name: Check synthetic benchmark errors
+        run: |
+          python -m benchmarks.propagation_workflow --case gate --repeats 1
+          python -m benchmarks.propagation_workflow --case sparse --dimension 320 --repeats 1
+          python -m benchmarks.propagation_workflow --case lindblad --repeats 1
 
-  build:
-    name: Build distributions
-    needs: test
-    runs-on: ubuntu-latest
+  build-python:
+    name: Validate Python wheel and source distribution
+    runs-on: ubuntu-22.04
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-
-      - name: Install build backend
-        run: python -m pip install --upgrade pip build
-
-      - name: Build sdist and wheel
+      - run: python -m pip install --upgrade build twine
+      - name: Build compiler-free distributions
         run: python -m build
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        env:
+          PYSUQU_BUILD_NATIVE: "0"
+      - run: python -m twine check dist/*
+      - name: Check release version
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        run: |
+          python - <<'PY'
+          import os
+          from pysuqu.version import __version__
+          assert os.environ["RELEASE_TAG"] == "v" + __version__, "Release tag and version differ"
+          PY
+      - name: Install and test the Python wheel
+        run: |
+          python -m pip install dist/*.whl
+          python -I tests/native_wheel_smoke.py --python-only
+      - name: Build the native extension from the source distribution
+        run: python -m pip wheel --no-deps dist/*.tar.gz --wheel-dir sdist-wheels
+        env:
+          PYSUQU_BUILD_NATIVE: "1"
+      - name: Install and test the source-built native wheel
+        run: |
+          python -m pip install --force-reinstall --no-deps sdist-wheels/*.whl
+          python -I tests/native_wheel_smoke.py --native
+      - uses: actions/upload-artifact@v4
         with:
-          name: python-package-distributions
+          name: distributions-python
           path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-native:
+    name: Native wheels (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            arch: x86_64
+          - os: windows-2022
+            arch: AMD64
+          - os: macos-15
+            arch: arm64
+          - os: macos-15-intel
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - name: Build and test installed native wheels
+        uses: pypa/cibuildwheel@v4.2.1
+        env:
+          CIBW_BUILD: "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+          CIBW_SKIP: "*-musllinux_*"
+          CIBW_ARCHS: ${{ matrix.arch }}
+          CIBW_ENVIRONMENT: "PYSUQU_BUILD_NATIVE=1"
+          CIBW_BUILD_FRONTEND: "build"
+          CIBW_TEST_COMMAND: "python -I {project}/tests/native_wheel_smoke.py --native"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: distributions-${{ matrix.os }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
           retention-days: 14
 
   publish-pypi:
     name: Publish distributions to PyPI
-    needs: build
-    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    needs: [test, build-python, build-native]
+    runs-on: ubuntu-22.04
     environment: pypi
     permissions:
       id-token: write
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          name: python-package-distributions
+          pattern: distributions-*
+          merge-multiple: true
           path: dist
-
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -97,24 +152,24 @@ jobs:
 
   github-release:
     name: Upload distributions to GitHub Release
-    needs:
-      - build
-      - publish-pypi
-    runs-on: ubuntu-latest
+    needs: publish-pypi
+    runs-on: ubuntu-22.04
     permissions:
       contents: write
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v6
         with:
-          name: python-package-distributions
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: distributions-*
+          merge-multiple: true
           path: dist
-
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
           name: ${{ env.RELEASE_TAG }}
-          generate_release_notes: true
+          body_path: docs/releases/2.1.0.md
           fail_on_unmatched_files: true
           files: dist/*

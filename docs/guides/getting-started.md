@@ -11,6 +11,10 @@ For most users, install the published package from PyPI:
 pip install pysuqu
 ```
 
+Python 3.9 or newer and QuTiP 5 are required. Native wheels include the optional
+C++ propagation backend; the platform-independent wheel runs with QuTiP alone.
+See [propagation backends](propagation-backends.md) for source-build instructions.
+
 If you want the latest repository version for development:
 
 ```bash
@@ -124,8 +128,8 @@ print(result)
 
 ## Repository Policy
 
-This public repository ships `demo/` notebooks and synthetic data only. The
-old private notebook set is still excluded.
+The `demo/` notebooks use reproducible synthetic inputs and include their model
+assumptions alongside the examples.
 
 ## Public Demo Notebooks
 
@@ -135,6 +139,7 @@ old private notebook set is still excluded.
 - [../../demo/demo_03_waveform_and_gate_basics.ipynb](../../demo/demo_03_waveform_and_gate_basics.ipynb)
 - [../../demo/demo_04_dynamic_simulation.ipynb](../../demo/demo_04_dynamic_simulation.ipynb)
 - [../../demo/demo_05_transmission_chain_touchstone.ipynb](../../demo/demo_05_transmission_chain_touchstone.ipynb)
+- [../../demo/demo_06_native_propagation.ipynb](../../demo/demo_06_native_propagation.ipynb)
 
 ## Next References
 
@@ -142,4 +147,5 @@ old private notebook set is still excluded.
 - [../architecture/refactor-status.md](../architecture/refactor-status.md)
 - [code-style.md](code-style.md)
 - [transmission-chains.md](transmission-chains.md)
+- [propagation-backends.md](propagation-backends.md)
 
