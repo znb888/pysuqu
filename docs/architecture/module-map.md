@@ -6,6 +6,8 @@ Updated for the current public repository.
 
 ```text
 pysuqu/
+  _native/
+    __init__.py
   qubit/
     __init__.py
     analysis.py
@@ -14,6 +16,9 @@ pysuqu/
     gate.py
     multi.py
     plotting.py
+    propagation.py
+    backends/
+      cpp_backend.py
     single.py
     solver.py
     sweeps.py
@@ -94,6 +99,8 @@ from pysuqu.qubit import (
 - `base.py`: core qubit abstractions and parameterized qubit foundations
 - `circuit.py`: circuit input handling and matrix preparation
 - `solver.py`: Hamiltonian assembly and solver helpers
+- `propagation.py`: prepared propagation, backend options, and batch result types
+- `backends/cpp_backend.py`: native preparation, representations, and capability checks
 - `single.py`: single-qubit models
 - `multi.py`: multi-qubit and coupler models
 - `gate.py`: gate-level scheduling and simulation helpers

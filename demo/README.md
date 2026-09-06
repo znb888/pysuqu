@@ -15,6 +15,9 @@ This directory contains public tutorial notebooks for `pysuqu`.
 - `demo_05_transmission_chain_touchstone.ipynb`
   - single-line and MIMO transmission chains, synthetic Touchstone models,
     qubit-plane traces, and multi-drive gate simulation
+- `demo_06_native_propagation.ipynb`
+  - backend comparison, analytic RF carriers, reusable state batches, and
+    static-collapse Lindblad evolution with synthetic parameters
 
 ## Data Policy
 
