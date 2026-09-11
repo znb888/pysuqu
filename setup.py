@@ -1,8 +1,11 @@
 ﻿from pathlib import Path
 
 import os
+from glob import glob
 
 from setuptools import Extension, find_packages, setup
+
+from pysuqu._native_build_options import native_build_options
 
 
 ROOT = Path(__file__).resolve().parent
@@ -15,13 +18,32 @@ def native_extensions():
     """Enable native propagation explicitly while keeping compiler-free installs."""
     if os.environ.get("PYSUQU_BUILD_NATIVE", "0").lower() not in {"1", "true", "yes", "on"}:
         return []
-    compile_args = ["/O2", "/std:c++17"] if os.name == "nt" else ["-O3", "-std=c++17", "-pthread"]
+    options = native_build_options()
+    family = options["compiler_family"] or ("msvc" if os.name == "nt" else "gnu")
+    if options["march_native"] and family == "msvc":
+        raise RuntimeError("PYSUQU_NATIVE_MARCH_NATIVE is unsupported with MSVC")
+    compile_args = ["/O2", "/EHsc", "/std:c++17"] if family == "msvc" else ["-O3", "-std=c++17", "-pthread"]
+    link_args = [] if family == "msvc" else ["-pthread"]
+    if options["march_native"]:
+        compile_args.append("-march=native")
+    if options["pgo"] == "generate":
+        flag = "-fprofile-generate" + (f"={options['profile_dir']}" if options["profile_dir"] else "")
+        compile_args.append(flag)
+        if family != "msvc":
+            link_args.append(flag)
+    elif options["pgo"] == "use":
+        flag = "-fprofile-use" + (f"={options['profile_dir']}" if options["profile_dir"] else "")
+        compile_args.extend([flag, "-fprofile-correction"])
+        if family != "msvc":
+            link_args.append(flag)
+    native_details = sorted(glob("native/detail/*.inc"))
     return [Extension(
         "pysuqu._native._dynamics",
         sources=["native/dynamics.cpp"],
+        depends=native_details,
         language="c++",
         extra_compile_args=compile_args,
-        extra_link_args=[] if os.name == "nt" else ["-pthread"],
+        extra_link_args=link_args,
     )]
 
 
