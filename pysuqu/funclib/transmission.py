@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
+import hashlib
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Literal, Optional, Protocol, Sequence, Tuple, Union
 
@@ -1821,6 +1823,8 @@ class TouchstoneStage(BaseTransmissionStage):
     allowed_planes: Tuple[str, ...] = ("awg_iq", "awg_rf", "qubit_iq", "qubit_rf")
     is_lti: bool = True
     output_plane: Optional[SignalPlane] = None
+    response_cache_size: int = 4
+    _response_cache: Any = field(default_factory=OrderedDict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.interpolation not in ("cartesian", "polar"):
@@ -1835,6 +1839,9 @@ class TouchstoneStage(BaseTransmissionStage):
             raise ValueError(
                 f"Unsupported Touchstone frequency_mode: {self.frequency_mode}"
             )
+        if isinstance(self.response_cache_size, bool) or int(self.response_cache_size) < 0:
+            raise ValueError("response_cache_size must be a non-negative integer.")
+        self.response_cache_size = int(self.response_cache_size)
 
         if self.network is None:
             if not self.file_path:
@@ -1895,6 +1902,36 @@ class TouchstoneStage(BaseTransmissionStage):
         response[negative_mask] = np.conj(response[negative_mask])
         return _enforce_real_self_conjugate_bins(response, freq_axis)
 
+    def _response_cache_key(self, trace: SignalTrace, fft_length: int) -> bytes:
+        """Fingerprint mutable network and trace inputs for response reuse."""
+        hasher = hashlib.blake2b(digest_size=20)
+        hasher.update(b"pysuqu-touchstone-response-v1;")
+        hasher.update(np.asarray(self.network.frequencies, dtype=np.float64).tobytes())
+        hasher.update(np.asarray(self._selected_response(), dtype=np.complex128).tobytes())
+        for value in (
+            int(fft_length), float(trace.sample_rate), trace.domain, float(trace.lo_freq),
+            int(self.input_port), int(self.output_port), self.interpolation,
+            self.out_of_band, self.frequency_mode,
+        ):
+            hasher.update(repr(value).encode("utf-8"))
+            hasher.update(b";")
+        return hasher.digest()
+
+    def _cached_response(self, trace: SignalTrace, freq_axis: np.ndarray) -> np.ndarray:
+        if self.response_cache_size <= 0:
+            return self._evaluate_response(trace, freq_axis)
+        key = self._response_cache_key(trace, len(freq_axis))
+        cached = self._response_cache.get(key)
+        if cached is not None:
+            self._response_cache.move_to_end(key)
+            return cached
+        response = np.asarray(self._evaluate_response(trace, freq_axis), dtype=np.complex128)
+        response.setflags(write=False)
+        self._response_cache[key] = response
+        while len(self._response_cache) > self.response_cache_size:
+            self._response_cache.popitem(last=False)
+        return response
+
     def apply(self, trace: SignalTrace) -> SignalTrace:
         """Propagate one trace through the selected S-parameter response."""
         self._validate_trace(trace)
@@ -1914,7 +1951,7 @@ class TouchstoneStage(BaseTransmissionStage):
         fft_length = _next_fft_length(len(trace.values))
         freq_axis = np.fft.fftfreq(fft_length, d=1.0 / trace.sample_rate)
         padded_values = np.pad(trace.values, (0, fft_length - len(trace.values)))
-        response = self._evaluate_response(trace, freq_axis)
+        response = self._cached_response(trace, freq_axis)
         filtered = np.fft.ifft(
             np.fft.fft(padded_values, n=fft_length) * response,
             n=fft_length,
@@ -1956,6 +1993,8 @@ class MIMOTouchstoneStage(BaseBundleTransmissionStage):
     allowed_planes: Tuple[str, ...] = ("awg_iq", "awg_rf", "qubit_iq", "qubit_rf")
     is_lti: bool = True
     output_plane: Optional[SignalPlane] = None
+    response_cache_size: int = 4
+    _response_cache: Any = field(default_factory=OrderedDict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         for field_name, ports in (
@@ -2000,6 +2039,9 @@ class MIMOTouchstoneStage(BaseBundleTransmissionStage):
             raise ValueError(
                 f"Unsupported Touchstone frequency_mode: {self.frequency_mode}"
             )
+        if isinstance(self.response_cache_size, bool) or int(self.response_cache_size) < 0:
+            raise ValueError("response_cache_size must be a non-negative integer.")
+        self.response_cache_size = int(self.response_cache_size)
 
         if self.network is None:
             if not self.file_path:
@@ -2142,6 +2184,40 @@ class MIMOTouchstoneStage(BaseBundleTransmissionStage):
                 )
         return response
 
+    def _response_cache_key(self, bundle: SignalBundle, fft_length: int) -> bytes:
+        """Fingerprint all mutable inputs that determine the MIMO response."""
+        hasher = hashlib.blake2b(digest_size=20)
+        hasher.update(b"pysuqu-mimo-touchstone-response-v1;")
+        hasher.update(np.asarray(self.network.frequencies, dtype=np.float64).tobytes())
+        for output_port in self.output_ports:
+            for input_port in self.input_ports:
+                hasher.update(
+                    np.asarray(self.network.get_response(output_port, input_port), dtype=np.complex128).tobytes()
+                )
+        for value in (
+            int(fft_length), float(bundle.sample_rate), bundle.domain,
+            bundle.shared_lo_freq, self.input_ports, self.output_ports,
+            self.interpolation, self.out_of_band, self.frequency_mode,
+        ):
+            hasher.update(repr(value).encode("utf-8"))
+            hasher.update(b";")
+        return hasher.digest()
+
+    def _cached_response_matrix(self, bundle: SignalBundle, freq_axis: np.ndarray) -> np.ndarray:
+        if self.response_cache_size <= 0:
+            return self._evaluate_response_matrix(bundle, freq_axis)
+        key = self._response_cache_key(bundle, len(freq_axis))
+        cached = self._response_cache.get(key)
+        if cached is not None:
+            self._response_cache.move_to_end(key)
+            return cached
+        response = np.asarray(self._evaluate_response_matrix(bundle, freq_axis), dtype=np.complex128)
+        response.setflags(write=False)
+        self._response_cache[key] = response
+        while len(self._response_cache) > self.response_cache_size:
+            self._response_cache.popitem(last=False)
+        return response
+
     def _make_output_trace(
         self,
         bundle: SignalBundle,
@@ -2195,7 +2271,7 @@ class MIMOTouchstoneStage(BaseBundleTransmissionStage):
         else:
             fft_length = _next_fft_length(num_samples)
             freq_axis = np.fft.fftfreq(fft_length, d=1.0 / bundle.sample_rate)
-            response_matrix = self._evaluate_response_matrix(bundle, freq_axis)
+            response_matrix = self._cached_response_matrix(bundle, freq_axis)
             input_spectra = np.zeros(
                 (len(input_channels), fft_length),
                 dtype=np.complex128,
