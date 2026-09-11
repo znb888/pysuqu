@@ -60,6 +60,7 @@ from .propagation import (
     native_backend_available,
     native_plan_cache_info,
 )
+from ..funclib.awgenerator import WaveformCache
 from .solver import HamiltonianEvo
 from .single import FloatingTransmon, GroundedTransmon, SingleQubitBase
 from .sweeps import sweep_single_qubit_energy_vs_flux
@@ -113,6 +114,7 @@ __all__ = [
     'TransmonReflectionModel',
     'UnsupportedBackendError',
     'WaveformGenerator',
+    'WaveformCache',
     'apply_derivative_precorrection',
     'analyze_single_qubit_spectrum',
     'calculate_loaded_multiport_response',
