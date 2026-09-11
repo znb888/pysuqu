@@ -6,13 +6,15 @@ Lib for arbitrary wave generator.
 import os
 import csv
 import sys
+import hashlib
 import importlib.util
 import numpy as np
 from scipy.signal import windows, convolve
 from scipy.special import i0, i1
 from scipy.interpolate import interp1d
 from scipy.io import wavfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
+from collections import OrderedDict
 from typing import Any, Dict, Literal, Tuple, Callable, Optional, Union, List
 from pathlib import Path
 
@@ -633,9 +635,146 @@ def _load_waveform_wav(
     
     return time_array, complex_wave
 
+# --- Explicit waveform cache ---
+def _update_waveform_cache_fingerprint(hasher, value) -> bool:
+    """Add a value's exact content to ``hasher``; return False if unsafe.
+
+    Callables and opaque objects are deliberately rejected because their
+    behaviour may depend on mutable state that cannot be fingerprinted.
+    """
+    if value is None:
+        hasher.update(b"none;")
+        return True
+    if isinstance(value, (bool, int, float, str, bytes)):
+        hasher.update(type(value).__name__.encode("utf-8"))
+        hasher.update(repr(value).encode("utf-8"))
+        hasher.update(b";")
+        return True
+    if isinstance(value, np.generic):
+        return _update_waveform_cache_fingerprint(hasher, value.item())
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            return False
+        contiguous = np.ascontiguousarray(value)
+        hasher.update(b"array:")
+        hasher.update(str(contiguous.dtype).encode("ascii"))
+        hasher.update(repr(contiguous.shape).encode("ascii"))
+        hasher.update(contiguous.tobytes(order="C"))
+        return True
+    if callable(value):
+        return False
+    if is_dataclass(value):
+        hasher.update(type(value).__qualname__.encode("utf-8"))
+        for item in fields(value):
+            hasher.update(item.name.encode("utf-8"))
+            if not _update_waveform_cache_fingerprint(hasher, getattr(value, item.name)):
+                return False
+        return True
+    if isinstance(value, (list, tuple)):
+        hasher.update(type(value).__name__.encode("ascii"))
+        for item in value:
+            if not _update_waveform_cache_fingerprint(hasher, item):
+                return False
+        return True
+    if isinstance(value, dict):
+        hasher.update(b"dict:")
+        for key in sorted(value, key=lambda item: repr(item)):
+            if not _update_waveform_cache_fingerprint(hasher, key):
+                return False
+            if not _update_waveform_cache_fingerprint(hasher, value[key]):
+                return False
+        return True
+    return False
+
+
+def _waveform_cache_key(generator, schedule: "ChannelSchedule", mode: str):
+    hasher = hashlib.blake2b(digest_size=20)
+    hasher.update(b"pysuqu-awg-v1;")
+    # Transmission stages run after AWG compilation and do not affect this
+    # entry, allowing one compiled trace to serve several chain selections.
+    schedule_content = {
+        "name": schedule.name,
+        "sampling_rate": schedule.sampling_rate,
+        "mixer_config": schedule.mixer_config,
+        "mixer_correction": schedule.mixer_correction,
+        "events": schedule.events,
+        "fir_kernel": schedule.fir_kernel,
+    }
+    if not _update_waveform_cache_fingerprint(
+        hasher,
+        (generator.total_time, generator.sample_rate, generator.anharmonicity, mode, schedule_content),
+    ):
+        return None
+    return hasher.digest()
+
+
+class WaveformCache:
+    """Bounded cache for deterministic AWG-side :class:`SignalTrace` values.
+
+    Pass an instance to ``WaveformGenerator(cache=...)`` to opt in.  Cached
+    arrays are copied on both insertion and retrieval, so callers cannot
+    mutate future results through an earlier return value.
+    """
+
+    def __init__(self, max_entries: int = 32):
+        if isinstance(max_entries, bool) or int(max_entries) <= 0:
+            raise ValueError("max_entries must be a positive integer.")
+        self.max_entries = int(max_entries)
+        self._entries = OrderedDict()
+        self.hits = 0
+        self.misses = 0
+
+    def clear(self) -> None:
+        self._entries.clear()
+        self.hits = 0
+        self.misses = 0
+
+    def info(self) -> dict:
+        return {
+            "size": len(self._entries),
+            "max_entries": self.max_entries,
+            "hits": self.hits,
+            "misses": self.misses,
+        }
+
+    def get(self, key):
+        if key is None or key not in self._entries:
+            self.misses += 1
+            return None
+        self.hits += 1
+        value = self._entries.pop(key)
+        self._entries[key] = value
+        return value.clone(
+            t_axis=np.array(value.t_axis, copy=True),
+            values=np.array(value.values, copy=True),
+            metadata=dict(value.metadata),
+        )
+
+    def put(self, key, value):
+        if key is None:
+            return
+        stored = value.clone(
+            t_axis=np.array(value.t_axis, copy=True),
+            values=np.array(value.values, copy=True),
+            metadata=dict(value.metadata),
+        )
+        stored.t_axis.setflags(write=False)
+        stored.values.setflags(write=False)
+        self._entries.pop(key, None)
+        self._entries[key] = stored
+        while len(self._entries) > self.max_entries:
+            self._entries.popitem(last=False)
+
+
 # --- Waveform Generator ---
 class WaveformGenerator:
-    def __init__(self, total_time: float, sample_rate: float, anharmonicity: float = -0.25):
+    def __init__(
+        self,
+        total_time: float,
+        sample_rate: float,
+        anharmonicity: float = -0.25,
+        cache: Optional[WaveformCache] = None,
+    ):
         """
         Waveform Generator for hierarchical Pulse/Schedule architecture.
 
@@ -647,6 +786,9 @@ class WaveformGenerator:
         self.total_time = total_time
         self.sample_rate = sample_rate
         self.anharmonicity = anharmonicity
+        if cache is not None and not isinstance(cache, WaveformCache):
+            raise TypeError("cache must be a WaveformCache instance or None.")
+        self.cache = cache
         
         self.num_samples = int(np.round(total_time * sample_rate))
         self.t_axis = np.linspace(0, total_time, self.num_samples, endpoint=False)
@@ -987,23 +1129,34 @@ class WaveformGenerator:
         mode: Literal['iq', 'rf'] = 'iq',
     ):
         """Return the AWG-side sampled signal as a SignalTrace."""
+        cache_key = _waveform_cache_key(self, schedule, mode) if self.cache is not None else None
+        if self.cache is not None:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                return cached
+
         if mode == 'iq':
-            return self._build_signal_trace(
+            output = self._build_signal_trace(
                 self._compile_awg_iq_complex(schedule),
                 domain='iq_complex',
                 plane='awg_iq',
                 schedule=schedule,
                 label_suffix='awg_iq',
             )
-        if mode == 'rf':
-            return self._build_signal_trace(
+        elif mode == 'rf':
+            output = self._build_signal_trace(
                 self.generate_rf_waveform(schedule),
                 domain='rf_real',
                 plane='awg_rf',
                 schedule=schedule,
                 label_suffix='awg_rf',
             )
-        raise ValueError(f"Unsupported AWG output mode: {mode}")
+        else:
+            raise ValueError(f"Unsupported AWG output mode: {mode}")
+
+        if self.cache is not None:
+            self.cache.put(cache_key, output)
+        return output
 
     def generate_awg_bundle(
         self,
