@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+import copy
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -240,6 +241,76 @@ class DriveTerm:
     operator: qt.Qobj
     trace: Any
     mode: str = "rf"
+
+
+def _snapshot_qobj(value: qt.Qobj) -> qt.Qobj:
+    """Own an operator used by a prepared context.
+
+    QuTiP operators are mutable containers.  Keeping the caller's instance
+    would let a later in-place data update silently change a prepared native
+    plan (or make its hash disagree with the matrices already cached).
+    ``Qobj.copy`` is supported by QuTiP 4 and 5; the dense fallback keeps this
+    boundary usable with the small test doubles used by the package tests.
+    """
+    copier = getattr(value, "copy", None)
+    if callable(copier):
+        return copier()
+    return qt.Qobj(np.array(value.full(), dtype=np.complex128, copy=True), dims=value.dims)
+
+
+def _snapshot_trace(trace: Any) -> Any:
+    """Copy sampled trace arrays while retaining custom trace metadata."""
+    try:
+        t_axis = np.array(getattr(trace, "t_axis"), dtype=np.float64, copy=True)
+        values = np.array(getattr(trace, "values"), copy=True)
+    except (AttributeError, TypeError, ValueError):
+        # Callable coefficients and user supplied trace objects may not expose
+        # sampled arrays.  They remain supported through their existing path.
+        return trace
+    clone = getattr(trace, "clone", None)
+    metadata = getattr(trace, "metadata", None)
+    if callable(clone):
+        changes = {"t_axis": t_axis, "values": values}
+        if metadata is not None:
+            changes["metadata"] = copy.deepcopy(metadata)
+        try:
+            return clone(**changes)
+        except (TypeError, ValueError):
+            pass
+    try:
+        snapshot = copy.copy(trace)
+        snapshot.t_axis = t_axis
+        snapshot.values = values
+        if metadata is not None:
+            snapshot.metadata = copy.deepcopy(metadata)
+        return snapshot
+    except (AttributeError, TypeError):
+        return trace
+
+
+def _snapshot_drive_term(term: DriveTerm) -> DriveTerm:
+    """Return a drive descriptor whose mutable numerical inputs are owned."""
+    operator = _snapshot_qobj(term.operator) if isinstance(term.operator, qt.Qobj) else term.operator
+    trace = _snapshot_trace(term.trace)
+    if operator is term.operator and trace is term.trace:
+        return term
+    try:
+        return replace(term, operator=operator, trace=trace)
+    except TypeError:
+        return DriveTerm(operator=operator, trace=trace, mode=getattr(term, "mode", "rf"))
+
+
+def _snapshot_collapse(item: Any) -> Any:
+    """Copy collapse operators, including the dynamic-rate descriptor."""
+    if isinstance(item, qt.Qobj):
+        return _snapshot_qobj(item)
+    if isinstance(item, DynamicCollapseRate):
+        return replace(item, operator=_snapshot_qobj(item.operator),
+                       rate_trace=_snapshot_trace(item.rate_trace))
+    if isinstance(item, (list, tuple)) and item and isinstance(item[0], qt.Qobj):
+        copied = [_snapshot_qobj(item[0]), *item[1:]]
+        return type(item)(copied) if isinstance(item, tuple) else copied
+    return item
 
 
 @dataclass
@@ -488,8 +559,11 @@ class PreparedPropagation:
     ) -> None:
         if not isinstance(static_hamiltonian, qt.Qobj):
             raise TypeError("static_hamiltonian must be a qutip.Qobj.")
-        self.static_hamiltonian = static_hamiltonian
-        self.drive_terms = tuple(drive_terms)
+        # Prepared contexts own their numerical inputs.  This prevents a
+        # caller mutating a Qobj or sampled trace after preparation from
+        # changing a cached native plan behind the context's back.
+        self.static_hamiltonian = _snapshot_qobj(static_hamiltonian)
+        self.drive_terms = tuple(_snapshot_drive_term(term) for term in drive_terms)
         self.tlist = np.ascontiguousarray(np.asarray(tlist, dtype=np.float64))
         if self.tlist.ndim != 1 or len(self.tlist) == 0:
             raise ValueError("tlist must be a non-empty one-dimensional array.")
@@ -497,7 +571,7 @@ class PreparedPropagation:
             raise ValueError("tlist must contain only finite values.")
         if len(self.tlist) > 1 and np.any(np.diff(self.tlist) <= 0):
             raise ValueError("tlist must be strictly increasing.")
-        self.c_ops = list(c_ops or [])
+        self.c_ops = [_snapshot_collapse(item) for item in (c_ops or [])]
         self.args = dict(args or {})
         self.options = PropagationOptions.from_mapping(options, backend=backend)
         self._requested_backend = str(self.options.backend).lower()
