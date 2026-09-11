@@ -14,10 +14,107 @@ from scipy.optimize import curve_fit
 from scipy.signal import savgol_filter
 from scipy.ndimage import uniform_filter1d, gaussian_filter1d
 from scipy.integrate import quad, simpson
+try:
+    from scipy.integrate import quad_vec
+except ImportError:  # pragma: no cover - old SciPy fallback
+    quad_vec = None
 from scipy.interpolate import CubicSpline, UnivariateSpline
 from typing import Callable, Optional, Tuple
 
 kb = Boltzmann
+
+
+class PreparedFilteredPSD:
+    """Reusable PSD preprocessing for sparse-grid filter integrations."""
+
+    def __init__(self, x_arr, y_arr, *, continuous=False, grid_per_decade=4, spline_order=3):
+        dtype = float if continuous else None
+        x_arr = np.asarray(x_arr, dtype=dtype)
+        y_arr = np.asarray(y_arr, dtype=dtype)
+        if x_arr.shape != y_arr.shape:
+            raise ValueError("x_arr and y_arr must have the same shape.")
+        order = np.argsort(x_arr)
+        self.x_sorted = np.array(x_arr[order], copy=True)
+        self.y_sorted = np.array(y_arr[order], copy=True)
+        self.x_sorted.setflags(write=False)
+        self.y_sorted.setflags(write=False)
+        self._continuous_ready = False
+        if continuous:
+            self._prepare_continuous(grid_per_decade, spline_order)
+
+    @classmethod
+    def for_continuous(cls, x_arr, y_arr, *, grid_per_decade=4, spline_order=3):
+        return cls(x_arr, y_arr, continuous=True, grid_per_decade=grid_per_decade, spline_order=spline_order)
+
+    @classmethod
+    def for_discrete(cls, x_arr, y_arr):
+        return cls(x_arr, y_arr)
+
+    def _prepare_continuous(self, grid_per_decade, spline_order):
+        mask = np.isfinite(self.x_sorted) & np.isfinite(self.y_sorted) & (self.x_sorted > 0) & (self.y_sorted > 0)
+        x, y = self.x_sorted[mask], self.y_sorted[mask]
+        if len(x) < 3:
+            raise ValueError("integrate_filtered_psd_continuous requires at least 3 positive finite points.")
+        x, idx = np.unique(x, return_index=True)
+        y = y[idx]
+        if len(x) < 3:
+            raise ValueError("integrate_filtered_psd_continuous requires at least 3 unique positive x points.")
+        if grid_per_decade <= 0:
+            raise ValueError("grid_per_decade must be positive.")
+        self.x_unique, self.y_unique = x.copy(), y.copy()
+        self.x_unique.setflags(write=False); self.y_unique.setflags(write=False)
+        self._log_spline = UnivariateSpline(np.log(x), np.log(y), s=0, k=min(int(spline_order), len(x)-1))
+        step = 1.0 / float(grid_per_decade)
+        decade = 10.0 ** np.arange(np.floor(np.log10(x[0])), np.ceil(np.log10(x[-1])) + step, step)
+        self._nodes = np.unique(np.concatenate(([x[0], x[-1]], decade[(decade > x[0]) & (decade < x[-1])])))
+        self._nodes.setflags(write=False)
+        self._continuous_ready = True
+
+    def integrate_discrete(self, z_func, *, method="log"):
+        try:
+            z = z_func(self.x_sorted) ** 2
+        except (TypeError, ValueError):
+            z = np.array([z_func(v) ** 2 for v in self.x_sorted])
+        integrand = self.y_sorted * z
+        if method == "simpson":
+            return simpson(y=integrand, x=self.x_sorted)
+        if method == "log":
+            if np.any(self.x_sorted <= 0):
+                raise ValueError("x must be positive for log-space integration.")
+            return simpson(y=integrand * self.x_sorted, x=np.log(self.x_sorted))
+        if method == "spline":
+            return CubicSpline(self.x_sorted, integrand).integrate(self.x_sorted[0], self.x_sorted[-1])
+        raise ValueError("Method %s not supported. Choose in ['simpson', 'log', 'spline']." % method)
+
+    def integrate_continuous(self, z_func, *, epsrel=1e-5, epsabs=0.0, limit=500):
+        if not self._continuous_ready:
+            raise ValueError("continuous PSD preparation was not requested")
+        def integrand(x):
+            return float(np.real(np.exp(self._log_spline(np.log(x)) * 1.0) * z_func(x) ** 2))
+        total = 0.0
+        for left, right in zip(self._nodes[:-1], self._nodes[1:]):
+            value, _ = quad(integrand, float(left), float(right), epsrel=epsrel, epsabs=epsabs, limit=limit)
+            total += value
+        return float(max(total, 0.0))
+
+    def integrate_continuous_many(self, z_func, count, *, epsrel=1e-5, epsabs=0.0, limit=500):
+        if not self._continuous_ready:
+            raise ValueError("continuous PSD preparation was not requested")
+        count = int(count)
+        if count < 1:
+            return np.empty(0, dtype=float)
+        if quad_vec is None:
+            return np.asarray([self.integrate_continuous(lambda x, i=i: np.asarray(z_func(x))[i], epsrel=epsrel, epsabs=epsabs, limit=limit) for i in range(count)])
+        def integrand(x):
+            values = np.asarray(z_func(x))
+            if values.shape != (count,):
+                raise ValueError(f"z_func must return a one-dimensional array with shape ({count},) for scalar frequency input.")
+            return np.real(np.exp(self._log_spline(np.log(x))) * values ** 2)
+        total = np.zeros(count, dtype=float)
+        for left, right in zip(self._nodes[:-1], self._nodes[1:]):
+            value, _ = quad_vec(integrand, float(left), float(right), epsrel=epsrel, epsabs=epsabs, limit=limit, norm="max")
+            total += np.asarray(value, dtype=float)
+        return np.maximum(total, 0.0)
 
 
 def _fit_cache_token(values: np.ndarray) -> tuple[str, tuple[int, ...], bytes]:

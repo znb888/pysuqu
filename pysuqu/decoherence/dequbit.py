@@ -249,22 +249,34 @@ class Decoherence:
             integration_method: 'continuous' uses log-log PSD interpolation and adaptive quadrature.
                                 'discrete' preserves the legacy sparse-grid integration.
         """
-        p1_list = []
         if noise_freq is None:
             noise_freq = self.noise.output_stage.frequency
-        
-        for tau in delay_list:
+        if integration_method not in {"continuous", "discrete"}:
+            raise ValueError("integration_method must be 'continuous' or 'discrete'.")
+        delays = np.asarray(delay_list, dtype=float).reshape(-1)
+        vectorizable = delays.size > 0 and np.all(np.isfinite(delays)) and (
+            experiment != "CPMG" or np.all(delays > 0)
+        )
+        if integration_method == "continuous" and experiment in {"Ramsey", "SpinEcho", "CPMG"} and vectorizable:
+            prepared = PreparedFilteredPSD.for_continuous(noise_freq, psd)
+            if experiment == "Ramsey":
+                vector_filter = lambda f: ramsey_transfunc(f, delays)
+            elif experiment == "SpinEcho":
+                vector_filter = lambda f: echo_transfunc(f, delays)
+            else:
+                vector_filter = lambda f: cpmg_transfunc(f, delays, N, len_pi)
+            dfactors = prepared.integrate_continuous_many(vector_filter, delays.size)
+            return np.exp(-dfactors * (sensitivity_factor * 2) ** 2 / 2)
+
+        p1_list = []
+        for tau in delays:
             trans_func = self._generate_transfunc(experiment, tau, N, len_pi)
             if integration_method == "continuous":
                 dfactor = integrate_filtered_psd_continuous(noise_freq, psd, trans_func)
-            elif integration_method == "discrete":
-                dfactor = integrate_square_large_span(noise_freq, psd, trans_func, method='log')
             else:
-                raise ValueError("integration_method must be 'continuous' or 'discrete'.")
-            exponent = -dfactor * (sensitivity_factor * 2)**2 / 2
-            p1_list.append(np.exp(exponent))
-            
-        return np.array(p1_list)
+                dfactor = integrate_square_large_span(noise_freq, psd, trans_func, method='log')
+            p1_list.append(np.exp(-dfactor * (sensitivity_factor * 2) ** 2 / 2))
+        return np.asarray(p1_list)
 
 
 class ZNoiseDecoherence(Decoherence):
