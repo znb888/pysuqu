@@ -2,13 +2,20 @@
 
 import os
 from glob import glob
+import importlib.util
+import sys
 
 from setuptools import Extension, find_packages, setup
 
-from pysuqu._native_build_options import native_build_options
-
-
 ROOT = Path(__file__).resolve().parent
+_BUILD_OPTIONS_PATH = ROOT / "pysuqu" / "_native_build_options.py"
+_BUILD_OPTIONS_SPEC = importlib.util.spec_from_file_location(
+    "pysuqu_native_build_options", _BUILD_OPTIONS_PATH,
+)
+_BUILD_OPTIONS_MODULE = importlib.util.module_from_spec(_BUILD_OPTIONS_SPEC)
+sys.modules[_BUILD_OPTIONS_SPEC.name] = _BUILD_OPTIONS_MODULE
+_BUILD_OPTIONS_SPEC.loader.exec_module(_BUILD_OPTIONS_MODULE)
+native_build_options = _BUILD_OPTIONS_MODULE.native_build_options
 ABOUT = {}
 exec((ROOT / "pysuqu" / "version.py").read_text(encoding="utf-8"), ABOUT)
 README = (ROOT / "README.md").read_text(encoding="utf-8")
