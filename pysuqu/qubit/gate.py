@@ -10,6 +10,8 @@ adopt the International System of Units.
 energy is in gigahertz (GHz).
 '''
 # import
+import hashlib
+from collections import OrderedDict
 import numpy as np
 import qutip as qt
 from typing import Any, Union, List, Tuple, Dict, Optional, Literal, Sequence
@@ -22,6 +24,7 @@ from .base import AbstractQubit, Phi0, e, pi
 from .solver import HamiltonianEvo
 from .propagation import (
     DriveTerm,
+    DynamicCollapseRate,
     PreparedPropagation,
     PropagationOptions,
     UnsupportedBackendError,
@@ -29,7 +32,87 @@ from .propagation import (
 )
 from ..funclib.awgenerator import *
 from ..funclib import truncate_hilbert_space
-from ..funclib.transmission import TransmissionChain
+from ..funclib.transmission import SignalTrace, TransmissionChain
+
+
+def _prepared_cache_fingerprint(value, *, _seen=None):
+    """Return a strict content fingerprint for opt-in prepared reuse.
+
+    Opaque callbacks and transmission chains deliberately bypass this cache;
+    a cache miss is safer than reusing a context whose inputs may have changed.
+    """
+    if _seen is None:
+        _seen = set()
+    if isinstance(value, qt.Qobj):
+        array = np.ascontiguousarray(value.full(), dtype=np.complex128)
+        return ("qobj", tuple(value.shape), array.tobytes(order="C"))
+    if isinstance(value, DynamicCollapseRate):
+        return (
+            "dynamic-collapse-rate",
+            _prepared_cache_fingerprint(value.operator, _seen=_seen),
+            _prepared_cache_fingerprint(value.rate_trace, _seen=_seen),
+            str(value.label),
+        )
+    if isinstance(value, TransmissionChain):
+        raise TypeError("transmission chains bypass prepared cache")
+    if callable(value) and not isinstance(value, type):
+        raise TypeError("opaque callable cannot be fingerprinted exactly")
+    if isinstance(value, SignalTrace):
+        return (
+            "trace", str(value.domain), float(getattr(value, "lo_freq", 0.0)),
+            np.ascontiguousarray(value.t_axis, dtype=np.float64).tobytes(),
+            np.ascontiguousarray(value.values).tobytes(),
+        )
+    if isinstance(value, np.ndarray):
+        array = np.ascontiguousarray(value)
+        return ("array", str(array.dtype), tuple(array.shape), array.tobytes())
+    if isinstance(value, (str, int, float, bool, type(None), complex)):
+        return (type(value).__name__, value)
+    if isinstance(value, dict):
+        return ("dict", tuple(sorted(
+            (_prepared_cache_fingerprint(key, _seen=_seen),
+             _prepared_cache_fingerprint(item, _seen=_seen))
+            for key, item in value.items()
+        )))
+    if isinstance(value, (list, tuple)):
+        return (type(value).__name__, tuple(
+            _prepared_cache_fingerprint(item, _seen=_seen) for item in value
+        ))
+    marker = id(value)
+    if marker in _seen:
+        raise TypeError("cyclic object cannot be fingerprinted exactly")
+    _seen.add(marker)
+    try:
+        if hasattr(value, "__dict__"):
+            fields = {
+                key: item for key, item in vars(value).items()
+                if not key.startswith("_")
+            }
+            return (type(value).__qualname__, _prepared_cache_fingerprint(fields, _seen=_seen))
+    finally:
+        _seen.discard(marker)
+    raise TypeError(f"opaque value {type(value).__qualname__} cannot be fingerprinted exactly")
+
+
+def _prepared_cache_key(gate, channel, trace, *, backend, mode, plane,
+                        couple_term, couple_type, c_ops, options, args,
+                        induc_phi_model):
+    """Build a content key for a reusable prepared gate context."""
+    static = gate.qubit.get_hamiltonian()
+    drive = gate.get_drive_hamiltonian(
+        couple_term=couple_term,
+        couple_type=couple_type,
+        induc_phi_model=induc_phi_model,
+    )
+    payload = (
+        "pysuqu-gate-prepared-v1", str(backend).lower(), mode, plane,
+        float(couple_term), couple_type, induc_phi_model,
+        _prepared_cache_fingerprint(channel), _prepared_cache_fingerprint(trace),
+        _prepared_cache_fingerprint(static), _prepared_cache_fingerprint(drive),
+        _prepared_cache_fingerprint(list(c_ops or ())),
+        _prepared_cache_fingerprint(options or {}), _prepared_cache_fingerprint(args or {}),
+    )
+    return hashlib.blake2b(repr(payload).encode("utf-8"), digest_size=24).digest()
 
 
 def _load_plotly_helpers():
@@ -89,7 +172,22 @@ class GateBase:
             sample_rate=sample_rate,
             anharmonicity=self.qubit.qubit_anharm
         )
+        # Prepared reuse is explicit at run_simulation call sites so historical
+        # mutation and ownership semantics remain unchanged by default.
+        self._prepared_run_cache = OrderedDict()
+        self._prepared_run_cache_size = 4
         print('AWG initialized. ')
+
+    def clear_prepared_cache(self) -> None:
+        """Drop opt-in prepared contexts retained by this gate instance."""
+        self._prepared_run_cache.clear()
+
+    def prepared_cache_info(self) -> Dict[str, int]:
+        """Return occupancy information for the explicit prepared cache."""
+        return {
+            "entries": len(self._prepared_run_cache),
+            "max_entries": int(self._prepared_run_cache_size),
+        }
 
     @staticmethod
     def _default_solver_options(
@@ -804,6 +902,7 @@ class SingleQubitGate(GateBase):
             channel = self.pulse_channel
 
         backend = kwargs.pop('backend', 'qutip')
+        reuse_prepared = bool(kwargs.pop('reuse_prepared', False))
         mode = kwargs.pop('mode', 'rf')
         plane = kwargs.pop('plane', 'qubit')
         options = kwargs.pop('options', None)
@@ -815,19 +914,73 @@ class SingleQubitGate(GateBase):
         induc_phi_model = kwargs.get('induc_phi_model', 'exact')
 
         if backend not in {'qutip', 'reference', 'qutip_reference'}:
-            prepared = self.prepare_propagator(
-                channel,
-                transmission_chain=transmission_chain,
-                mode=mode,
-                plane=plane,
-                couple_term=c_term,
-                couple_type=c_type,
-                c_ops=c_ops,
-                options=options,
-                args=args,
-                induc_phi_model=induc_phi_model,
-                backend=backend,
-            )
+            if not reuse_prepared:
+                prepared = self.prepare_propagator(
+                    channel,
+                    transmission_chain=transmission_chain,
+                    mode=mode,
+                    plane=plane,
+                    couple_term=c_term,
+                    couple_type=c_type,
+                    c_ops=c_ops,
+                    options=options,
+                    args=args,
+                    induc_phi_model=induc_phi_model,
+                    backend=backend,
+                )
+            else:
+                active_chain = self._resolve_transmission_chain(
+                    channel, transmission_chain=transmission_chain
+                )
+                trace = self.awg.get_solver_trace(
+                    channel, mode=mode, chain=active_chain, plane=plane
+                )
+                use_native_c_ops = str(backend).lower() not in {
+                    'qutip', 'reference', 'qutip_reference',
+                    'qutip_compiled', 'compiled', 'fast_qutip',
+                }
+                if c_ops is None:
+                    get_c_ops = (
+                        getattr(self, '_get_native_c_ops', None)
+                        if use_native_c_ops else getattr(self, '_get_c_ops', None)
+                    )
+                    resolved_c_ops = get_c_ops() if callable(get_c_ops) else []
+                else:
+                    resolved_c_ops = list(c_ops)
+                if active_chain is not None:
+                    prepared = self.prepare_trace_propagator(
+                        trace, couple_term=c_term, couple_type=c_type,
+                        mode=mode, c_ops=resolved_c_ops, options=options,
+                        args=args, induc_phi_model=induc_phi_model,
+                        backend=backend,
+                    )
+                    return prepared.propagate(psi0)
+                try:
+                    key = _prepared_cache_key(
+                        self, channel, trace, backend=backend, mode=mode,
+                        plane=plane, couple_term=c_term, couple_type=c_type,
+                        c_ops=resolved_c_ops, options=options, args=args,
+                        induc_phi_model=induc_phi_model,
+                    )
+                except TypeError:
+                    prepared = self.prepare_trace_propagator(
+                        trace, couple_term=c_term, couple_type=c_type,
+                        mode=mode, c_ops=resolved_c_ops, options=options,
+                        args=args, induc_phi_model=induc_phi_model,
+                        backend=backend,
+                    )
+                    return prepared.propagate(psi0)
+                prepared = self._prepared_run_cache.pop(key, None)
+                if prepared is None:
+                    prepared = self.prepare_trace_propagator(
+                        trace, couple_term=c_term, couple_type=c_type,
+                        mode=mode, c_ops=resolved_c_ops, options=options,
+                        args=args, induc_phi_model=induc_phi_model,
+                        backend=backend,
+                    )
+                self._prepared_run_cache[key] = prepared
+                while len(self._prepared_run_cache) > self._prepared_run_cache_size:
+                    self._prepared_run_cache.popitem(last=False)
             return prepared.propagate(psi0)
 
         active_chain = self._resolve_transmission_chain(
