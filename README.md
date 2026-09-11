@@ -56,17 +56,19 @@ pip install -e .
   S-parameters, digital precorrection, and multi-line MIMO propagation
 - `demo/` for end-to-end notebook examples
 
-### What's New In 2.1.0
+### What's New In 2.1.2
 
-Version `2.1.0` adds prepared propagation and optional C++ simulation acceleration:
+Version `2.1.2` extends the prepared propagation and optional C++ simulation acceleration:
 
 - reusable QuTiP and native contexts, state batches, and gate-fidelity integration
 - dense and structured sparse kernels, exact interaction frames, and Krylov actions
 - static-collapse Lindblad evolution without an explicit Kronecker Liouvillian
 - explicit backend selection, capability-aware fallback, and opt-in RWA models
 - a runnable synthetic tutorial, comparative benchmarks, and tested native wheels
+- opt-in gate, waveform, Touchstone, and filtered-PSD preparation caches
+- dynamic Lindblad rate descriptors, predistortion design helpers, and portable build tuning
 
-See the [2.1.0 release notes](https://github.com/znb888/pysuqu/blob/main/docs/releases/2.1.0.md)
+See the [2.1.2 release notes](https://github.com/znb888/pysuqu/blob/main/docs/releases/2.1.2.md)
 for the complete public summary.
 
 ### Quick Start
@@ -142,17 +144,19 @@ pip install -e .
 - 传输链仿真：AWG/量子比特参考面、Touchstone S 参数、数字预校正与多线 MIMO 传播
 - `demo/`：端到端 notebook 示例
 
-### 2.1.0 新增内容
+### 2.1.2 新增内容
 
-`2.1.0` 增加了可复用传播上下文和可选 C++ 仿真加速：
+`2.1.2` 扩展了可复用传播上下文和可选 C++ 仿真加速：
 
 - 可复用的 QuTiP 与原生传播、批量初态演化和门保真度接口
 - 稠密与结构化稀疏内核、精确相互作用绘景和 Krylov 指数作用
 - 无需显式构造 Kronecker Liouvillian 的静态耗散 Lindblad 演化
 - 明确的后端选择、按能力回退，以及需要显式启用的 RWA 近似
 - 可运行的合成参数教程、对照基准和经过测试的原生 wheel
+- 门、波形、Touchstone 和滤波 PSD 的可选准备缓存
+- 动态 Lindblad 速率描述符、预校正设计工具和可移植构建调优
 
-完整说明见 [2.1.0 发布说明](https://github.com/znb888/pysuqu/blob/main/docs/releases/2.1.0.md)。
+完整说明见 [2.1.2 发布说明](https://github.com/znb888/pysuqu/blob/main/docs/releases/2.1.2.md)。
 
 ### 快速开始
 

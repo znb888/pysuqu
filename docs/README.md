@@ -13,12 +13,14 @@ the place to decide which public guide or reference to open next.
   propagation, Touchstone models, MIMO chains, and derivative precorrection
 - [guides/propagation-backends.md](guides/propagation-backends.md) for prepared
   propagation, native acceleration, backend selection, and reproducible benchmarks
+- [guides/acceleration-caches.md](guides/acceleration-caches.md) for gate, waveform,
+  Touchstone, native-plan, PSD, and build-tuning caches
 - [architecture/module-map.md](architecture/module-map.md) for package layout
   and recommended import surfaces
 - [architecture/refactor-status.md](architecture/refactor-status.md) for the
   current public module status
 - [guides/code-style.md](guides/code-style.md) for development conventions
-- [releases/2.1.0.md](releases/2.1.0.md) for prepared propagation and native acceleration
+- [releases/2.1.2.md](releases/2.1.2.md) for prepared propagation, caches, and native acceleration
 - [releases/2.0.4.md](releases/2.0.4.md) for the transmission-chain release
   summary and validation record
 - [../demo/README.md](../demo/README.md) for the public tutorial notebooks

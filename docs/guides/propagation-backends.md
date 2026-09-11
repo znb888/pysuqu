@@ -132,3 +132,10 @@ and timing includes Python result construction. No approximate backend is includ
 The [native propagation tutorial](../../demo/demo_06_native_propagation.ipynb)
 compares RF dynamics, repeated state batches, and dissipative evolution. It also
 runs on the platform-independent wheel using QuTiP.
+
+See [acceleration caches](acceleration-caches.md) for gate, waveform, Touchstone,
+native-plan, PSD, and compiler-tuning controls.
+
+Predistortion design helpers are available from `pysuqu.funclib.predistortion`.
+They operate on synthetic or user-supplied traces and can be composed with the
+transmission stages documented in the transmission-chain guide.
