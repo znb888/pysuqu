@@ -38,7 +38,8 @@ def main(argv=None):
         parser.error('Installed version does not match the requested release.')
     if native_backend_available() != args.native:
         parser.error('Installed native availability does not match the wheel under test.')
-    if args.native and not all(callable(getattr(_native, name)) for name in _native.__all__):
+    required_native = [name for name in _native.__all__ if name != 'propagate_prepared']
+    if args.native and not all(callable(getattr(_native, name)) for name in required_native):
         parser.error('The native wheel is missing a required propagation kernel.')
 
     suite = unittest.TestSuite()

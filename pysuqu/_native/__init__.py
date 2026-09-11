@@ -35,7 +35,15 @@ try:
 except (ImportError, ModuleNotFoundError, OSError):
     propagate_lindblad_csr = None
 
+try:
+    from ._dynamics import propagate_prepared
+except (ImportError, ModuleNotFoundError, OSError):
+    # Older native wheels remain usable; the Python adapter can fall back to
+    # its existing prepared execution path when this entry point is absent.
+    propagate_prepared = None
+
 __all__ = [
+    "propagate_prepared",
     "propagate",
     "propagate_csr",
     "propagate_banded",
