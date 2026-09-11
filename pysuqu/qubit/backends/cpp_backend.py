@@ -20,6 +20,7 @@ import qutip as qt
 from ..propagation import (
     BackendUnavailable,
     BatchPropagationResult,
+    DynamicCollapseRate,
     DriveTerm,
     PreparedPropagation,
     PropagationOptions,
@@ -477,6 +478,8 @@ def _static_collapse_operator(value: Any, dimension: int) -> qt.Qobj:
     coefficients are rejected because evaluating them inside the native
     GIL-free loop would change the callback semantics.
     """
+    if isinstance(value, DynamicCollapseRate):
+        value = value.operator
     coefficient = 1.0
     operator = value
     if isinstance(value, (list, tuple)):
@@ -750,6 +753,39 @@ def _native_lindblad_csr_components(prepared):
         )
     collapse_bundle = _csr_bundle_from_components(collapse_components, n=n)
     return h0, controls, collapse_bundle
+
+
+def _native_lindblad_rate_components(prepared):
+    """Pack descriptor-backed scalar rates on the prepared solver grid.
+
+    ``None`` denotes an all-static collapse list.  Descriptor traces must be
+    real, finite, non-negative and sampled exactly on ``prepared.tlist``;
+    rejecting mismatches avoids silently changing callback semantics.
+    """
+    if not any(isinstance(item, DynamicCollapseRate) for item in prepared.c_ops):
+        return None
+    tlist = np.asarray(prepared.tlist, dtype=np.float64)
+    rates = np.empty((len(prepared.c_ops), len(tlist)), dtype=np.float64)
+    for index, item in enumerate(prepared.c_ops):
+        if not isinstance(item, DynamicCollapseRate):
+            rates[index] = 1.0
+            continue
+        trace_t = np.asarray(getattr(item.rate_trace, "t_axis", None), dtype=np.float64)
+        trace_values = np.asarray(getattr(item.rate_trace, "values", None))
+        if trace_t.shape != tlist.shape or not np.array_equal(trace_t, tlist):
+            raise UnsupportedBackendError(
+                "native dynamic collapse rate traces must use the prepared solver grid"
+            )
+        if np.iscomplexobj(trace_values):
+            if np.any(np.abs(np.imag(trace_values)) > 0.0):
+                raise UnsupportedBackendError("native collapse rates must be real-valued")
+            trace_values = np.real(trace_values)
+        values = np.asarray(trace_values, dtype=np.float64)
+        if values.shape != tlist.shape or not np.all(np.isfinite(values)) or np.any(values < 0.0):
+            raise ValueError("native collapse rate traces must be finite and non-negative")
+        rates[index] = values
+    rates.setflags(write=False)
+    return rates
 
 
 def _decode_complex_payload(payload, shape):
@@ -2422,6 +2458,8 @@ class CppPropagationBackend:
                 legacy.pop("coefficient_order", None)
             if legacy.get("parallel") == 1:
                 legacy.pop("parallel", None)
+            if legacy.get("collapse_rates") is None:
+                legacy.pop("collapse_rates", None)
             modes = legacy.get("control_modes")
             if modes is None or (
                 isinstance(modes, np.ndarray)
@@ -2434,6 +2472,8 @@ class CppPropagationBackend:
             if kwargs.get("iq_polynomial") is not None:
                 raise
             if kwargs.get("coefficient_order", 1) != 1:
+                raise
+            if kwargs.get("collapse_rates") is not None:
                 raise
             modes = kwargs.get("control_modes")
             if isinstance(modes, np.ndarray) and modes.size > 0 and not np.all(modes == modes.flat[0]):
@@ -2766,6 +2806,7 @@ class LindbladCppPropagationBackend:
         self._direct_h0 = None
         self._direct_controls = None
         self._direct_collapses = None
+        self._direct_collapse_rates = None
         if self._direct:
             # A coherent proxy is used only for the shared trace/grid plan;
             # the native call below applies the physical Lindblad equation
@@ -2784,6 +2825,7 @@ class LindbladCppPropagationBackend:
             self._direct_h0, self._direct_controls, self._direct_collapses = (
                 _native_lindblad_csr_components(prepared)
             )
+            self._direct_collapse_rates = _native_lindblad_rate_components(prepared)
         else:
             effective_static, effective_drives = _lindblad_effective_operators(
                 prepared.static_hamiltonian,
@@ -2870,6 +2912,7 @@ class LindbladCppPropagationBackend:
                 "auto": 1,
                 "on": 2,
             }.get(str(getattr(self.prepared.options, "parallel", "auto")).lower(), 1),
+            "collapse_rates": self._direct_collapse_rates,
         }
         return self._backend._invoke_native(
             _native_propagate_lindblad_csr,

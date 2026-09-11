@@ -44,6 +44,25 @@ class UnsupportedBackendError(ValueError):
 
 
 @dataclass(frozen=True)
+class DynamicCollapseRate:
+    """Describe a collapse operator with an exact scalar rate trace.
+
+    The descriptor keeps the original QuTiP coefficient for the reference
+    solver while allowing native adapters to consume a sampled non-negative
+    rate ``r(t)`` for the equivalent dissipator ``r(t) D[C]``.
+    """
+
+    operator: qt.Qobj
+    rate_trace: Any
+    qutip_coefficient: Any
+    label: str = "dynamic collapse rate"
+
+    def qutip_spec(self):
+        """Return the standard QuTiP ``[operator, coefficient]`` payload."""
+        return [self.operator, self.qutip_coefficient]
+
+
+@dataclass(frozen=True)
 class PropagationOptions:
     """Numerical options shared by the prepared propagation backends.
 
@@ -573,14 +592,18 @@ class PreparedPropagation:
         hamiltonian = self._qutip_hamiltonian(active_backend == "qutip_compiled")
         options = self.options.qutip_options()
         resolved_e_ops = [] if e_ops is None else e_ops
+        resolved_c_ops = [
+            value.qutip_spec() if isinstance(value, DynamicCollapseRate) else value
+            for value in self.c_ops
+        ]
         if self.options.use_solver_class and hasattr(qt, "MESolver"):
             # Solver classes compile QobjEvo once and can be reused.  Keep this
             # opt-in because QuTiP 4.x does not expose the class API.
-            if self.c_ops:
+            if resolved_c_ops:
                 if self._qutip_solver is None or self._qutip_solver_backend != active_backend:
                     self._qutip_solver = qt.MESolver(
                         hamiltonian,
-                        self.c_ops,
+                        resolved_c_ops,
                         options=options,
                     )
                     self._qutip_solver_backend = active_backend
@@ -601,7 +624,7 @@ class PreparedPropagation:
         # an unnecessary master-equation wrapper on every prepared run.
         if (
             active_backend == "qutip_compiled"
-            and not self.c_ops
+            and not resolved_c_ops
             and getattr(self.static_hamiltonian, "issuper", False) is False
             and all(not getattr(term.operator, "issuper", False) for term in self.drive_terms)
             and getattr(initial_state, "isket", False)
@@ -621,7 +644,7 @@ class PreparedPropagation:
             hamiltonian,
             initial_state,
             self.tlist,
-            c_ops=self.c_ops,
+            c_ops=resolved_c_ops,
             e_ops=resolved_e_ops,
             options=options,
             args=self.args,
@@ -759,6 +782,7 @@ class PreparedPropagation:
 __all__ = [
     "BackendUnavailable",
     "BatchPropagationResult",
+    "DynamicCollapseRate",
     "DriveTerm",
     "PreparedPropagation",
     "PropagationOptions",

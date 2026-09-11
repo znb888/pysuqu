@@ -51,6 +51,7 @@ from .multi import FGF1V1Coupling, FGF2V7Coupling, QCRFGRModel
 from .propagation import (
     BackendUnavailable,
     BatchPropagationResult,
+    DynamicCollapseRate,
     DriveTerm,
     PreparedPropagation,
     PropagationOptions,
@@ -76,6 +77,7 @@ __all__ = [
     'DerivativePrecorrectionDesign',
     'DerivativePrecorrectionStage',
     'DriveTerm',
+    'DynamicCollapseRate',
     'EnvelopeParams',
     'FGF1V1Coupling',
     'FGF2V7Coupling',
