@@ -101,6 +101,7 @@ from pysuqu.qubit import (
 - `solver.py`: Hamiltonian assembly and solver helpers
 - `propagation.py`: prepared propagation, backend options, and batch result types
 - `backends/cpp_backend.py`: native preparation, representations, and capability checks
+- `backends/cpp/`: stable import points for native loading, execution, plans, and results
 - `single.py`: single-qubit models
 - `multi.py`: multi-qubit and coupler models
 - `gate.py`: gate-level scheduling and simulation helpers
@@ -120,6 +121,7 @@ from pysuqu.qubit import (
 
 - mathematical helpers
 - waveform-generation helpers
+- `predistortion.py`: derivative, FIR/IIR, ZOH, and discrete inverse design helpers
 - AWG-to-qubit transmission stages, Touchstone models, and MIMO bundles
 - derivative and FIR precorrection design helpers
 - noise-model conversion helpers
