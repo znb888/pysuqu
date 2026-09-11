@@ -24,6 +24,16 @@ from .types import CouplingResult, SweepResult
 _SINGLE_QUBIT_SWEEP_RELATIVE_ENERGY_CACHE_MAXSIZE = 256
 
 
+def _normalize_single_qubit_sweep_offsets(qubit, flux_offsets) -> list[object]:
+    """Accept scalar offsets for the common one-node qubit case."""
+    offsets = list(flux_offsets)
+    current_flux = np.asarray(getattr(qubit, '_flux', np.asarray(0.0)))
+    if current_flux.shape != (1, 1):
+        return offsets
+    return [np.array([[np.asarray(offset).item()]]) if np.asarray(offset).ndim == 0 else offset
+            for offset in offsets]
+
+
 def _validate_single_qubit_sweep_upper_level(qubit, upper_level):
     if isinstance(qubit._Nlevel, (list, tuple, np.ndarray)):
         nlevel_val = qubit._Nlevel[0]
@@ -302,6 +312,7 @@ def sweep_single_qubit_energy_vs_flux_base_result(
 ) -> SweepResult:
     """Return the preferred structured result for a single-qubit energy-vs-flux sweep."""
     _validate_single_qubit_sweep_upper_level(qubit, upper_level)
+    flux_offsets = _normalize_single_qubit_sweep_offsets(qubit, flux_offsets)
 
     flux_origin = copy(qubit._flux)
     if _supports_fast_single_qubit_sweep(qubit):
@@ -317,6 +328,13 @@ def sweep_single_qubit_energy_vs_flux_base_result(
         flux_origin,
         flux_offsets,
         upper_level,
+    )
+
+
+def sweep_single_qubit_energy_vs_flux(qubit, flux_offsets, upper_level: float = 2) -> SweepResult:
+    """Return the preferred structured single-qubit energy sweep result."""
+    return sweep_single_qubit_energy_vs_flux_base_result(
+        qubit, flux_offsets, upper_level=upper_level,
     )
 
 

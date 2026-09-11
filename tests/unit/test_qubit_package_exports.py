@@ -156,6 +156,7 @@ class QubitPackageExportTests(unittest.TestCase):
                 'SingleQubitBase',
                 'SingleQubitSpectrum',
                 'SpectrumResult',
+                'sweep_single_qubit_energy_vs_flux',
                 'TouchstoneNetwork',
                 'TouchstoneStage',
                 'TransferFunctionStage',

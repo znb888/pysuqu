@@ -61,6 +61,7 @@ from .propagation import (
 )
 from .solver import HamiltonianEvo
 from .single import FloatingTransmon, GroundedTransmon, SingleQubitBase
+from .sweeps import sweep_single_qubit_energy_vs_flux
 from .types import FluxSpec, SpectrumResult
 
 __all__ = [
@@ -101,6 +102,7 @@ __all__ = [
     'SingleQubitBase',
     'SingleQubitSpectrum',
     'SpectrumResult',
+    'sweep_single_qubit_energy_vs_flux',
     'TouchstoneNetwork',
     'TouchstoneStage',
     'TransferFunctionStage',

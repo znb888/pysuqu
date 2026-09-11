@@ -17,6 +17,7 @@ from pysuqu.qubit.sweeps import (
     _get_single_qubit_sweep_relative_energy_cache_key_prefix,
     sweep_single_qubit_energy_vs_flux_base,
     sweep_single_qubit_energy_vs_flux_base_result,
+    sweep_single_qubit_energy_vs_flux,
 )
 from pysuqu.qubit.single import GroundedTransmon
 from pysuqu.qubit.types import SweepResult
@@ -63,6 +64,22 @@ def _run_reference_single_qubit_sweep(qubit, flux_offsets, upper_level):
 
 
 class SingleQubitSweepWrapperTests(unittest.TestCase):
+    def test_public_sweep_entry_accepts_scalar_offsets_for_one_node(self):
+        qubit = mock.Mock()
+        qubit._Nlevel = [6]
+        qubit._flux = np.array([[0.2]])
+        original_flux = qubit._flux.copy()
+
+        def apply_params(**params):
+            qubit._flux = np.array(params['flux'])
+
+        qubit.change_para.side_effect = apply_params
+        qubit.get_energylevel.side_effect = [2 * pi, 3 * pi, 4 * pi, 5 * pi]
+        result = sweep_single_qubit_energy_vs_flux(qubit, [0.1, -0.05], upper_level=2)
+        self.assertIsInstance(result, SweepResult)
+        np.testing.assert_allclose(result.sweep_values[0], np.array([[0.1]]))
+        np.testing.assert_allclose(qubit._flux, original_flux)
+
     def test_single_qubit_sweep_helper_walks_offsets_and_restores_original_flux(self):
         qubit = mock.Mock()
         qubit._Nlevel = [6]
