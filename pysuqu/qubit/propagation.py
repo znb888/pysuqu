@@ -564,7 +564,10 @@ class PreparedPropagation:
         # changing a cached native plan behind the context's back.
         self.static_hamiltonian = _snapshot_qobj(static_hamiltonian)
         self.drive_terms = tuple(_snapshot_drive_term(term) for term in drive_terms)
-        self.tlist = np.ascontiguousarray(np.asarray(tlist, dtype=np.float64))
+        # ``ascontiguousarray`` may alias an already contiguous caller array;
+        # take an explicit copy so a later time-grid edit cannot alter this
+        # prepared context or its native plan key.
+        self.tlist = np.array(tlist, dtype=np.float64, copy=True, order="C")
         if self.tlist.ndim != 1 or len(self.tlist) == 0:
             raise ValueError("tlist must be a non-empty one-dimensional array.")
         if not np.all(np.isfinite(self.tlist)):

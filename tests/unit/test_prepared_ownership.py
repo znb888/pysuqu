@@ -11,12 +11,13 @@ class PreparedOwnershipTests(unittest.TestCase):
     def test_operator_and_sampled_trace_are_snapshotted(self):
         h0 = qt.sigmax()
         values = np.array([0.1 + 0.02j, 0.3 + 0.04j], dtype=np.complex128)
+        times = np.array([0.0, 1.0])
         trace = SignalTrace(
-            t_axis=np.array([0.0, 1.0]), values=values, sample_rate=1.0,
+            t_axis=times, values=values, sample_rate=1.0,
             domain="iq_complex", plane="qubit_iq", lo_freq=0.25,
         )
         prepared = PreparedPropagation(
-            h0, [DriveTerm(qt.sigmaz(), trace)], [0.0, 1.0], backend="qutip",
+            h0, [DriveTerm(qt.sigmaz(), trace)], times, backend="qutip",
         )
 
         self.assertIsNot(prepared.static_hamiltonian, h0)
@@ -24,11 +25,13 @@ class PreparedOwnershipTests(unittest.TestCase):
         self.assertIsNot(prepared.drive_terms[0].trace, trace)
         values[:] = 9.0 + 4.0j
         trace.t_axis[:] = [0.0, 2.0]
+        times[:] = [0.0, 3.0]
         np.testing.assert_allclose(
             prepared.drive_terms[0].trace.values,
             [0.1 + 0.02j, 0.3 + 0.04j],
         )
         np.testing.assert_allclose(prepared.drive_terms[0].trace.t_axis, [0.0, 1.0])
+        np.testing.assert_allclose(prepared.tlist, [0.0, 1.0])
 
     def test_dynamic_collapse_operator_is_owned(self):
         collapse = qt.sigmam()
