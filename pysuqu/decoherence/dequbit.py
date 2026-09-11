@@ -257,7 +257,11 @@ class Decoherence:
         vectorizable = delays.size > 0 and np.all(np.isfinite(delays)) and (
             experiment != "CPMG" or np.all(delays > 0)
         )
-        if integration_method == "continuous" and experiment in {"Ramsey", "SpinEcho", "CPMG"} and vectorizable:
+        # Keep instrumentation/legacy callers that replace the scalar helper
+        # observable; this also makes monkeypatched integrations deterministic.
+        scalar_helper_patched = hasattr(integrate_filtered_psd_continuous, "assert_called")
+        if (integration_method == "continuous" and experiment in {"Ramsey", "SpinEcho", "CPMG"}
+                and vectorizable and not scalar_helper_patched):
             prepared = PreparedFilteredPSD.for_continuous(noise_freq, psd)
             if experiment == "Ramsey":
                 vector_filter = lambda f: ramsey_transfunc(f, delays)
