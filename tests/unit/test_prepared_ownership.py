@@ -34,7 +34,7 @@ class PreparedOwnershipTests(unittest.TestCase):
         np.testing.assert_allclose(prepared.tlist, [0.0, 1.0])
 
     def test_dynamic_collapse_operator_is_owned(self):
-        collapse = qt.sigmam()
+        collapse = qt.sigmax()
         trace = SignalTrace(
             t_axis=np.array([0.0, 1.0]), values=np.array([0.2, 0.4]),
             sample_rate=1.0, domain="rf_real", plane="qubit_rf",

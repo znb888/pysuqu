@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+import qutip as qt
 
 from pysuqu.funclib.awgenerator import (
     ChannelSchedule, EnvelopeParams, MixerParams, PulseEvent,
@@ -9,6 +10,8 @@ from pysuqu.funclib.awgenerator import (
 from pysuqu.qubit.gate import SingleQubitGate
 
 
+@unittest.skipUnless(getattr(qt, '__version__', None) and hasattr(qt.Qobj, 'expm'),
+                     'real QuTiP is required')
 class GatePreparedCacheTests(unittest.TestCase):
     def _case(self):
         gate = SingleQubitGate(total_time=12.0, sample_rate=2.0,

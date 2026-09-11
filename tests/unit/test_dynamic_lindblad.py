@@ -12,6 +12,8 @@ from pysuqu.qubit.propagation import (
 )
 
 
+@unittest.skipUnless(getattr(qt, '__version__', None) and hasattr(qt.Qobj, 'expm'),
+                     'real QuTiP is required')
 class DynamicLindbladTests(unittest.TestCase):
     def setUp(self):
         self.times = np.linspace(0.0, 1.0, 21)
