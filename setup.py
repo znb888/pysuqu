@@ -76,6 +76,9 @@ setup(
         "scipy>=1.7.0",
         "tqdm>=4.0.0",
     ],
+    extras_require={
+        "hdf5": ["h5py>=3.0.0"],
+    },
     project_urls={
         "Source": "https://github.com/znb888/pysuqu",
         "Documentation": "https://github.com/znb888/pysuqu/tree/main/docs",
