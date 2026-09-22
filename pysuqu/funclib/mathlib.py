@@ -400,7 +400,14 @@ def cpmg_transfunc(freq: np.ndarray, tau: float, N: int, len_pi: float = 30e-9) 
     delta_place = [(2*n-1)/N for n in range(1,N+1)]
     return np.abs(1+(-1)**N*np.exp(1j*2*pi*freq*tau)+2*np.sum([(-1)**n*np.exp(1j*2*pi*delta_place[n-1]*freq*tau)*np.cos(2*pi*freq*len_pi/2) for n in range(1,N+1)], axis=0))/4/pi/freq/tau
 
-def integrate_square_large_span(x_arr: np.ndarray, y_arr: np.ndarray, z_func: Callable, method: str = 'simpson') -> float:
+def integrate_square_large_span(
+    x_arr: np.ndarray,
+    y_arr: np.ndarray,
+    z_func: Callable,
+    method: str = 'simpson',
+    *,
+    _prepared: Optional[PreparedFilteredPSD] = None,
+) -> float:
     """
     Performs numerical integration on discrete data spanning large orders of magnitude.
     Formula: Integral = sum( y * z(x) * dx )
@@ -418,35 +425,8 @@ def integrate_square_large_span(x_arr: np.ndarray, y_arr: np.ndarray, z_func: Ca
     Returns:
         float: The calculated integral value.
     """
-    x_arr = np.asarray(x_arr)
-    y_arr = np.asarray(y_arr)
-    
-    sort_idx = np.argsort(x_arr)
-    x_sorted = x_arr[sort_idx]
-    y_sorted = y_arr[sort_idx]
-    
-    try:
-        z_values = z_func(x_sorted) ** 2
-    except TypeError:
-        z_values = np.array([z_func(val) ** 2 for val in x_sorted])
-        
-    integrand = y_sorted * z_values
-    
-    if method == 'simpson':
-        return simpson(y=integrand, x=x_sorted)
-    elif method == 'log':
-        if np.any(x_sorted <= 0):
-            raise ValueError("x must be positive for log-space integration.")
-
-        integrand_log = integrand * x_sorted
-        x_log = np.log(x_sorted)
-
-        return simpson(y=integrand_log, x=x_log)
-    elif method == 'spline':
-        spline = CubicSpline(x_sorted, integrand)
-        return spline.integrate(x_sorted[0], x_sorted[-1])
-    else:
-        raise ValueError(f"Method {method} not supported. Choose in ['simpson', 'log', 'spline'].")
+    prepared = _prepared if _prepared is not None else PreparedFilteredPSD.for_discrete(x_arr, y_arr)
+    return prepared.integrate_discrete(z_func, method=method)
 
 def integrate_filtered_psd_continuous(
     x_arr: np.ndarray,
@@ -466,81 +446,20 @@ def integrate_filtered_psd_continuous(
     evaluating the filter only on sparse measured PSD points can undersample the
     filter and produce non-physical non-monotonic dephasing curves.
     """
-    x_arr = np.asarray(x_arr, dtype=float)
-    y_arr = np.asarray(y_arr, dtype=float)
-
-    if x_arr.shape != y_arr.shape:
-        raise ValueError("x_arr and y_arr must have the same shape.")
-
-    valid_mask = np.isfinite(x_arr) & np.isfinite(y_arr) & (x_arr > 0.0) & (y_arr > 0.0)
-    x_valid = x_arr[valid_mask]
-    y_valid = y_arr[valid_mask]
-
-    if len(x_valid) < 3:
-        raise ValueError("integrate_filtered_psd_continuous requires at least 3 positive finite points.")
-
-    sort_idx = np.argsort(x_valid)
-    x_sorted = x_valid[sort_idx]
-    y_sorted = y_valid[sort_idx]
-    x_unique, unique_idx = np.unique(x_sorted, return_index=True)
-    y_unique = y_sorted[unique_idx]
-
-    if len(x_unique) < 3:
-        raise ValueError("integrate_filtered_psd_continuous requires at least 3 unique positive x points.")
-
-    log_x = np.log(x_unique)
-    log_y = np.log(y_unique)
-    order = min(int(spline_order), len(x_unique) - 1)
-    if order < 1:
-        raise ValueError("spline_order must be at least 1 after filtering.")
-
-    log_spline = UnivariateSpline(log_x, log_y, s=0, k=order)
-    x_min = float(x_unique[0])
-    x_max = float(x_unique[-1])
-    if x_min == x_max:
+    prepared = PreparedFilteredPSD.for_continuous(
+        x_arr,
+        y_arr,
+        grid_per_decade=grid_per_decade,
+        spline_order=spline_order,
+    )
+    if prepared.x_unique[0] == prepared.x_unique[-1]:
         return 0.0
-
-    if grid_per_decade <= 0:
-        raise ValueError("grid_per_decade must be positive.")
-
-    step = 1.0 / float(grid_per_decade)
-    log10_min = np.log10(x_min)
-    log10_max = np.log10(x_max)
-    decade_nodes = 10.0 ** np.arange(
-        np.floor(log10_min),
-        np.ceil(log10_max) + step,
-        step,
+    return prepared.integrate_continuous(
+        z_func,
+        epsrel=epsrel,
+        epsabs=epsabs,
+        limit=limit,
     )
-    nodes = np.unique(
-        np.concatenate(
-            (
-                np.array([x_min, x_max]),
-                decade_nodes[(decade_nodes > x_min) & (decade_nodes < x_max)],
-            )
-        )
-    )
-    nodes.sort()
-
-    def integrand(x):
-        psd_value = np.exp(log_spline(np.log(x)))
-        filter_value = z_func(x)
-        return float(np.real(psd_value * filter_value**2))
-
-    integral = 0.0
-    for left, right in zip(nodes[:-1], nodes[1:]):
-        if right <= left:
-            continue
-        segment_integral, _ = quad(
-            integrand,
-            float(left),
-            float(right),
-            epsrel=epsrel,
-            epsabs=epsabs,
-            limit=limit,
-        )
-        integral += segment_integral
-
-    return float(max(integral, 0.0))
 
 def exp_decay(t: np.ndarray, tau: float, A: float = 1, B: float = 0) -> np.ndarray:
     """

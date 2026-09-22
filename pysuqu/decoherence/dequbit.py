@@ -10,7 +10,7 @@ import warnings
 
 import numpy as np
 import scipy as sp
-from typing import Optional, Callable, Tuple, List, Union
+from typing import Optional, Callable, Tuple, List, Union, Literal, Sequence
 # local lib
 from ..funclib.mathlib import *
 from ..qubit.base import AbstractQubit, Phi0
@@ -27,7 +27,7 @@ from .formatting import (
     format_z_tphi1_report,
     format_z_tphi2_report,
 )
-from .plotting import plot_read_tphi_fit, plot_z_tphi2_fit
+from .plotting import plot_read_tphi_fit, plot_z_tphi2_fit, plot_z_tphi2_multipsd_fit
 from .results import BiasCurrentVoltageResult, T1Result, TphiResult, XYCurrentVoltageResult
 
 Euler_gamma = 0.577216
@@ -183,14 +183,21 @@ class Decoherence:
 
         return self._qubit_builder(*args, **builder_kwargs)
 
-    def _build_noise(self, *args, is_print: Optional[bool] = None, **kwargs):
+    def _build_noise_for_psd(
+        self,
+        psd_freq,
+        psd_S,
+        *args,
+        is_print: Optional[bool] = None,
+        **kwargs,
+    ):
         resolved_is_print = self._resolve_is_print(is_print)
         builder_kwargs = self._filter_builder_kwargs(
             self._noise_builder,
             {
                 **kwargs,
-                'psd_freq': self.psd_freq,
-                'psd_S': self.psd_S,
+                'psd_freq': psd_freq,
+                'psd_S': psd_S,
                 'noise_type': self.noise_type,
                 'noise_prop': self.noise_prop,
                 'T_setup': self.T_setup,
@@ -202,6 +209,15 @@ class Decoherence:
             builder_kwargs['is_print'] = resolved_is_print
 
         return self._noise_builder(*args, **builder_kwargs)
+
+    def _build_noise(self, *args, is_print: Optional[bool] = None, **kwargs):
+        return self._build_noise_for_psd(
+            self.psd_freq,
+            self.psd_S,
+            *args,
+            is_print=is_print,
+            **kwargs,
+        )
 
     def refresh_model(self, *args, is_print: Optional[bool] = None, **kwargs):
         """Rebuild the qubit and noise dependencies from the current model state.
@@ -711,86 +727,73 @@ class ZNoiseDecoherence(Decoherence):
         method: str,
         experiment: str,
         fit_diagnostics: Optional[dict[str, object]] = None,
+        metadata: Optional[dict[str, object]] = None,
     ) -> TphiResult:
         diagnostics = {'segments': {}}
         if fit_diagnostics is not None:
             diagnostics.update(fit_diagnostics)
 
+        result_metadata = {
+            'method': method,
+            'experiment': experiment,
+            'source': 'z-control',
+        }
+        if metadata is not None:
+            result_metadata.update(metadata)
+
         return TphiResult(
             value=value,
-            metadata={
-                'method': method,
-                'experiment': experiment,
-                'source': 'z-control',
-            },
+            metadata=result_metadata,
             fit_diagnostics=diagnostics,
         )
 
-    def cal_tphi2(self, 
-              method: str = 'fit', 
-              experiment: str = 'Ramsey', 
-              delay_list: np.ndarray = np.linspace(10, 10e3, 100) * 1e-9, 
-              *, 
-              sensitivity: Optional[float] = None,
-              N: int = 100, 
-              len_pi: float = 100e-9, 
-              idle_freq: Optional[float] = None, 
-              p0: Optional[List[float]] = None, 
-              bounds: Tuple = ([0, 0, 0, -1], [np.inf, np.inf, 2, 1]), 
-              cut_point: List[float] = [],
-              is_print: bool = True, 
-              is_plot: bool = True,
-              integration_method: str = "continuous") -> TphiResult:
-        """
-        Calculate Tphi2 (pure dephasing time), typically dominated by 1/f noise.
-
-        Allows filtering the noise power spectral density (PSD) via cut_point 
-        to analyze contributions from specific frequency bands.
-
-        Args:
-            method (str): Calculation method, 'fit' for simulation fitting or 'cal' for analytical formula.
-            experiment (str): Experiment type, 'Ramsey' or 'SpinEcho'.
-            delay_list (np.ndarray): Array of delay times in seconds.
-            N (int): Number of pulses (for CPMG/Echo), default is 100 (if applicable).
-            len_pi (float): Length of pi pulse in seconds.
-            idle_freq (float): Idle frequency point. If None, uses current operating point.
-            p0 (List[float]): Initial guess for fitting parameters. 
-                            Format: [T1, Tphi, scale, offset]. Default is None (sets internal default).
-            bounds (Tuple): Bounds for curve fitting (lower_bound, upper_bound).
-            cut_point (List[float]): Frequency range [min_freq, max_freq] to slice the PSD. 
-                                    If empty, uses full spectrum.
-            is_print (bool): Whether to print the result.
-            is_plot (bool): Whether to plot the decay curve (only for 'fit' method).
-            integration_method (str): PSD integration method for fit mode.
-                                    'continuous' is the default; 'discrete' preserves legacy behavior.
-
-        Returns:
-            TphiResult: The calculated or fitted Tphi2 value in seconds.
-        """
-        if p0 is None:
-            p0 = [100e-6, 3e-6, 1., 0.]
-
-        if sensitivity is None:
-            sens = self.get_sensitivity_at_idle(idle_freq)
-        else:
-            sens = sensitivity
-        sensitivity_factor = sens * self.couple_term
-
+    def _calculate_tphi2_from_noise_output(
+        self,
+        *,
+        noise_output,
+        sensitivity_factor: float,
+        method: str,
+        experiment: str,
+        delay_list: np.ndarray,
+        N: int,
+        len_pi: float,
+        p0: Optional[List[float]],
+        bounds: Optional[Tuple],
+        cut_point: Sequence[float],
+        fit_mode: Literal['both', 'gauss'],
+        integration_method: str,
+        result_metadata: Optional[dict[str, object]] = None,
+    ) -> tuple[TphiResult, Optional[dict[str, object]]]:
         if method == 'fit':
+            if fit_mode == 'both':
+                fit_func = tphi_decay
+                if p0 is None:
+                    p0 = [100e-6, 3e-6, 1.]
+                if bounds is None:
+                    bounds = ([0, 0, 0.5], [np.inf, np.inf, 1.4])
+            elif fit_mode == 'gauss':
+                fit_func = gaussian_decay
+                if p0 is None:
+                    p0 = [5e-6, 1.]
+                if bounds is None:
+                    bounds = ([0, 0.5], [np.inf, 1.4])
+            else:
+                raise ValueError(f"Invalid fit_mode: {fit_mode}. Must be 'both' or 'gauss'.")
+
             if len(p0) != len(bounds[0]):
                 raise ValueError(f"Length mismatch: p0 ({len(p0)}) vs bounds ({len(bounds[0])})")
 
-            noise_output = self.noise.output_stage
             noise_freq_all = noise_output.frequency
             psd_all = noise_output.psd_single
 
             def _compute_segment(f_mask):
                 if not np.any(f_mask):
-                    return np.inf, np.zeros_like(delay_list)
+                    empty_popt = np.full(len(p0), np.inf)
+                    empty_pcov = np.full((len(p0), len(p0)), np.inf)
+                    return empty_popt, np.zeros_like(delay_list), empty_pcov
 
                 _freq = noise_freq_all[f_mask]
                 _psd = psd_all[f_mask]
-
                 _p1_list = self.cal_dephase(
                     psd=_psd,
                     sensitivity_factor=sensitivity_factor,
@@ -803,115 +806,378 @@ class ZNoiseDecoherence(Decoherence):
                 )
 
                 try:
-                    _popt, _pcov = fit_decay(delay_list, _p1_list, tphi_decay, p0=p0, bounds=bounds)
-                    return _popt, _p1_list, _pcov
+                    _popt, _pcov = fit_decay(
+                        delay_list,
+                        _p1_list,
+                        fit_func,
+                        p0=p0,
+                        bounds=bounds,
+                    )
                 except RuntimeError:
-                    return 0.0, _p1_list, np.inf
+                    _popt = np.full(len(p0), np.inf)
+                    _pcov = np.full((len(p0), len(p0)), np.inf)
+                return _popt, _p1_list, _pcov
 
-            popt, self.dephase, pcov = _compute_segment(np.ones(len(noise_freq_all), dtype=bool))
-            self.tphi2 = popt[1]
-            self.tphi2_fiterror = np.sqrt(pcov[1][1])
+            popt, dephase, pcov = _compute_segment(
+                np.ones(len(noise_freq_all), dtype=bool)
+            )
+            tphi2 = float(popt[1])
+            tphi2_fiterror = float(np.sqrt(pcov[1][1]))
 
             segment_results = {}
             if cut_point:
                 if min(cut_point) < np.min(noise_freq_all):
-                    raise ValueError(f"Cut point is too low. The minimum frequency is {np.min(noise_freq_all)}")
+                    raise ValueError(
+                        f"Cut point is too low. The minimum frequency is {np.min(noise_freq_all)}"
+                    )
                 if max(cut_point) > np.max(noise_freq_all):
-                    raise ValueError(f"Cut point is too high. The maximum frequency is {np.max(noise_freq_all)}")
-
-                sorted_cuts = sorted(cut_point)
-                boundaries = [np.min(noise_freq_all)] + sorted_cuts + [np.max(noise_freq_all)]
-
-                for i in range(len(boundaries) - 1):
-                    f_start, f_end = boundaries[i], boundaries[i+1]
-                    mask = (noise_freq_all >= f_start) & (noise_freq_all <= f_end)
-
-                    popt_seg, _, pcov_seg = _compute_segment(mask)
-
-                    label = f"{f_start:.2e}-{f_end:.2e} Hz"
-                    segment_results[label] = dict(
-                        popt=np.array(popt_seg, copy=True),
-                        pcov=np.array(pcov_seg, copy=True),
+                    raise ValueError(
+                        f"Cut point is too high. The maximum frequency is {np.max(noise_freq_all)}"
                     )
 
-            if is_plot:
-                plot_z_tphi2_fit(
-                    delay_list=delay_list,
-                    dephase=self.dephase,
-                    popt=popt,
-                    tphi2=self.tphi2,
-                    tphi2_fiterror=self.tphi2_fiterror,
-                    experiment=experiment,
-                    segment_results=segment_results,
+                sorted_cuts = sorted(cut_point)
+                boundaries = (
+                    [np.min(noise_freq_all)]
+                    + sorted_cuts
+                    + [np.max(noise_freq_all)]
                 )
 
+                for i in range(len(boundaries) - 1):
+                    f_start, f_end = boundaries[i], boundaries[i + 1]
+                    mask = (noise_freq_all >= f_start) & (noise_freq_all <= f_end)
+                    popt_seg, _, pcov_seg = _compute_segment(mask)
+                    label = f"{f_start:.2e}-{f_end:.2e} Hz"
+                    segment_results[label] = {
+                        'popt': np.array(popt_seg, copy=True),
+                        'pcov': np.array(pcov_seg, copy=True),
+                    }
 
             diagnostics = {
                 'tphi1': float(popt[0]),
                 'tphi1_fiterror': float(np.sqrt(pcov[0][0])),
-                'fit_error': float(self.tphi2_fiterror),
+                'fit_error': tphi2_fiterror,
                 'segments': segment_results,
             }
             result = self._build_tphi2_result(
-                value=self.tphi2,
+                value=tphi2,
                 method='fit',
                 experiment=experiment,
                 fit_diagnostics=diagnostics,
+                metadata=result_metadata,
             )
-            if is_print:
-                self._emit_report(
-                    format_z_tphi2_report(
-                        method='fit',
-                        experiment=experiment,
-                        idle_freq=idle_freq,
-                        sensitivity_factor=sensitivity_factor,
-                        noise_output=noise_output,
-                        tphi2=self.tphi2,
-                        fit_diagnostics=diagnostics,
-                    ),
-                    is_print=True,
-                )
-            return result
+            plot_data = {
+                'dephase': np.array(dephase, copy=True),
+                'popt': np.array(popt, copy=True),
+                'fitted_dephase': np.asarray(fit_func(delay_list, *popt)),
+                'tphi2': tphi2,
+                'tphi2_fiterror': tphi2_fiterror,
+                'segments': segment_results,
+            }
+            return result, plot_data
 
         if method == 'cal':
-            if cut_point:
-                warnings.warn(
-                    "'cal' method usually assumes full 1/f spectrum. 'cut_point' is ignored in analytical mode.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-
             if not self.noise_type.startswith('1f'):
                 raise ValueError("Analytical 'cal' method only works for 1/f type noise.")
 
-            noise_output = self.noise.output_stage
-            self.tphi2 = self.z_analyzer.calculate_tphi2_cal(
+            tphi2 = self.z_analyzer.calculate_tphi2_cal(
                 noise_output=noise_output,
                 sensitivity_factor=sensitivity_factor,
                 experiment=experiment,
                 delay_list=delay_list,
             )
-
             result = self._build_tphi2_result(
-                value=self.tphi2,
+                value=tphi2,
                 method='cal',
                 experiment=experiment,
+                metadata=result_metadata,
             )
+            return result, None
+
+        raise ValueError(f"Method {method} not supported.")
+
+    def cal_tphi2(
+        self,
+        method: str = 'fit',
+        experiment: str = 'Ramsey',
+        delay_list: np.ndarray = np.linspace(10, 10e3, 100) * 1e-9,
+        *,
+        sensitivity: Optional[float] = None,
+        N: int = 100,
+        len_pi: float = 100e-9,
+        idle_freq: Optional[float] = None,
+        p0: Optional[List[float]] = None,
+        bounds: Tuple = None,
+        cut_point: List[float] = [],
+        is_print: bool = True,
+        is_plot: bool = True,
+        plot_title: str = 'Global Dephasing',
+        fit_mode: Literal['both', 'gauss'] = 'both',
+        integration_method: str = "continuous",
+    ) -> TphiResult:
+        """
+        Calculate Tphi2 (pure dephasing time), typically dominated by 1/f noise.
+
+        Allows filtering the noise power spectral density (PSD) via cut_point
+        to analyze contributions from specific frequency bands.
+
+        Args:
+            method (str): Calculation method, 'fit' for simulation fitting or 'cal' for analytical formula.
+            experiment (str): Experiment type, 'Ramsey' or 'SpinEcho'.
+            delay_list (np.ndarray): Array of delay times in seconds.
+            N (int): Number of pulses (for CPMG/Echo), default is 100 (if applicable).
+            len_pi (float): Length of pi pulse in seconds.
+            idle_freq (float): Idle frequency point. If None, uses current operating point.
+            p0 (List[float]): Initial guess for fitting parameters.
+                            Format: [T1, Tphi, scale, offset]. Default is None (sets internal default).
+            bounds (Tuple): Bounds for curve fitting (lower_bound, upper_bound).
+            cut_point (List[float]): Frequency range [min_freq, max_freq] to slice the PSD.
+                                    If empty, uses full spectrum.
+            is_print (bool): Whether to print the result.
+            is_plot (bool): Whether to plot the decay curve (only for 'fit' method).
+            integration_method (str): PSD integration method for fit mode.
+                                    'continuous' is the default; 'discrete' preserves legacy behavior.
+
+        Returns:
+            TphiResult: The calculated or fitted Tphi2 value in seconds.
+        """
+        sens = (
+            self.get_sensitivity_at_idle(idle_freq)
+            if sensitivity is None
+            else sensitivity
+        )
+        sensitivity_factor = sens * self.couple_term
+        noise_output = self.noise.output_stage
+
+        if method == 'cal' and cut_point:
+            warnings.warn(
+                "'cal' method usually assumes full 1/f spectrum. 'cut_point' is ignored in analytical mode.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        result, plot_data = self._calculate_tphi2_from_noise_output(
+            noise_output=noise_output,
+            sensitivity_factor=sensitivity_factor,
+            method=method,
+            experiment=experiment,
+            delay_list=delay_list,
+            N=N,
+            len_pi=len_pi,
+            p0=p0,
+            bounds=bounds,
+            cut_point=cut_point,
+            fit_mode=fit_mode,
+            integration_method=integration_method,
+        )
+
+        self.tphi2 = result.value
+        if plot_data is not None:
+            self.dephase = plot_data['dephase']
+            self.tphi2_fiterror = plot_data['tphi2_fiterror']
+            if is_plot:
+                plot_z_tphi2_fit(
+                    delay_list=delay_list,
+                    dephase=self.dephase,
+                    popt=plot_data['popt'],
+                    fitted_dephase=plot_data['fitted_dephase'],
+                    tphi2=self.tphi2,
+                    tphi2_fiterror=self.tphi2_fiterror,
+                    experiment=experiment,
+                    plot_title=plot_title,
+                    segment_results=plot_data['segments'],
+                )
+
+        if is_print:
+            self._emit_report(
+                format_z_tphi2_report(
+                    method=method,
+                    experiment=experiment,
+                    idle_freq=idle_freq,
+                    sensitivity_factor=sensitivity_factor,
+                    noise_output=noise_output,
+                    tphi2=result.value,
+                    fit_diagnostics=result.fit_diagnostics if method == 'fit' else None,
+                ),
+                is_print=True,
+            )
+        return result
+
+    @staticmethod
+    def _normalize_multipsd_inputs(
+        psd_list: Sequence[np.ndarray],
+        psd_freq_list: Sequence[np.ndarray],
+        labels: Optional[Sequence[str]],
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[str]]:
+        psds = list(psd_list)
+        frequencies = list(psd_freq_list)
+        if not psds:
+            raise ValueError('psd_list must contain at least one PSD.')
+        if len(psds) != len(frequencies):
+            raise ValueError(
+                'psd_list and psd_freq_list must contain the same number of entries.'
+            )
+
+        if labels is None:
+            resolved_labels = [f'PSD {index + 1}' for index in range(len(psds))]
+        else:
+            if isinstance(labels, str):
+                raise TypeError('labels must be a sequence of strings, not one string.')
+            resolved_labels = list(labels)
+            if len(resolved_labels) != len(psds):
+                raise ValueError(
+                    'labels must contain one label for each PSD.'
+                )
+
+        if any(
+            not isinstance(label, str) or not label.strip()
+            for label in resolved_labels
+        ):
+            raise ValueError('Each PSD label must be a non-empty string.')
+        if len(set(resolved_labels)) != len(resolved_labels):
+            raise ValueError('PSD labels must be unique.')
+
+        normalized_psds = []
+        normalized_frequencies = []
+        for index, (frequency, psd) in enumerate(zip(frequencies, psds)):
+            frequency_array = np.asarray(frequency, dtype=float)
+            psd_array = np.asarray(psd, dtype=float)
+            entry_name = resolved_labels[index]
+            if frequency_array.ndim != 1 or psd_array.ndim != 1:
+                raise ValueError(
+                    f"PSD entry '{entry_name}' must use one-dimensional frequency and PSD arrays."
+                )
+            if len(frequency_array) != len(psd_array):
+                raise ValueError(
+                    f"PSD entry '{entry_name}' has mismatched frequency and PSD lengths."
+                )
+            if len(frequency_array) < 2:
+                raise ValueError(f"PSD entry '{entry_name}' must contain at least two points.")
+            if not np.all(np.isfinite(frequency_array)) or not np.all(
+                np.isfinite(psd_array)
+            ):
+                raise ValueError(f"PSD entry '{entry_name}' contains non-finite values.")
+            frequency_steps = np.diff(frequency_array)
+            is_strictly_monotonic = np.all(frequency_steps > 0) or np.all(
+                frequency_steps < 0
+            )
+            if np.any(frequency_array <= 0) or not is_strictly_monotonic:
+                raise ValueError(
+                    f"PSD entry '{entry_name}' frequencies must be positive and strictly monotonic."
+                )
+            if np.any(psd_array < 0):
+                raise ValueError(f"PSD entry '{entry_name}' contains negative PSD values.")
+            normalized_frequencies.append(frequency_array)
+            normalized_psds.append(psd_array)
+
+        return normalized_psds, normalized_frequencies, resolved_labels
+
+    def cal_tphi_multipsd(
+        self,
+        psd_list: Sequence[np.ndarray],
+        psd_freq_list: Sequence[np.ndarray],
+        *,
+        labels: Optional[Sequence[str]] = None,
+        plot_title: str = 'Multi-PSD Dephasing',
+        method: str = 'fit',
+        experiment: str = 'Ramsey',
+        delay_list: np.ndarray = np.linspace(10, 10e3, 100) * 1e-9,
+        sensitivity: Optional[float] = None,
+        N: int = 100,
+        len_pi: float = 100e-9,
+        idle_freq: Optional[float] = None,
+        p0: Optional[List[float]] = None,
+        bounds: Tuple = None,
+        cut_point: Optional[Sequence[float]] = None,
+        is_print: bool = True,
+        is_plot: bool = True,
+        fit_mode: Literal['both', 'gauss'] = 'both',
+        integration_method: str = 'continuous',
+    ) -> dict[str, TphiResult]:
+        """Calculate Tphi2 for several PSDs using one qubit configuration.
+
+        Each PSD is propagated through a temporary electronic-noise pipeline.
+        The current instance PSD, noise pipeline, and scalar Tphi2 attributes are
+        left unchanged. Fit-mode decay curves are rendered in one comparison
+        plot when ``is_plot`` is true.
+        """
+        if not self.is_spectral:
+            raise ValueError('cal_tphi_multipsd requires is_spectral=True.')
+
+        normalized_psds, normalized_frequencies, resolved_labels = (
+            self._normalize_multipsd_inputs(psd_list, psd_freq_list, labels)
+        )
+        cut_points = tuple(cut_point) if cut_point is not None else ()
+        if method == 'cal' and cut_points:
+            warnings.warn(
+                "'cal' method usually assumes full 1/f spectrum. 'cut_point' is ignored in analytical mode.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+        sens = (
+            self.get_sensitivity_at_idle(idle_freq)
+            if sensitivity is None
+            else sensitivity
+        )
+        sensitivity_factor = sens * self.couple_term
+        results = {}
+        plot_series = {}
+
+        for index, (label, frequency, psd) in enumerate(
+            zip(resolved_labels, normalized_frequencies, normalized_psds)
+        ):
+            noise = self._build_noise_for_psd(
+                frequency,
+                psd,
+                is_print=False,
+            )
+            noise_output = noise.output_stage
+            result, plot_data = self._calculate_tphi2_from_noise_output(
+                noise_output=noise_output,
+                sensitivity_factor=sensitivity_factor,
+                method=method,
+                experiment=experiment,
+                delay_list=delay_list,
+                N=N,
+                len_pi=len_pi,
+                p0=p0,
+                bounds=bounds,
+                cut_point=cut_points,
+                fit_mode=fit_mode,
+                integration_method=integration_method,
+                result_metadata={'label': label, 'psd_index': index},
+            )
+            results[label] = result
+            if plot_data is not None:
+                plot_series[label] = plot_data
+
             if is_print:
+                self._emit_report((f'PSD: {label}',), is_print=True)
                 self._emit_report(
                     format_z_tphi2_report(
-                        method='cal',
+                        method=method,
                         experiment=experiment,
                         idle_freq=idle_freq,
                         sensitivity_factor=sensitivity_factor,
                         noise_output=noise_output,
-                        tphi2=self.tphi2,
+                        tphi2=result.value,
+                        fit_diagnostics=(
+                            result.fit_diagnostics if method == 'fit' else None
+                        ),
                     ),
                     is_print=True,
                 )
-            return result
 
-        raise ValueError(f"Method {method} not supported.")
+        if is_plot and plot_series:
+            plot_z_tphi2_multipsd_fit(
+                delay_list=delay_list,
+                series=plot_series,
+                experiment=experiment,
+                plot_title=plot_title,
+            )
+
+        return results
+
 
 class XYNoiseDecoherence(Decoherence):
     """

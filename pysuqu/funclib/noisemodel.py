@@ -6,10 +6,22 @@ since 2025-12-10
 """
 
 import numpy as np
+from numpy.typing import NDArray
 from scipy.constants import h, hbar, Boltzmann
-from typing import List, Mapping, Optional, Sequence, Union
+from typing import List, Literal, Mapping, Optional, Sequence, Tuple, Union
 
 kb = Boltzmann
+
+PSDUnitMode = Literal[
+    "dBm/Hz",
+    "W/Hz",
+    "V^2/Hz",
+    "V/sqrt(Hz)",
+    "A^2/Hz",
+    "A/sqrt(Hz)",
+]
+PSDInput = Union[float, Sequence[float], NDArray[np.float64]]
+PSDOutput = Union[float, NDArray[np.float64]]
 
 def T2Sii_Double(T: Union[float, int, np.ndarray], f: float, R: float = 50) -> Union[float, np.ndarray]:
     r"""
@@ -764,7 +776,7 @@ def compare_psd(
         np.finfo(float).tiny,
     )
     relative_error = np.abs(first - second) / denominator
-    comparison = {}
+    comparison: dict[str, dict[str, Union[float, int]]] = {}
     for name, mask in (
         ("all", both_finite),
         ("nonzero_frequency", both_finite & (freq != 0)),
@@ -782,7 +794,7 @@ def compare_psd(
 
 def plot_psd(
     frequency: Union[float, np.ndarray],
-    psd_by_mode: Mapping[str, Optional[np.ndarray]],
+    psd_by_mode: Mapping[str, Union[np.ndarray, None]],
     *,
     ax=None,
     title: Optional[str] = None,
@@ -839,7 +851,7 @@ def plot_psd_groups(
     ax=None,
     title: Optional[str] = "Group PSD",
     ylabel: str = "PSD (V$^2$/Hz)",
-    group_labels: Optional[List[str]] = None,
+    group_labels: Optional[List[str]] = None
 ):
     """Plot selected processed H5 groups on one PSD axes.
 
@@ -853,8 +865,6 @@ def plot_psd_groups(
         ax: Existing Matplotlib axes. A new axes is created when omitted.
         title: Plot title. Set to ``None`` to omit it.
         ylabel: PSD axis label.
-        group_labels: Optional display labels overriding each selected group's
-            own ``label`` metadata, in selection order.
 
     Returns:
         ``(figure, ax)`` with one line per selected group. The legend uses each
@@ -966,6 +976,90 @@ def compare_psd_groups(
         )
     figure.tight_layout()
     return figure, axes
+
+
+def convert_noise_psd_to_load(
+    psd: PSDInput,
+    R_m: float = 50.0,
+    R_s: float = 50.0,
+    R_l: float = 50.0,
+    mode: PSDUnitMode = "dBm/Hz",
+) -> PSDOutput:
+    """Convert a measured noise spectrum to the spectrum at the actual load.
+
+    The source is modeled as a Thevenin voltage-noise source with a series
+    resistance R_s. The measurement instrument presents a resistance R_m,
+    while the actual load presents a resistance R_l.
+
+    Args:
+        psd: Measured spectrum as a scalar or array-like value. Its unit is
+            selected by ``mode``.
+        R_m: Measurement instrument input resistance in ohms.
+        R_s: Source output resistance in ohms.
+        R_l: Actual load resistance in ohms.
+        mode: Unit and quantity represented by ``psd``. Supported values are
+            ``dBm/Hz`` and ``W/Hz`` for absorbed power; ``V^2/Hz`` and
+            ``V/sqrt(Hz)`` for load voltage; and ``A^2/Hz`` and ``A/sqrt(Hz)``
+            for load current.
+
+    Returns:
+        The corresponding spectrum at R_l in the same unit as ``psd``. A
+        scalar input produces a float; an array-like input produces a NumPy
+        float64 array with the same shape.
+
+    Raises:
+        ValueError: If a resistance is non-positive or non-finite, ``mode`` is
+            unsupported, or a linear PSD or ASD input contains negative values.
+
+    Notes:
+        This corrects only for resistive loading. It does not remove the
+        instrument noise floor or correct cable loss, amplifier noise, or
+        frequency-dependent complex impedances.
+    """
+    resistances = np.asarray([R_m, R_s, R_l], dtype=np.float64)
+
+    if not np.all(np.isfinite(resistances)) or np.any(resistances <= 0.0):
+        raise ValueError("R_m, R_s, and R_l must be finite and positive.")
+
+    supported_modes: Tuple[PSDUnitMode, ...] = (
+        "dBm/Hz",
+        "W/Hz",
+        "V^2/Hz",
+        "V/sqrt(Hz)",
+        "A^2/Hz",
+        "A/sqrt(Hz)",
+    )
+    if mode not in supported_modes:
+        raise ValueError(
+            f"Unsupported mode {mode!r}. Expected one of {supported_modes}."
+        )
+
+    measured = np.asarray(psd, dtype=np.float64)
+
+    if mode != "dBm/Hz" and np.any(measured < 0.0):
+        raise ValueError("Linear PSD and ASD values cannot be negative.")
+
+    power_ratio: float = R_l * (R_s + R_m) ** 2 / (R_m * (R_s + R_l) ** 2)
+    voltage_asd_ratio: float = R_l * (R_s + R_m) / (R_m * (R_s + R_l))
+    current_asd_ratio: float = (R_s + R_m) / (R_s + R_l)
+
+    if mode == "dBm/Hz":
+        converted = measured + 10.0 * np.log10(power_ratio)
+    elif mode == "W/Hz":
+        converted = measured * power_ratio
+    elif mode == "V^2/Hz":
+        converted = measured * voltage_asd_ratio**2
+    elif mode == "V/sqrt(Hz)":
+        converted = measured * voltage_asd_ratio
+    elif mode == "A^2/Hz":
+        converted = measured * current_asd_ratio**2
+    else:  # mode == "A/sqrt(Hz)"
+        converted = measured * current_asd_ratio
+
+    if converted.ndim == 0:
+        return float(converted)
+
+    return converted.astype(np.float64, copy=False)
 
 def thermal_photon_noise(T_cav:float, kappa:float, chi:float, cavity_freq:float, PSD_freq:np.ndarray, S0:float = 0.0) -> np.ndarray:
     """
