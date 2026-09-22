@@ -7,7 +7,7 @@ since 2025-12-10
 
 import numpy as np
 from scipy.constants import h, hbar, Boltzmann
-from typing import Mapping, Optional, Sequence, Union
+from typing import List, Mapping, Optional, Sequence, Union
 
 kb = Boltzmann
 
@@ -640,6 +640,332 @@ def find_psd_peaks(
             plt.show()
 
     return peak_results if multi_trace else peak_results["psd"]
+
+
+PSD_MODES = (
+    "rpwr_over_bandwidth",
+    "rpwr_raw",
+    "xy_stddev2_over_bandwidth",
+    "rstddev2_over_bandwidth",
+)
+
+PSD_MODE_LABELS = {
+    "rpwr_over_bandwidth": "rpwr / bandwidth",
+    "rpwr_raw": "rpwr (raw)",
+    "xy_stddev2_over_bandwidth": "(xstddev^2 + ystddev^2) / bandwidth",
+    "rstddev2_over_bandwidth": "rstddev^2 / bandwidth",
+}
+
+
+def process_psd(
+    frequency: Union[float, np.ndarray],
+    bandwidth: Union[float, np.ndarray],
+    mode: str = "xy_stddev2_over_bandwidth",
+    *,
+    rpwr: Optional[Union[float, np.ndarray]] = None,
+    xstddev: Optional[Union[float, np.ndarray]] = None,
+    ystddev: Optional[Union[float, np.ndarray]] = None,
+    rstddev: Optional[Union[float, np.ndarray]] = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Calculate one PSD representation from Zurich sweeper arrays.
+
+    Args:
+        frequency: Frequency samples in Hz. Returned unchanged as a detached
+            one-dimensional array so callers can keep frequency and PSD aligned.
+        bandwidth: Resolution bandwidth for each sample in Hz.
+        mode: One of ``PSD_MODES``:
+            ``rpwr_over_bandwidth`` computes ``rpwr / bandwidth``;
+            ``rpwr_raw`` returns ``rpwr`` without normalization;
+            ``xy_stddev2_over_bandwidth`` computes
+            ``(xstddev**2 + ystddev**2) / bandwidth``;
+            ``rstddev2_over_bandwidth`` computes ``rstddev**2 / bandwidth``.
+        rpwr, xstddev, ystddev, rstddev: Raw sweeper arrays. Only the fields
+            required by the selected mode are required.
+
+    Returns:
+        A ``(frequency, values)`` tuple. Values retain non-finite results from
+        invalid input; callers can decide whether to filter or diagnose them.
+
+    Raises:
+        ValueError: If the mode is unknown, a required field is missing, or
+            input arrays do not have the same length.
+    """
+    if mode not in PSD_MODES:
+        choices = ", ".join(PSD_MODES)
+        raise ValueError(f"Unknown PSD mode {mode!r}. Use one of: {choices}")
+
+    freq = np.asarray(frequency, dtype=float).ravel()
+    bw = np.asarray(bandwidth, dtype=float).ravel()
+    if freq.size != bw.size:
+        raise ValueError(
+            f"frequency and bandwidth must have the same length; got {freq.size} and {bw.size}."
+        )
+
+    if mode == "xy_stddev2_over_bandwidth":
+        if xstddev is None or ystddev is None:
+            raise ValueError(f"PSD mode {mode!r} requires xstddev and ystddev arrays.")
+        x_values = np.asarray(xstddev, dtype=float).ravel()
+        y_values = np.asarray(ystddev, dtype=float).ravel()
+        if x_values.size != freq.size or y_values.size != freq.size:
+            raise ValueError(
+                f"PSD mode {mode!r} requires xstddev and ystddev to have length {freq.size}."
+            )
+    else:
+        field_name, field_values = {
+            "rpwr_over_bandwidth": ("rpwr", rpwr),
+            "rpwr_raw": ("rpwr", rpwr),
+            "rstddev2_over_bandwidth": ("rstddev", rstddev),
+        }[mode]
+        if field_values is None:
+            raise ValueError(f"PSD mode {mode!r} requires a {field_name} array.")
+        raw_values = np.asarray(field_values, dtype=float).ravel()
+        if raw_values.size != freq.size:
+            raise ValueError(
+                f"PSD mode {mode!r} requires {field_name} to have length {freq.size}; "
+                f"got {raw_values.size}."
+            )
+
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        if mode == "rpwr_over_bandwidth":
+            values = raw_values / bw
+        elif mode == "rpwr_raw":
+            values = raw_values.copy()
+        elif mode == "xy_stddev2_over_bandwidth":
+            values = (x_values**2 + y_values**2) / bw
+        else:
+            values = raw_values**2 / bw
+
+    return freq.copy(), np.asarray(values, dtype=float).copy()
+
+
+def compare_psd(
+    frequency: Union[float, np.ndarray],
+    psd_a: Union[float, np.ndarray],
+    psd_b: Union[float, np.ndarray],
+) -> dict[str, dict[str, Union[float, int]]]:
+    """Compare two PSD arrays using pointwise relative error statistics.
+
+    Returns a mapping with ``all`` and ``nonzero_frequency`` entries, each
+    holding the point count plus median, 95th-percentile, and maximum
+    relative error against the larger magnitude of the two traces.
+    """
+    freq = np.asarray(frequency, dtype=float).ravel()
+    first = np.asarray(psd_a, dtype=float).ravel()
+    second = np.asarray(psd_b, dtype=float).ravel()
+    if not (freq.size == first.size == second.size):
+        raise ValueError(
+            "frequency and both PSD arrays must have the same length; "
+            f"got {freq.size}, {first.size}, and {second.size}."
+        )
+
+    both_finite = np.isfinite(freq) & np.isfinite(first) & np.isfinite(second)
+    denominator = np.maximum(
+        np.maximum(np.abs(first), np.abs(second)),
+        np.finfo(float).tiny,
+    )
+    relative_error = np.abs(first - second) / denominator
+    comparison = {}
+    for name, mask in (
+        ("all", both_finite),
+        ("nonzero_frequency", both_finite & (freq != 0)),
+    ):
+        values = relative_error[mask]
+        if values.size:
+            comparison[name] = {
+                "points": int(values.size),
+                "median_relative_error": float(np.median(values)),
+                "p95_relative_error": float(np.percentile(values, 95)),
+                "max_relative_error": float(np.max(values)),
+            }
+    return comparison
+
+
+def plot_psd(
+    frequency: Union[float, np.ndarray],
+    psd_by_mode: Mapping[str, Optional[np.ndarray]],
+    *,
+    ax=None,
+    title: Optional[str] = None,
+    ylabel: str = "PSD",
+    include_raw: bool = False,
+):
+    """Plot one frequency trace for each available PSD mode.
+
+    Matplotlib is imported lazily so using the numerical noise-model helpers
+    does not require a plotting backend. The raw ``rpwr`` trace is excluded by
+    default because it is V^2 rather than V^2/Hz; pass ``include_raw=True`` to
+    show it as a diagnostic. The function returns ``(figure, ax)`` and leaves
+    display control to the caller.
+    """
+    import matplotlib.pyplot as plt
+
+    freq = np.asarray(frequency, dtype=float).ravel()
+    if ax is None:
+        _, ax = plt.subplots()
+    figure = ax.figure
+
+    for mode, values in psd_by_mode.items():
+        if mode == "rpwr_raw" and not include_raw:
+            continue
+        if values is None:
+            continue
+        psd = np.asarray(values, dtype=float).ravel()
+        if psd.size != freq.size:
+            raise ValueError(
+                f"PSD mode {mode!r} has length {psd.size}; expected {freq.size}."
+            )
+        mask = np.isfinite(freq) & np.isfinite(psd) & (freq > 0) & (psd > 0)
+        if not np.any(mask):
+            continue
+        order = np.argsort(freq[mask])
+        label = PSD_MODE_LABELS.get(mode, mode)
+        ax.loglog(freq[mask][order], psd[mask][order], label=label, linewidth=1.5)
+
+    if title:
+        ax.set_title(title)
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, which="both", alpha=0.3)
+    if ax.lines:
+        ax.legend()
+    return figure, ax
+
+
+def plot_psd_groups(
+    data,
+    group_ids=None,
+    psd_key: str = "psd",
+    *,
+    ax=None,
+    title: Optional[str] = "Group PSD",
+    ylabel: str = "PSD (V$^2$/Hz)",
+    group_labels: Optional[List[str]] = None,
+):
+    """Plot selected processed H5 groups on one PSD axes.
+
+    Args:
+        data: Mapping returned by a group-processing workflow. Each item must
+            provide ``freq``, the selected PSD under ``psd_key`` (or in
+            ``psd_by_mode``), and may provide ``group_id``/``label`` metadata.
+        group_ids: Optional group ids or sample paths to include. ``None`` plots
+            every group in insertion order.
+        psd_key: Item key for the selected PSD, or a key in ``psd_by_mode``.
+        ax: Existing Matplotlib axes. A new axes is created when omitted.
+        title: Plot title. Set to ``None`` to omit it.
+        ylabel: PSD axis label.
+        group_labels: Optional display labels overriding each selected group's
+            own ``label`` metadata, in selection order.
+
+    Returns:
+        ``(figure, ax)`` with one line per selected group. The legend uses each
+        group's H5 ``label`` and falls back to ``group_id``.
+    """
+    import matplotlib.pyplot as plt
+
+    if not data:
+        raise ValueError("No processed H5 groups are available for plotting.")
+
+    if group_ids is None:
+        selected = list(data.items())
+    else:
+        if isinstance(group_ids, (str, int)):
+            group_ids = [group_ids]
+        wanted = {str(group_id) for group_id in group_ids}
+        selected = [
+            (sample_path, item)
+            for sample_path, item in data.items()
+            if str(item.get("group_id")) in wanted
+            or str(sample_path) in wanted
+        ]
+        if not selected:
+            raise ValueError(f"No requested groups found: {sorted(wanted)}")
+
+    if ax is None:
+        figure, ax = plt.subplots(figsize=(9, 5))
+    else:
+        figure = ax.figure
+
+    for sid, (sample_path, item) in enumerate(selected):
+        if psd_key in item:
+            psd = item[psd_key]
+        else:
+            psd = item.get("psd_by_mode", {}).get(psd_key)
+        if psd is None:
+            group_name = item.get("group_id", sample_path)
+            raise ValueError(f"PSD key {psd_key!r} is unavailable for group {group_name}.")
+
+        frequency = np.asarray(item["freq"], dtype=float).ravel()
+        values = np.asarray(psd, dtype=float).ravel()
+        if frequency.shape != values.shape:
+            group_name = item.get("group_id", sample_path)
+            raise ValueError(f"Frequency and PSD lengths differ for group {group_name}.")
+
+        mask = np.isfinite(frequency) & np.isfinite(values) & (frequency > 0) & (values > 0)
+        if not np.any(mask):
+            continue
+        order = np.argsort(frequency[mask])
+        if group_labels is not None and sid < len(group_labels):
+            group_label = group_labels[sid]
+        else:
+            group_label = item.get("label") or f"group={item.get('group_id', sample_path)}"
+        ax.loglog(
+            frequency[mask][order],
+            values[mask][order],
+            label=group_label,
+        )
+
+    ax.set_xlabel("Frequency (Hz)")
+    ax.set_ylabel(ylabel)
+    if title:
+        ax.set_title(title)
+    ax.grid(True, which="both", alpha=0.3)
+    if ax.lines:
+        ax.legend()
+    figure.tight_layout()
+    return figure, ax
+
+
+def compare_psd_groups(
+    data,
+    modes=("xy_stddev2_over_bandwidth", "rpwr_over_bandwidth"),
+):
+    """Compare multiple PSD representations in one panel per H5 group."""
+    import matplotlib.pyplot as plt
+
+    if not data:
+        raise ValueError("No processed H5 groups are available for plotting.")
+    if isinstance(modes, str):
+        modes = (modes,)
+
+    figure, axes = plt.subplots(
+        nrows=len(data),
+        ncols=1,
+        squeeze=False,
+        figsize=(9, max(4.0, 3.8 * len(data))),
+    )
+    for axis, (sample_path, item) in zip(axes[:, 0], data.items()):
+        available = item.get("psd_by_mode", {})
+        if not available:
+            available = {
+                "xy_stddev2_over_bandwidth": item.get("psd_xy"),
+                "rpwr_over_bandwidth": item.get("psd_rpwr"),
+            }
+        selected = {mode: available.get(mode) for mode in modes}
+        check = item.get("crosscheck", {}).get("nonzero_frequency", {})
+        title = f"group={item.get('group_id', sample_path)}"
+        if item.get("label"):
+            title += f" | label={item['label']}"
+        if check:
+            title += f" | p95 relative error={check['p95_relative_error']:.2%}"
+        plot_psd(
+            item["freq"],
+            selected,
+            ax=axis,
+            title=title,
+            ylabel="PSD (V$^2$/Hz)",
+        )
+    figure.tight_layout()
+    return figure, axes
 
 def thermal_photon_noise(T_cav:float, kappa:float, chi:float, cavity_freq:float, PSD_freq:np.ndarray, S0:float = 0.0) -> np.ndarray:
     """
