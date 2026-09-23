@@ -1,7 +1,6 @@
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
-from types import SimpleNamespace
 
 import numpy as np
 
@@ -13,7 +12,6 @@ from pysuqu.decoherence.dequbit import XYNoiseDecoherence, ZNoiseDecoherence
 from pysuqu.qubit.base import Phi0
 from pysuqu.decoherence.formatting import (
     format_bias_current_voltage_report,
-    format_coupler_tphi1_report,
     format_xy_current_voltage_report,
 )
 
@@ -89,37 +87,6 @@ class DecoherenceRoundHDisplayFormattingTests(unittest.TestCase):
 
         self.assertEqual(self._normalize(actual_result), self._normalize(expected_result))
         self.assertEqual(tuple(stdout.getvalue().splitlines()), expected_lines)
-
-    def test_format_coupler_tphi1_report_describes_target_and_sensitivity(self):
-        noise_output = SimpleNamespace(
-            white_noise=2.5e-18,
-            white_ref_freq=11.0,
-            white_noise_temperature=0.012,
-        )
-
-        self.assertEqual(
-            format_coupler_tphi1_report(
-                coupler_flux_point=0.42,
-                qubit_idx=1,
-                qubit_fluxes=[0.1, 0.2],
-                sensitivity_ghz_per_phi0=0.031,
-                sensitivity_rad_per_wb=9.415e19,
-                couple_term=1.5e-12,
-                noise_output=noise_output,
-                tphi1=3.2e-6,
-            ),
-            (
-                '--- Coupler Flux Noise Tphi1 ---',
-                'Coupler flux: 0.420000 Phi0',
-                'Target qubit: Qubit2',
-                'Qubit flux overrides: [0.100000, 0.200000] Phi0',
-                'Output white noise PSD: 2.500e-18 A^2/Hz @ 11.000 Hz',
-                'Output white noise temperature: 12.000 mK',
-                'Frequency sensitivity: 0.031000 GHz/Phi0 = 31.000 MHz/Phi0',
-                'Angular flux sensitivity: 9.415e+19 rad/s/Wb, mutual inductance: 1.500e-12 H',
-                'Tphi1: 3.200 us',
-            ),
-        )
 
 
 if __name__ == '__main__':

@@ -11,7 +11,6 @@ _OPTIONAL_SUBMODULES = (
     '.qutiplib',
     '.awgenerator',
     '.transmission',
-    '.predistortion',
     '.interfile',
 )
 

@@ -77,6 +77,7 @@ def _run_r_noise_read_tphi_workload(
         psd_S=_PSD_S,
         noise_prop='single',
         is_spectral=True,
+        read_freq=_READ_FREQ,
         is_print=False,
     )
     result = model.cal_read_tphi(
@@ -152,6 +153,7 @@ def _profile_warm_path(
         psd_S=_PSD_S,
         noise_prop='single',
         is_spectral=True,
+        read_freq=_READ_FREQ,
         is_print=False,
     )
 
@@ -170,10 +172,9 @@ def _profile_warm_path(
             is_plot=False,
             is_print=False,
         )
-        model.cal_readcavity_psd(read_freq=_READ_FREQ)
+        model.cal_readcavity_psd()
         dephase = model.cal_read_dephase(
             experiment='Ramsey',
-            read_freq=_READ_FREQ,
             delay_list=_DELAY_LIST,
         )
         if method == 'fit':
@@ -196,6 +197,7 @@ def _profile_warm_path(
             psd_S=_PSD_S,
             noise_prop='single',
             is_spectral=True,
+            read_freq=_READ_FREQ,
             is_print=False,
         )
         constructor_times.append(time.perf_counter() - start)
@@ -230,13 +232,12 @@ def _profile_warm_path(
         cal_read_tphi_times.append(time.perf_counter() - start)
 
         start = time.perf_counter()
-        model.cal_readcavity_psd(read_freq=_READ_FREQ)
+        model.cal_readcavity_psd()
         cal_readcavity_psd_times.append(time.perf_counter() - start)
 
         start = time.perf_counter()
         dephase = model.cal_read_dephase(
             experiment='Ramsey',
-            read_freq=_READ_FREQ,
             delay_list=_DELAY_LIST,
         )
         cal_read_dephase_times.append(time.perf_counter() - start)

@@ -13,6 +13,7 @@ import scipy as sp
 from typing import Optional, Callable, Tuple, List, Union, Literal, Sequence
 # local lib
 from ..funclib.mathlib import *
+from ..funclib.noisemodel import Sii_A2dBm, Sii2T_Double, Sii_D2S, T2Sii_Double
 from ..qubit.base import AbstractQubit, Phi0
 from .analysis import ReadoutCavityAnalyzer, XYRelaxationAnalyzer, ZDephasingAnalyzer
 from .electronics import ElectronicNoise
@@ -265,38 +266,64 @@ class Decoherence:
             integration_method: 'continuous' uses log-log PSD interpolation and adaptive quadrature.
                                 'discrete' preserves the legacy sparse-grid integration.
         """
+        p1_list = []
         if noise_freq is None:
             noise_freq = self.noise.output_stage.frequency
-        if integration_method not in {"continuous", "discrete"}:
-            raise ValueError("integration_method must be 'continuous' or 'discrete'.")
-        delays = np.asarray(delay_list, dtype=float).reshape(-1)
-        vectorizable = delays.size > 0 and np.all(np.isfinite(delays)) and (
-            experiment != "CPMG" or np.all(delays > 0)
-        )
-        # Keep instrumentation/legacy callers that replace the scalar helper
-        # observable; this also makes monkeypatched integrations deterministic.
-        scalar_helper_patched = hasattr(integrate_filtered_psd_continuous, "assert_called")
-        if (integration_method == "continuous" and experiment in {"Ramsey", "SpinEcho", "CPMG"}
-                and vectorizable and not scalar_helper_patched):
-            prepared = PreparedFilteredPSD.for_continuous(noise_freq, psd)
-            if experiment == "Ramsey":
-                vector_filter = lambda f: ramsey_transfunc(f, delays)
-            elif experiment == "SpinEcho":
-                vector_filter = lambda f: echo_transfunc(f, delays)
-            else:
-                vector_filter = lambda f: cpmg_transfunc(f, delays, N, len_pi)
-            dfactors = prepared.integrate_continuous_many(vector_filter, delays.size)
-            return np.exp(-dfactors * (sensitivity_factor * 2) ** 2 / 2)
 
-        p1_list = []
-        for tau in delays:
-            trans_func = self._generate_transfunc(experiment, tau, N, len_pi)
-            if integration_method == "continuous":
-                dfactor = integrate_filtered_psd_continuous(noise_freq, psd, trans_func)
+        # Prepare the PSD once per dephasing curve.  The integration rules and
+        # filter functions remain unchanged; this only avoids repeating sorting,
+        # filtering, spline construction and decade-node generation for every
+        # delay value.
+        if integration_method == "continuous":
+            prepared_psd = PreparedFilteredPSD.for_continuous(noise_freq, psd)
+        elif integration_method == "discrete":
+            prepared_psd = PreparedFilteredPSD.for_discrete(noise_freq, psd)
+        else:
+            raise ValueError("integration_method must be 'continuous' or 'discrete'.")
+        
+        delay_array = np.asarray(delay_list, dtype=float).reshape(-1)
+        vectorizable_delays = (
+            delay_array.size
+            and np.all(np.isfinite(delay_array))
+            and (experiment != 'CPMG' or np.all(delay_array > 0.0))
+        )
+        if integration_method == "continuous" and experiment in {
+            'Ramsey', 'SpinEcho', 'CPMG'
+        } and vectorizable_delays:
+            # The three built-in filters are vectorizable in ``tau``.  A single
+            # quad_vec traversal therefore computes every delay while retaining
+            # the same spline, breakpoints and adaptive tolerances as the scalar
+            # reference implementation.  Arbitrary future experiments continue
+            # through the scalar callback path below.
+            if experiment == 'Ramsey':
+                vector_filter = lambda freq: ramsey_transfunc(freq, delay_array)
+            elif experiment == 'SpinEcho':
+                vector_filter = lambda freq: echo_transfunc(freq, delay_array)
             else:
-                dfactor = integrate_square_large_span(noise_freq, psd, trans_func, method='log')
-            p1_list.append(np.exp(-dfactor * (sensitivity_factor * 2) ** 2 / 2))
-        return np.asarray(p1_list)
+                vector_filter = lambda freq: cpmg_transfunc(
+                    freq, delay_array, N, len_pi
+                )
+            dfactors = prepared_psd.integrate_continuous_many(
+                vector_filter, delay_array.size
+            )
+            p1_list = np.exp(-dfactors * (sensitivity_factor * 2)**2 / 2).tolist()
+        else:
+            for tau in delay_array:
+                trans_func = self._generate_transfunc(experiment, tau, N, len_pi)
+                if integration_method == "continuous":
+                    dfactor = prepared_psd.integrate_continuous(trans_func)
+                elif integration_method == "discrete":
+                    dfactor = integrate_square_large_span(
+                        noise_freq,
+                        psd,
+                        trans_func,
+                        method='log',
+                        _prepared=prepared_psd,
+                    )
+                exponent = -dfactor * (sensitivity_factor * 2)**2 / 2
+                p1_list.append(np.exp(exponent))
+            
+        return np.array(p1_list)
 
 
 class ZNoiseDecoherence(Decoherence):
@@ -335,6 +362,10 @@ class ZNoiseDecoherence(Decoherence):
             - experiment: 'Ramsey' | 'SpinEcho' | 'CPMG'
             - idle_freq: Idle frequency point [Hz] for sensitivity calculation
             - cut_point: List of frequency boundaries for segmented analysis
+
+        cal_tphi_multipsd(psd_list, psd_freq_list, labels, ...) -> dict[str, TphiResult]
+            Compare several PSD conditions using one qubit configuration and plot
+            their simulated and fitted dephasing curves in one figure
 
         cal_bias_current_voltage(phi_fraction, is_print) -> dict
             Calculate bias current and voltage at chip and room temperature ends
@@ -455,7 +486,7 @@ class ZNoiseDecoherence(Decoherence):
                     tphi1=self.tphi1,
                 ),
                 is_print=True,
-            )
+        )
         return self.tphi1
 
     def cal_coupler_tphi1(
@@ -579,56 +610,49 @@ class ZNoiseDecoherence(Decoherence):
         if couplers_per_qubit <= 0:
             raise ValueError('couplers_per_qubit must be a positive integer.')
 
-        # A zero sensitivity is valid and maps to an infinite single-coupler
-        # Tphi, while NaN/infinite sensitivity would make the result meaningless.
-        for label, sensitivity_value in (
+        sensitivities = {}
+        for label, sensitivity in (
             ('gate_sensitivity', gate_sensitivity),
             ('off_sensitivity', off_sensitivity),
         ):
             try:
-                sensitivity_value = float(
-                    self._extract_frequency_sensitivity_ghz_per_phi0(
-                        sensitivity_value
-                    )
+                sensitivity_rad_per_wb = self._frequency_sensitivity_to_rad_per_wb(
+                    sensitivity,
+                    unit=sensitivity_unit,
                 )
             except (TypeError, ValueError) as exc:
                 raise ValueError(f'{label} must be a finite scalar.') from exc
-            if not np.isfinite(sensitivity_value):
+            if not np.isfinite(sensitivity_rad_per_wb):
                 raise ValueError(f'{label} must be a finite scalar.')
+            sensitivities[label] = sensitivity_rad_per_wb
 
         gate_sensitivity_ghz_per_phi0 = self._rad_per_wb_to_ghz_per_phi0(
-            self._frequency_sensitivity_to_rad_per_wb(
-                gate_sensitivity,
-                unit=sensitivity_unit,
-            )
+            sensitivities['gate_sensitivity']
         )
         off_sensitivity_ghz_per_phi0 = self._rad_per_wb_to_ghz_per_phi0(
-            self._frequency_sensitivity_to_rad_per_wb(
-                off_sensitivity,
-                unit=sensitivity_unit,
+            sensitivities['off_sensitivity']
+        )
+
+        tphi_gate_s = float(
+            self.cal_coupler_tphi1(
+                sensitivity=gate_sensitivity,
+                sensitivity_unit=sensitivity_unit,
+                is_print=False,
             )
         )
-
-        tphi_gate_s = self.cal_coupler_tphi1(
-            sensitivity=gate_sensitivity,
-            sensitivity_unit=sensitivity_unit,
-            is_print=False,
+        tphi_off_s = float(
+            self.cal_coupler_tphi1(
+                sensitivity=off_sensitivity,
+                sensitivity_unit=sensitivity_unit,
+                is_print=False,
+            )
         )
-        tphi_off_s = self.cal_coupler_tphi1(
-            sensitivity=off_sensitivity,
-            sensitivity_unit=sensitivity_unit,
-            is_print=False,
-        )
-
-        try:
-            tphi_gate_s = float(tphi_gate_s)
-            tphi_off_s = float(tphi_off_s)
-        except (TypeError, ValueError) as exc:
-            raise ValueError('computed gate/off Tphi values must be numeric.') from exc
-        if any(np.isnan(value) or value <= 0 for value in (tphi_gate_s, tphi_off_s)):
-            raise ValueError('computed gate/off Tphi values must be positive.')
-        if any(np.isinf(value) and value < 0 for value in (tphi_gate_s, tphi_off_s)):
-            raise ValueError('computed gate/off Tphi values must not be negative infinity.')
+        for label, value in (
+            ('gate Tphi', tphi_gate_s),
+            ('off Tphi', tphi_off_s),
+        ):
+            if np.isnan(value) or value <= 0 or (np.isinf(value) and value < 0):
+                raise ValueError(f'computed {label} must be positive.')
 
         gamma_gate_s_inv = 1 / tphi_gate_s
         gamma_off_s_inv = 1 / tphi_off_s
@@ -719,6 +743,7 @@ class ZNoiseDecoherence(Decoherence):
             phi_fraction=coupler_flux_point,
             is_print=is_print,
         )
+
 
     def _build_tphi2_result(
         self,
@@ -1344,14 +1369,13 @@ class XYNoiseDecoherence(Decoherence):
             )
         return result
 
-    def cal_thermal_exitation(self, T1: Optional[float] = 100, is_print: bool = True) -> Tuple[float, float]:
+    def cal_thermal_exitation(self, T1: float = None, is_print: bool = True) -> Tuple[float, float]:
         """
         Calculate total and XY-only thermal excitation probabilities.
 
         Args:
-            T1: Measured relaxation time in microseconds (`us`), default 100.
-                When set to `None`, use the relaxation time derived by
-                `cal_t1()`.
+            T1: Optional measured relaxation time in microseconds (`us`). When
+                put `None`, the calculation falls back to the XY-only rates derived by `cal_t1()`.
             is_print: Whether to emit the formatted thermal-excitation report.
 
         Returns:
@@ -1370,9 +1394,6 @@ class XYNoiseDecoherence(Decoherence):
                     stacklevel=2,
                 )
                 return 0.0, 0.0
-        if T1 is None:
-            T1 = self.T1 * 1e6
-
         thermal_excitation = self.xy_analyzer.calculate_thermal_excitation(
             gamma_up=self.Gamma_up,
             gamma_down=self.Gamma_down,
@@ -1444,6 +1465,9 @@ class RNoiseDecoherence(Decoherence):
         noise_prop (str): Noise propagation mode, default 'single'
         T_setup (np.ndarray): Temperature setup [K], default [290, 45, 3.5, 0.9, 0.1, 0.01]
         attenuation_setup (np.ndarray): Attenuation setup [dB], default [10, 3, 10, 10, 0, 0]
+        read_freq (float): Readout frequency [Hz]. When omitted, a scalar or
+            singleton `psd_freq` is used as `self.read_freq`; multi-point
+            `psd_freq` falls back to 6.5 GHz.
         qubit_freq (float): Qubit frequency [Hz], default 5e9
         qubit_freq_max (float): Maximum qubit frequency [Hz], default equals qubit_freq
         qubit_anharm (float): Anharmonicity [Hz], default -250e6
@@ -1452,13 +1476,13 @@ class RNoiseDecoherence(Decoherence):
         is_spectral (bool): Whether to use spectral analysis, default True
     
     Key Methods:
-        cal_readcavity_psd(kappa, chi, read_freq, noise_freq) -> np.ndarray
+        cal_readcavity_psd(kappa, chi, noise_freq) -> np.ndarray
             Calculate effective frequency noise PSD induced by cavity
             
-        cal_read_dephase(kappa, chi, experiment, read_freq, delay_list, N, len_pi) -> np.ndarray
+        cal_read_dephase(kappa, chi, experiment, delay_list, N, len_pi) -> np.ndarray
             Calculate dephasing decay curve P(t)
             
-        cal_read_tphi(kappa, method, chi, read_freq, experiment, delay_list, is_plot, is_print) -> TphiResult
+        cal_read_tphi(kappa, method, chi, experiment, delay_list, is_plot, is_print) -> TphiResult
             Calculate Tphi [s] limited by readout cavity noise
             - kappa: Cavity linewidth [Hz] (required for calculation)
             - chi: Dispersive shift [Hz], defaults to couple_term
@@ -1486,6 +1510,7 @@ class RNoiseDecoherence(Decoherence):
         *args,
         couple_term: float = 1e6,
         kappa: float = 6e6,
+        read_freq: float = None,
         r_analyzer_builder: Optional[Callable[..., object]] = None,
         **kwargs,
     ):
@@ -1494,6 +1519,12 @@ class RNoiseDecoherence(Decoherence):
         self.kappa = kappa
         self._r_analyzer_builder = r_analyzer_builder or ReadoutCavityAnalyzer
         super().__init__(*args, couple_term=couple_term, couple_type=couple_type, **kwargs)
+        if read_freq is None:
+            psd_freq_values = np.asarray(self.psd_freq, dtype=float).ravel()
+            read_freq = float(psd_freq_values[0]) if psd_freq_values.size == 1 else 6.5e9
+        self.read_freq = float(read_freq)
+        if not np.isfinite(self.read_freq) or self.read_freq <= 0:
+            raise ValueError("read_freq must be a positive finite frequency in Hz.")
         self.r_analyzer = self._build_r_analyzer()
         self.n_bar = self.cal_nbar(is_print=self._default_is_print)
 
@@ -1504,7 +1535,7 @@ class RNoiseDecoherence(Decoherence):
         self,
         kappa: float = None,
         chi: float = None,
-        read_freq: float = 6.5e9,
+        read_freq: float = None,
         is_print: bool = True,
         heat_temperature_k: Optional[float] = None,
     ) -> float:
@@ -1514,7 +1545,8 @@ class RNoiseDecoherence(Decoherence):
         Args:
             kappa (float): Cavity linewidth [rad/s] (required)
             chi (float): Dispersive shift [rad/s] (required)
-            read_freq (float): Readout frequency [Hz] (required)
+            read_freq (float): Optional readout frequency [Hz]. When omitted,
+                `self.read_freq` is used.
             heat_temperature_k (float, optional): Additional heat-source
                 temperature combined with the chain PSD by equal-weight
                 spectral averaging.
@@ -1526,6 +1558,13 @@ class RNoiseDecoherence(Decoherence):
             kappa = self.kappa
         if chi is None:
             chi = self.chi
+        if read_freq is None:
+            read_freq = self.read_freq
+        else:
+            read_freq = float(read_freq)
+            if not np.isfinite(read_freq) or read_freq <= 0:
+                raise ValueError("read_freq must be a positive finite frequency in Hz.")
+            self.read_freq = read_freq
 
         nbar_kwargs = {
             'noise_output': self.noise.output_stage,
@@ -1533,9 +1572,7 @@ class RNoiseDecoherence(Decoherence):
         }
         if heat_temperature_k is not None:
             nbar_kwargs['heat_temperature_k'] = heat_temperature_k
-        self.n_bar = self.r_analyzer.calculate_nbar(
-            **nbar_kwargs,
-        )
+        self.n_bar = self.r_analyzer.calculate_nbar(**nbar_kwargs)
         if is_print:
             self._emit_report(
                 format_readout_nbar_report(
@@ -1547,14 +1584,215 @@ class RNoiseDecoherence(Decoherence):
             )
         return self.n_bar
 
-    def cal_readcavity_psd(self, kappa: float = None, chi: float = None, read_freq: float = 6.5e9, noise_freq: np.ndarray = None) -> np.ndarray:
+    def cal_room_noise_floor(
+        self,
+        measured_output_temperature: float = None,
+        *,
+        measured_nbar: float = None,
+        read_freq: float = None,
+        T_setup: np.ndarray = None,
+        attenuation_setup: np.ndarray = None,
+        R: float = 50,
+        is_print: bool = True,
+    ) -> dict[str, object]:
+        """Infer the room-temperature input noise floor from output noise.
+
+        The chain inversion mirrors the existing `S_transmission` convention
+        used by `ElectronicNoise`, so the internal affine calculation uses
+        double-sided current PSD:
+        `S_out_double = chain_gain * S_in_double + chain_added_noise_double`.
+        The returned room-temperature noise floor is reported in the usual
+        single-sided dBm/Hz convention, with explicit double-sided fields kept
+        for auditability. Provide exactly one of `measured_output_temperature`
+        in K or `measured_nbar` at `read_freq`. When `read_freq` is omitted,
+        `self.read_freq` is used.
+
+        Returns:
+            dict: Key intermediate values and the inferred room input floor.
+        """
+        if (measured_output_temperature is None) == (measured_nbar is None):
+            raise ValueError(
+                "Provide exactly one of measured_output_temperature or measured_nbar."
+            )
+
+        if read_freq is None:
+            read_freq = self.read_freq
+        else:
+            read_freq = float(read_freq)
+            if not np.isfinite(read_freq) or read_freq <= 0:
+                raise ValueError("read_freq must be a positive finite frequency in Hz.")
+
+        resistance = float(R)
+        if not np.isfinite(resistance) or resistance <= 0:
+            raise ValueError("R must be a positive finite resistance in ohms.")
+
+        temperatures = np.asarray(
+            self.T_setup if T_setup is None else T_setup,
+            dtype=float,
+        ).ravel()
+        attenuations_db = np.asarray(
+            self.attenuation_setup if attenuation_setup is None else attenuation_setup,
+            dtype=float,
+        ).ravel()
+
+        if temperatures.size == 0:
+            raise ValueError("T_setup must contain at least one stage.")
+        if temperatures.size != attenuations_db.size:
+            raise ValueError("T_setup and attenuation_setup must have the same length.")
+        if not np.all(np.isfinite(temperatures)) or np.any(temperatures < 0):
+            raise ValueError("T_setup must contain finite non-negative temperatures.")
+        if not np.all(np.isfinite(attenuations_db)) or np.any(attenuations_db < 0):
+            raise ValueError("attenuation_setup must contain finite non-negative dB values.")
+
+        if measured_nbar is not None:
+            output_nbar = float(measured_nbar)
+            if not np.isfinite(output_nbar) or output_nbar < 0:
+                raise ValueError("measured_nbar must be finite and non-negative.")
+            output_temperature = (
+                0.0
+                if output_nbar == 0
+                else float(nbar2temp(output_nbar, read_freq))
+            )
+            source = "nbar"
+        else:
+            output_temperature = float(measured_output_temperature)
+            if not np.isfinite(output_temperature) or output_temperature < 0:
+                raise ValueError(
+                    "measured_output_temperature must be finite and non-negative."
+                )
+            output_nbar = (
+                0.0
+                if output_temperature == 0
+                else float(temp2nbar(output_temperature, read_freq))
+            )
+            source = "temperature"
+
+        attenuation_linear = 10 ** (-attenuations_db / 10)
+        chain_gain = float(attenuation_linear[0])
+        chain_added_noise = float(T2Sii_Double(temperatures[0], read_freq, R=resistance))
+        stage_added_noises = [chain_added_noise]
+
+        for stage_idx in range(1, temperatures.size):
+            stage_gain = float(attenuation_linear[stage_idx])
+            stage_thermal_noise = float(
+                T2Sii_Double(temperatures[stage_idx], read_freq, R=resistance)
+            )
+            chain_added_noise = (
+                stage_gain * chain_added_noise
+                + (1 - stage_gain) * stage_thermal_noise
+            )
+            chain_gain *= stage_gain
+            stage_added_noises.append(chain_added_noise)
+
+        output_psd = float(T2Sii_Double(output_temperature, read_freq, R=resistance))
+        if output_psd < chain_added_noise and not np.isclose(
+            output_psd,
+            chain_added_noise,
+            rtol=1e-12,
+            atol=0.0,
+        ):
+            with np.errstate(invalid="ignore", divide="ignore"):
+                model_floor_temperature = float(
+                    Sii2T_Double(chain_added_noise, read_freq, R=resistance)
+                )
+            raise ValueError(
+                "measured output noise is below the configured chain thermal floor: "
+                f"measured {output_temperature:.6g} K, "
+                f"chain floor {model_floor_temperature:.6g} K."
+            )
+
+        if chain_gain <= 0:
+            raise ValueError("Total attenuation underflowed to zero; cannot invert chain.")
+
+        input_psd = max(0.0, (output_psd - chain_added_noise) / chain_gain)
+        output_psd_single = max(
+            0.0,
+            float(Sii_D2S(output_psd, read_freq, R=resistance)),
+        )
+        input_psd_single = max(
+            0.0,
+            float(Sii_D2S(input_psd, read_freq, R=resistance)),
+        )
+        chain_added_noise_single = max(
+            0.0,
+            float(Sii_D2S(chain_added_noise, read_freq, R=resistance)),
+        )
+        stage_added_noises_single = tuple(
+            max(0.0, float(Sii_D2S(value, read_freq, R=resistance)))
+            for value in stage_added_noises
+        )
+
+        if input_psd == 0:
+            input_temperature = 0.0
+        else:
+            with np.errstate(invalid="ignore", divide="ignore"):
+                input_temperature = float(
+                    Sii2T_Double(input_psd, read_freq, R=resistance)
+                )
+        input_noise_floor_double_dbm = (
+            -np.inf
+            if input_psd == 0
+            else float(Sii_A2dBm(input_psd, R=resistance))
+        )
+        input_noise_floor_single_dbm = (
+            -np.inf
+            if input_psd_single == 0
+            else float(Sii_A2dBm(input_psd_single, R=resistance))
+        )
+        with np.errstate(invalid="ignore", divide="ignore"):
+            model_floor_temperature = float(
+                Sii2T_Double(chain_added_noise, read_freq, R=resistance)
+            )
+
+        result = {
+            "source": source,
+            "internal_psd_convention": "double-sided current PSD",
+            "room_noise_floor_convention": "single-sided current PSD",
+            "read_freq_Hz": read_freq,
+            "output_nbar": output_nbar,
+            "output_noise_temperature_K": output_temperature,
+            "output_psd_double_A2_per_Hz": output_psd,
+            "output_psd_single_A2_per_Hz": output_psd_single,
+            "input_psd_double_A2_per_Hz": input_psd,
+            "input_psd_single_A2_per_Hz": input_psd_single,
+            "input_noise_temperature_K": input_temperature,
+            "input_noise_floor_dBm_per_Hz": input_noise_floor_single_dbm,
+            "input_noise_floor_single_dBm_per_Hz": input_noise_floor_single_dbm,
+            "input_noise_floor_double_dBm_per_Hz": input_noise_floor_double_dbm,
+            "chain_gain_linear": chain_gain,
+            "total_attenuation_dB": float(np.sum(attenuations_db)),
+            "chain_added_noise_psd_double_A2_per_Hz": chain_added_noise,
+            "chain_added_noise_psd_single_A2_per_Hz": chain_added_noise_single,
+            "chain_floor_temperature_K": model_floor_temperature,
+            "stage_added_noise_psd_double_A2_per_Hz": tuple(stage_added_noises),
+            "stage_added_noise_psd_single_A2_per_Hz": stage_added_noises_single,
+        }
+        self.room_noise_floor_result = result
+
+        if is_print:
+            self._emit_report(
+                (
+                    "--- Readout Room Noise Floor Inference ---",
+                    f"Input source: {source}, readout frequency: {read_freq:.6e} Hz",
+                    f"Measured output: T = {output_temperature:.6e} K, nbar = {output_nbar:.6e}",
+                    f"Chain attenuation: {result['total_attenuation_dB']:.2f} dB, gain = {chain_gain:.6e}",
+                    f"Chain thermal floor: {model_floor_temperature:.6e} K",
+                    f"Room input temperature: {input_temperature:.6e} K",
+                    f"Room input noise floor (single-sided): {input_noise_floor_single_dbm:.3f} dBm/Hz",
+                    f"Room input noise floor (double-sided): {input_noise_floor_double_dbm:.3f} dBm/Hz",
+                ),
+                is_print=True,
+            )
+
+        return result
+
+    def cal_readcavity_psd(self, kappa: float = None, chi: float = None, noise_freq: np.ndarray = None) -> np.ndarray:
         """
         Calculate single-sided PSD of effective qubit frequency noise induced by thermal photons.
         
         Args:
             kappa (float): Cavity linewidth [rad/s] (required)
             chi (float, optional): Dispersive shift [rad/s], defaults to couple_term*2*pi
-            read_freq (float, optional): Readout frequency [Hz], default 6.5e9
             noise_freq (np.ndarray, optional): Noise frequency array [Hz], default log-spaced from 10^-2 to 2*kappa
         
         Returns:
@@ -1582,7 +1820,7 @@ class RNoiseDecoherence(Decoherence):
             len_pi=len_pi,
         )
     
-    def cal_read_dephase(self, kappa: float = None, chi: float = None, experiment: str = 'Ramsey', read_freq: float = 6.5e9, delay_list: np.ndarray = np.linspace(10, 10e3, 100)*1e-9, N: int = 100, len_pi: float = 100e-9) -> float:
+    def cal_read_dephase(self, kappa: float = None, chi: float = None, experiment: str = 'Ramsey', delay_list: np.ndarray = np.linspace(10, 10e3, 100)*1e-9, N: int = 100, len_pi: float = 100e-9) -> float:
         """
         Calculate dephasing time Tphi limited by readout cavity thermal photons.
         
@@ -1590,7 +1828,6 @@ class RNoiseDecoherence(Decoherence):
             kappa (float): Cavity linewidth [rad/s] (required)
             chi (float, optional): Dispersive shift [rad/s], defaults to couple_term*2*pi
             experiment (str, optional): The experiment type. Defaults to 'Ramsey'.
-            read_freq (float, optional): Readout frequency [Hz], default 6.5e9
             delay_list (np.ndarray, optional): Delay time array [s], default linspace from 10 to 10e3
             N (int, optional): Number of pulse blocks for CPMG, default 100
             len_pi (float, optional): Finite width of each pulse [s], default 100e-9
@@ -1636,8 +1873,8 @@ class RNoiseDecoherence(Decoherence):
             fit_diagnostics=diagnostics,
         )
 
-    def cal_read_tphi(self, kappa: float = None, method: str = 'cal', chi: float = None, 
-                      read_freq: float = 6.5e9, noise_freq: np.ndarray = None, 
+    def cal_read_tphi(self, kappa: float = None, method: str = 'cal', chi: float = None,
+                      read_freq: float = None, noise_freq: np.ndarray = None,
                       experiment: str = 'Ramsey', 
                       delay_list: np.ndarray = np.linspace(10, 10e3, 100)*1e-9, 
                       N: int = 100, len_pi: float = 100e-9,
@@ -1650,7 +1887,9 @@ class RNoiseDecoherence(Decoherence):
             kappa (float): The noise characteristic frequency (or decay rate) in [Hz].
             method (str, optional): The method to use for calculation. Defaults to 'cal'.
             chi (float, optional): The dispersive shift in [Hz]. Defaults to None.
-            read_freq (float, optional): The readout frequency. Defaults to 6.5e9.
+            read_freq (float, optional): Optional readout frequency [Hz]. When
+                omitted, `self.read_freq` is used. Providing a value refreshes
+                `self.n_bar` for that frequency before calculating Tphi.
             noise_freq (np.ndarray, optional): The noise frequency array. Defaults to None.
             experiment (str, optional): The experiment type. Defaults to 'Ramsey'.
             delay_list (np.ndarray, optional): The delay list array. Defaults to np.linspace(10, 10e3, 100)*1e-9.
@@ -1672,13 +1911,15 @@ class RNoiseDecoherence(Decoherence):
         kappa_hz = self.kappa if kappa is None else kappa
         chi = chi_hz * 2*pi
         kappa = kappa_hz * 2*pi
-
-        if heat_temperature_k is not None:
-            self.cal_nbar(
-                read_freq=read_freq,
-                is_print=False,
-                heat_temperature_k=heat_temperature_k,
-            )
+        if read_freq is not None or heat_temperature_k is not None:
+            nbar_kwargs = {
+                'read_freq': read_freq,
+                'is_print': False,
+            }
+            if heat_temperature_k is not None:
+                nbar_kwargs['heat_temperature_k'] = heat_temperature_k
+            self.cal_nbar(**nbar_kwargs)
+        read_freq = self.read_freq
 
         if method == 'cal':
             self.tphi_rc = self.r_analyzer.calculate_tphi_cal(
@@ -1707,13 +1948,12 @@ class RNoiseDecoherence(Decoherence):
             return result
 
         elif method == 'fit':
-            self.cal_readcavity_psd(kappa=kappa, chi=chi, read_freq=read_freq, noise_freq=noise_freq)
+            self.cal_readcavity_psd(kappa=kappa, chi=chi, noise_freq=noise_freq)
             
             p1_list = self.cal_read_dephase(
                 kappa=kappa,
                 chi=chi,
                 experiment=experiment, 
-                read_freq=read_freq, 
                 delay_list=delay_list,
                 N=N,
                 len_pi=len_pi,

@@ -19,14 +19,19 @@ def estimate_coupler_limited_qubit_t1(
     coupler_participation: float,
     coupler_count: int = 1,
 ) -> T1Result:
-    """Estimate the qubit T1 limit from identical independent coupler losses.
+    """Estimate a qubit T1 limit from independent, identical couplers.
 
     ``coupler_participation`` is the dressed-qubit energy participation of one
     coupler. Independent decay rates add as
     ``gamma_total = coupler_count * coupler_participation / coupler_t1_s``.
     """
-    coupler_t1_s = float(coupler_t1_s)
-    coupler_participation = float(coupler_participation)
+    try:
+        coupler_t1_s = float(coupler_t1_s)
+        coupler_participation = float(coupler_participation)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            'coupler_t1_s and coupler_participation must be numeric.'
+        ) from exc
 
     if not np.isfinite(coupler_t1_s) or coupler_t1_s <= 0:
         raise ValueError('coupler_t1_s must be a finite positive number.')
@@ -71,8 +76,7 @@ def estimate_coupler_limited_qubit_t1_combined(
     """Combine gate/off coupler T1 limits by adding independent rates.
 
     One coupler is assumed to be at the gate operating point and the remaining
-    ``couplers_per_qubit - 1`` couplers are at the coupling-off operating point:
-    ``gamma_total = 1 / t1_gate_s + (N - 1) / t1_off_s``.
+    ``couplers_per_qubit - 1`` couplers are at the coupling-off operating point.
     Infinite single-coupler T1 values contribute zero rate.
     """
     try:
@@ -80,10 +84,11 @@ def estimate_coupler_limited_qubit_t1_combined(
         t1_off_s = float(t1_off_s)
     except (TypeError, ValueError) as exc:
         raise ValueError('t1_gate_s and t1_off_s must be numeric.') from exc
-    if any(np.isnan(value) or value <= 0 for value in (t1_gate_s, t1_off_s)):
-        raise ValueError('t1_gate_s and t1_off_s must be positive numbers.')
-    if any(np.isinf(value) and value < 0 for value in (t1_gate_s, t1_off_s)):
-        raise ValueError('t1_gate_s and t1_off_s must not be negative infinity.')
+
+    for label, value in (('t1_gate_s', t1_gate_s), ('t1_off_s', t1_off_s)):
+        if np.isnan(value) or value <= 0 or (np.isinf(value) and value < 0):
+            raise ValueError(f'{label} must be a positive number.')
+
     if isinstance(couplers_per_qubit, (bool, np.bool_)) or not isinstance(
         couplers_per_qubit,
         (int, np.integer),
@@ -317,11 +322,15 @@ class XYRelaxationAnalyzer:
         *,
         gamma_up: float,
         gamma_down: float,
-        t1_us: float,
+        t1_us: float | None,
     ) -> tuple[float, float]:
-        gamma_t1 = 1 / (t1_us * 1e-6)
+        gamma_down_actual = (
+            1 / (t1_us * 1e-6)
+            if t1_us is not None
+            else 1 / 100e-6
+        )
         return (
-            gamma_up / gamma_t1,
+            gamma_up / (gamma_up + gamma_down_actual),
             gamma_up / (gamma_up + gamma_down),
         )
 
@@ -373,17 +382,26 @@ class ReadoutCavityAnalyzer:
         read_freq: float,
         heat_temperature_k: float | None = None,
     ) -> float:
-        chain_temperature_k = float(noise_output.white_noise_temperature)
+        chain_temperature_k = np.asarray(
+            noise_output.white_noise_temperature,
+            dtype=float,
+        )
+        if chain_temperature_k.ndim == 0:
+            chain_temperature_k = float(chain_temperature_k)
         if heat_temperature_k is None:
             effective_temperature_k = chain_temperature_k
         else:
-            heat_temperature_k = float(heat_temperature_k)
+            try:
+                heat_temperature_k = float(heat_temperature_k)
+            except (TypeError, ValueError) as exc:
+                raise ValueError('heat_temperature_k must be numeric.') from exc
             if not np.isfinite(heat_temperature_k) or heat_temperature_k < 0:
                 raise ValueError('heat_temperature_k must be finite and non-negative.')
             chain_psd = T2Sii_Double(chain_temperature_k, read_freq)
             heat_psd = T2Sii_Double(heat_temperature_k, read_freq)
-            effective_temperature_k = float(
-                Sii2T_Double(0.5 * (chain_psd + heat_psd), read_freq)
+            effective_temperature_k = Sii2T_Double(
+                0.5 * (chain_psd + heat_psd),
+                read_freq,
             )
         return temp2nbar(effective_temperature_k, read_freq)
 
