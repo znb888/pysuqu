@@ -11,6 +11,8 @@ the place to decide which public guide or reference to open next.
   imports, and a minimal usage example
 - [guides/transmission-chains.md](guides/transmission-chains.md) for AWG-to-qubit
   propagation, Touchstone models, MIMO chains, and derivative precorrection
+- [guides/sweeps.md](guides/sweeps.md) for the public single- and multi-qubit
+  flux sweep helpers and their result boundaries
 - [guides/propagation-backends.md](guides/propagation-backends.md) for prepared
   propagation, native acceleration, backend selection, and reproducible benchmarks
 - [guides/acceleration-caches.md](guides/acceleration-caches.md) for gate, waveform,

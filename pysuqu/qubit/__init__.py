@@ -19,10 +19,12 @@ from .circuit import (
     calculate_loaded_multiport_response,
     calculate_loaded_multiport_wave_response,
     calculate_loaded_single_port_response,
+    estimate_drive_line_t1_ns,
     evaluate_loaded_touchstone_multiport_wave_response,
     evaluate_touchstone_multiport_output_block,
     resolve_multi_load_reflection_response,
     resolve_load_reflection_response,
+    transmon_effective_capacitance_from_ec,
 )
 from ..funclib.transmission import (
     AttenuatorStage,
@@ -74,8 +76,16 @@ from .propagation import (
 from ..funclib.awgenerator import WaveformCache
 from .solver import HamiltonianEvo
 from .single import FloatingTransmon, GroundedTransmon, SingleQubitBase
-from .sweeps import sweep_single_qubit_energy_vs_flux
-from .types import FluxSpec, SpectrumResult
+from .sweeps import (
+    sweep_multi_qubit_coupling_strength_vs_flux,
+    sweep_multi_qubit_coupling_strength_vs_flux_result,
+    sweep_multi_qubit_energy_vs_flux,
+    sweep_multi_qubit_energy_vs_flux_result,
+    sweep_single_qubit_energy_vs_flux,
+    sweep_single_qubit_energy_vs_flux_base,
+    sweep_single_qubit_energy_vs_flux_base_result,
+)
+from .types import CouplingResult, FluxSpec, SpectrumResult, SweepResult
 
 __all__ = [
     'AbstractQubit',
@@ -85,6 +95,7 @@ __all__ = [
     'BundleTransmissionChain',
     'BundleTransmissionResult',
     'ChannelSchedule',
+    'CouplingResult',
     'DelayStage',
     'DerivativePrecorrectionDesign',
     'DerivativePrecorrectionStage',
@@ -116,7 +127,7 @@ __all__ = [
     'SingleQubitBase',
     'SingleQubitSpectrum',
     'SpectrumResult',
-    'sweep_single_qubit_energy_vs_flux',
+    'SweepResult',
     'TouchstoneNetwork',
     'TouchstoneStage',
     'TransferFunctionStage',
@@ -139,6 +150,7 @@ __all__ = [
     'design_derivative_precorrection',
     'design_inverse_fir_from_touchstone',
     'estimate_control_line_mutual_inductance',
+    'estimate_drive_line_t1_ns',
     'estimate_mutual_inductance_from_kf',
     'evaluate_loaded_touchstone_multiport_wave_response',
     'evaluate_touchstone_multiport_output_block',
@@ -150,4 +162,12 @@ __all__ = [
     'pi',
     'resolve_multi_load_reflection_response',
     'resolve_load_reflection_response',
+    'sweep_multi_qubit_coupling_strength_vs_flux',
+    'sweep_multi_qubit_coupling_strength_vs_flux_result',
+    'sweep_multi_qubit_energy_vs_flux',
+    'sweep_multi_qubit_energy_vs_flux_result',
+    'sweep_single_qubit_energy_vs_flux',
+    'sweep_single_qubit_energy_vs_flux_base',
+    'sweep_single_qubit_energy_vs_flux_base_result',
+    'transmon_effective_capacitance_from_ec',
 ]
