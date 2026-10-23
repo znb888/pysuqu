@@ -62,6 +62,27 @@ assert callable(thermal_photon)
         result = run_python(script)
         self.assertEqual(result.returncode, 0, msg=result.stderr)
 
+    def test_package_root_reexports_predistortion_helpers_without_shadowing_stages(self):
+        script = """
+import pysuqu.funclib as funclib
+from pysuqu.funclib import predistortion, transmission
+
+# The transmission-chain stages must keep winning over the older declarations
+# in ``predistortion``, otherwise the public stage classes change identity.
+assert funclib.FIRFilterStage is transmission.FIRFilterStage
+assert funclib.DerivativePrecorrectionStage is transmission.DerivativePrecorrectionStage
+assert (
+    funclib.DerivativePrecorrectionDesign is transmission.DerivativePrecorrectionDesign
+)
+
+# Names that only ``predistortion`` provides are still reachable.
+for name in ('fit_touchstone_rational', 'design_sampled_fir_inverse', 'apply_stage_sequence'):
+    assert hasattr(funclib, name), name
+    assert getattr(funclib, name) is getattr(predistortion, name), name
+"""
+        result = run_python(script)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+
     def test_awgenerator_non_plotting_helpers_work_without_plotly(self):
         script = f"""
 import importlib.abc

@@ -7,9 +7,15 @@ from importlib import import_module
 from .mathlib import *
 from .noisemodel import *
 
+# ``predistortion`` predates the transmission-chain stages and still declares
+# names such as ``FIRFilterStage`` and ``DerivativePrecorrectionStage``.  It is
+# imported first on purpose so the transmission-chain definitions installed
+# afterwards keep winning, while the predistortion-only helpers become
+# reachable through ``pysuqu.funclib``.
 _OPTIONAL_SUBMODULES = (
     '.qutiplib',
     '.awgenerator',
+    '.predistortion',
     '.transmission',
     '.interfile',
 )
