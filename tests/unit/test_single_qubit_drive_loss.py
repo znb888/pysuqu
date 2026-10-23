@@ -10,6 +10,7 @@ install_test_stubs()
 
 from pysuqu.qubit.single import (
     RLINE,
+    FloatingTransmon,
     Phi0,
     SingleQubitBase,
     e,
@@ -82,7 +83,6 @@ class SingleQubitDriveLossTests(unittest.TestCase):
         self.assertTrue(np.isinf(t1_drive))
 
 
-
 class SingleQubitDriveStrengthTests(unittest.TestCase):
     """Pin the reported drive strengths to their documented MHz convention."""
 
@@ -142,6 +142,26 @@ class SingleQubitDriveStrengthTests(unittest.TestCase):
 
         np.testing.assert_allclose(ind_plus_cap, [ind_strength, cap_strength])
         np.testing.assert_allclose(cap_plus_ind, [cap_strength, ind_strength])
+
+
+class FloatingTransmonDriveCouplingTests(unittest.TestCase):
+    def test_effective_drive_coupling_weights_both_nodes_by_their_capacitance(self):
+        qubit = object.__new__(FloatingTransmon)
+        qubit._capac = np.array([[2.0e-15, 0.2e-15], [0.2e-15, 6.0e-15]], dtype=float)
+        cd1, cd2 = 3.0e-17, 9.0e-17
+
+        expected = (6.0e-15 * cd1 - cd2 * 2.0e-15) / (2.0e-15 + 6.0e-15)
+        self.assertAlmostEqual(qubit.get_drive_couple_capac(cd1, cd2), expected)
+
+    def test_effective_drive_coupling_is_zero_for_balanced_ratios(self):
+        qubit = object.__new__(FloatingTransmon)
+        qubit._capac = np.array([[2.0e-15, 0.2e-15], [0.2e-15, 6.0e-15]], dtype=float)
+
+        self.assertAlmostEqual(
+            qubit.get_drive_couple_capac(1.0e-17, 3.0e-17),
+            0.0,
+            places=30,
+        )
 
 
 if __name__ == '__main__':

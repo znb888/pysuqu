@@ -471,6 +471,17 @@ class FloatingTransmon(SingleQubitBase):
         self.change_para(capac=origin_para[0], resis=origin_para[1])
         return result.x
 
+    def get_drive_couple_capac(self, Cd1: float, Cd2: float) -> float:
+        """Return the effective drive-line coupling for two measured couplings.
+
+        ``Cd1`` and ``Cd2`` are the couplings seen from the two floating nodes
+        to the drive line.  The returned value is the single capacitance that
+        reproduces the same net drive coupling for this capacitor network.
+        """
+        C1 = self._capac[0, 0]
+        C2 = self._capac[1, 1]
+        return (C2*Cd1 - Cd2*C1) / (C1 + C2)
+
 __all__ = [
     'FloatingTransmon',
     'GroundedTransmon',
