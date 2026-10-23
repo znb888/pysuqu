@@ -1,7 +1,18 @@
 """Stable public exports for the qubit package."""
 
 from .analysis import SingleQubitSpectrum, analyze_single_qubit_spectrum
-from .base import AbstractQubit, ParameterizedQubit, Phi0, pi
+from .base import (
+    AbstractQubit,
+    ParameterizedQubit,
+    Phi0,
+    bias_from_control_frequency,
+    control_frequency_from_bias,
+    control_frequency_slope,
+    estimate_control_line_mutual_inductance,
+    estimate_mutual_inductance_from_kf,
+    fit_mz,
+    pi,
+)
 from .circuit import (
     LoadedMultiportWaveResponse,
     TransmonReflectionModel,
@@ -117,16 +128,22 @@ __all__ = [
     'WaveformCache',
     'apply_derivative_precorrection',
     'analyze_single_qubit_spectrum',
+    'bias_from_control_frequency',
     'calculate_loaded_multiport_response',
     'calculate_loaded_multiport_wave_response',
     'calculate_loaded_single_port_response',
     'clear_native_plan_cache',
     'compute_derivative_basis',
+    'control_frequency_from_bias',
+    'control_frequency_slope',
     'design_derivative_precorrection',
     'design_inverse_fir_from_touchstone',
+    'estimate_control_line_mutual_inductance',
+    'estimate_mutual_inductance_from_kf',
     'evaluate_loaded_touchstone_multiport_wave_response',
     'evaluate_touchstone_multiport_output_block',
     'evaluate_touchstone_response',
+    'fit_mz',
     'load_touchstone_network',
     'native_backend_available',
     'native_plan_cache_info',

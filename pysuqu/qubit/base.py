@@ -2331,3 +2331,313 @@ class AbstractQubit(QubitBase):
             print(f"---------------------------")
 
         return Ec_final, Ej_final
+
+_DEFAULT_FLUX_MODEL_MIN_FREQUENCY_GHZ = 0.24026087
+
+
+def _scalar_or_array(value):
+    """Keep scalar helper calls scalar while retaining array vectorisation."""
+    array = np.asarray(value)
+    return array.item() if array.ndim == 0 else array
+
+
+def _validate_flux_model_parameters(max_frequency, flux_per_bias, minimum_frequency):
+    if not np.isfinite(max_frequency) or not np.isfinite(flux_per_bias):
+        raise ValueError('max_frequency and flux_per_bias must be finite.')
+    if not np.isfinite(minimum_frequency) or max_frequency <= minimum_frequency:
+        raise ValueError('max_frequency must be greater than minimum_frequency.')
+    if flux_per_bias == 0:
+        raise ValueError('flux_per_bias must be non-zero.')
+
+
+def control_frequency_from_bias(
+    bias,
+    max_frequency,
+    bias_offset,
+    flux_per_bias,
+    minimum_frequency=_DEFAULT_FLUX_MODEL_MIN_FREQUENCY_GHZ,
+):
+    """Evaluate the fitted SQUID-like frequency-versus-bias model.
+
+    All frequency arguments use the same unit; GHz is the normal ``pysuqu``
+    convention.  ``flux_per_bias`` (the fitted ``kf``) is in Phi0 per bias
+    unit, for example Phi0/V when ``bias`` is a voltage.
+    """
+    max_frequency = float(max_frequency)
+    bias_offset = float(bias_offset)
+    flux_per_bias = float(flux_per_bias)
+    minimum_frequency = float(minimum_frequency)
+    _validate_flux_model_parameters(max_frequency, flux_per_bias, minimum_frequency)
+
+    phase = np.pi * flux_per_bias * (np.asarray(bias, dtype=float) - bias_offset)
+    frequency = (max_frequency - minimum_frequency) * np.sqrt(np.abs(np.cos(phase)))
+    return _scalar_or_array(frequency + minimum_frequency)
+
+
+def bias_from_control_frequency(
+    frequency,
+    max_frequency,
+    bias_offset,
+    flux_per_bias,
+    minimum_frequency=_DEFAULT_FLUX_MODEL_MIN_FREQUENCY_GHZ,
+):
+    """Invert :func:`control_frequency_from_bias` on its principal branch."""
+    max_frequency = float(max_frequency)
+    bias_offset = float(bias_offset)
+    flux_per_bias = float(flux_per_bias)
+    minimum_frequency = float(minimum_frequency)
+    _validate_flux_model_parameters(max_frequency, flux_per_bias, minimum_frequency)
+
+    ratio = (np.asarray(frequency, dtype=float) - minimum_frequency) / (
+        max_frequency - minimum_frequency
+    )
+    tolerance = 1e-12
+    if np.any(ratio < -tolerance) or np.any(ratio > 1 + tolerance):
+        raise ValueError(
+            'frequency must lie between minimum_frequency and max_frequency '
+            'for the principal inverse branch.'
+        )
+    ratio = np.clip(ratio, 0.0, 1.0)
+    bias = np.arccos(ratio**2) / (np.pi * flux_per_bias) + bias_offset
+    return _scalar_or_array(bias)
+
+def control_frequency_slope(
+    bias,
+    max_frequency,
+    bias_offset,
+    flux_per_bias,
+    minimum_frequency=_DEFAULT_FLUX_MODEL_MIN_FREQUENCY_GHZ,
+):
+    """Return ``d f / d bias`` for the fitted frequency model.
+
+    The result has units of the chosen frequency unit per bias unit.  The
+    derivative includes the sign of the fitted branch and is therefore useful
+    for signed mutual-inductance estimates.
+    """
+    max_frequency = float(max_frequency)
+    bias_offset = float(bias_offset)
+    flux_per_bias = float(flux_per_bias)
+    minimum_frequency = float(minimum_frequency)
+    _validate_flux_model_parameters(max_frequency, flux_per_bias, minimum_frequency)
+
+    phase = np.pi * flux_per_bias * (np.asarray(bias, dtype=float) - bias_offset)
+    cosine = np.cos(phase)
+    denominator = np.sqrt(np.abs(cosine))
+    numerator = -0.5 * np.pi * flux_per_bias * (max_frequency - minimum_frequency) * np.sin(phase)
+    # The ideal model has a divergent slope at a zero of cos(phase).  Return
+    # the mathematically appropriate infinity there instead of a NaN from 0/0.
+    with np.errstate(divide='ignore', invalid='ignore'):
+        slope = np.divide(
+            numerator * np.sign(cosine),
+            denominator,
+            out=np.full_like(denominator, np.inf, dtype=float),
+            where=denominator > 0,
+        )
+    return _scalar_or_array(slope)
+
+
+def _frequency_scale_to_hz(unit):
+    key = str(unit).lower().replace(' ', '').replace('_', '')
+    scales = {'hz': 1.0, 'khz': 1e3, 'mhz': 1e6, 'ghz': 1e9}
+    try:
+        return scales[key]
+    except KeyError as exc:
+        raise ValueError("frequency_unit must be 'Hz', 'kHz', 'MHz', or 'GHz'.") from exc
+
+
+def _unpack_sensitivity_input(sensitivity):
+    """Accept a scalar or ``AbstractQubit``'s ``(sensitivity, f_current)`` tuple."""
+    if hasattr(sensitivity, 'sensitivity_value'):
+        sensitivity = sensitivity.sensitivity_value
+    if isinstance(sensitivity, (tuple, list)):
+        if len(sensitivity) != 2:
+            raise TypeError(
+                'sensitivity tuple must be (sensitivity, f_current), '
+                'as returned by AbstractQubit.calculate_sensitivity_at_detuning().'
+            )
+        return sensitivity[0], sensitivity[1]
+    return sensitivity, None
+
+
+def _sensitivity_to_hz_per_phi0(sensitivity, unit):
+    sensitivity, _ = _unpack_sensitivity_input(sensitivity)
+    value = float(sensitivity)
+    if not np.isfinite(value):
+        raise ValueError('sensitivity must be finite.')
+
+    key = str(unit).lower().replace(' ', '').replace('_', '')
+    if key in {'ghz/phi0', 'ghzperphi0', 'ghz/phi_0'}:
+        return value * 1e9
+    if key in {'hz/phi0', 'hzperphi0', 'hz/phi_0'}:
+        return value
+    if key in {'rad/s/phi0', 'rad/sperphi0', 'rads/phi0'}:
+        return value / (2 * np.pi)
+    if key in {'rad/s/wb', 'rads/wb', 'radpersecondperwb'}:
+        return value * Phi0 / (2 * np.pi)
+    raise ValueError(
+        "sensitivity_unit must be 'GHz/Phi0', 'Hz/Phi0', "
+        "'rad/s/Phi0', or 'rad/s/Wb'."
+    )
+
+
+def estimate_control_line_mutual_inductance(
+    frequency_slope,
+    sensitivity,
+    *,
+    frequency_unit='GHz',
+    sensitivity_unit='GHz/Phi0',
+    attenuation_db=0.0,
+    line_impedance=50.0,
+    endpoint_factor=2.0,
+):
+    """Estimate control-line mutual inductance from a measured frequency slope.
+
+    ``frequency_slope`` is ``df/dV_source`` referenced to the voltage before
+    the attenuator (the same source-side convention as an electronics bias
+    coordinate ``z``).  Positive ``attenuation_db`` converts that source-side
+    slope to the device-line current.  ``endpoint_factor=2`` reproduces the
+    usual incident-wave to open-end voltage convention; set it to 1 when the
+    voltage is already calibrated at the device end.
+
+    The conversion is performed in SI units, so a ``pysuqu`` sensitivity of
+    ``GHz/Phi0`` is converted to Hz/Phi0 without introducing an extra 2*pi.
+    ``2*pi`` is only used for angular sensitivity inputs.
+    """
+    frequency_slope = float(frequency_slope)
+    attenuation_db = float(attenuation_db)
+    line_impedance = float(line_impedance)
+    endpoint_factor = float(endpoint_factor)
+    if not np.isfinite(frequency_slope):
+        raise ValueError('frequency_slope must be finite.')
+    if not np.isfinite(attenuation_db):
+        raise ValueError('attenuation_db must be finite.')
+    if not np.isfinite(line_impedance) or line_impedance <= 0:
+        raise ValueError('line_impedance must be a positive finite value.')
+    if not np.isfinite(endpoint_factor) or endpoint_factor == 0:
+        raise ValueError('endpoint_factor must be finite and non-zero.')
+
+    slope_hz_per_v = frequency_slope * _frequency_scale_to_hz(frequency_unit)
+    sensitivity_hz_per_phi0 = _sensitivity_to_hz_per_phi0(sensitivity, sensitivity_unit)
+    if sensitivity_hz_per_phi0 == 0:
+        raise ValueError('sensitivity must be non-zero.')
+
+    attenuation_voltage_ratio = 10 ** (attenuation_db / 20)
+    flux_per_source_volt = (
+        slope_hz_per_v / sensitivity_hz_per_phi0
+        * attenuation_voltage_ratio
+        / endpoint_factor
+    )
+    return float(flux_per_source_volt * line_impedance * Phi0)
+
+
+def estimate_mutual_inductance_from_kf(
+    kf,
+    *,
+    bias_voltage_per_unit=1.0,
+    attenuation_db=0.0,
+    line_impedance=50.0,
+    endpoint_factor=2.0,
+):
+    """Estimate mutual inductance directly from a fitted ``kf``.
+
+    ``kf`` is the fitted flux conversion in Phi0 per bias unit.  When the fit
+    variable is an AWG-normalised coordinate, ``bias_voltage_per_unit`` is the
+    measured ``dV/dz``.  This direct route is useful when spectroscopy already
+    provides ``kf`` and no separate frequency sensitivity is needed.
+    """
+    kf = float(kf)
+    bias_voltage_per_unit = float(bias_voltage_per_unit)
+    attenuation_db = float(attenuation_db)
+    if not np.isfinite(kf):
+        raise ValueError('kf must be finite.')
+    if not np.isfinite(attenuation_db):
+        raise ValueError('attenuation_db must be finite.')
+    if not np.isfinite(bias_voltage_per_unit) or bias_voltage_per_unit == 0:
+        raise ValueError('bias_voltage_per_unit must be finite and non-zero.')
+    line_impedance = float(line_impedance)
+    endpoint_factor = float(endpoint_factor)
+    if not np.isfinite(line_impedance) or line_impedance <= 0:
+        raise ValueError('line_impedance must be a positive finite value.')
+    if not np.isfinite(endpoint_factor) or endpoint_factor == 0:
+        raise ValueError('endpoint_factor must be finite and non-zero.')
+    attenuation_voltage_ratio = 10 ** (attenuation_db / 20)
+    return float(
+        kf
+        / bias_voltage_per_unit
+        * attenuation_voltage_ratio
+        / endpoint_factor
+        * line_impedance
+        * Phi0
+    )
+
+
+def fit_mz(
+    coef_now,
+    sensitivity=None,
+    att_total=28.0,
+    *,
+    delta_select=None,
+    dVdz=1.0,
+    frequency_unit='GHz',
+    sensitivity_unit='GHz/Phi0',
+    line_impedance=50.0,
+    endpoint_factor=2.0,
+):
+    """Compatibility wrapper estimating ``M`` at a selected detuning.
+
+    ``coef_now`` is ``(max_f01, biasOffset, kf, fah)`` in one consistent
+    frequency unit.  Unlike the legacy snippet, the sensitivity is explicit;
+    pass ``ParameterizedQubit.calculate_sensitivity_at_detuning()`` directly
+    (a ``(sensitivity, f_current)`` tuple in ``GHz/Phi0`` and GHz), or pass
+    only its first element and declare its unit with ``sensitivity_unit``.
+    """
+    if sensitivity is None:
+        raise ValueError(
+            'sensitivity is required; pass the pysuqu value in GHz/Phi0 '
+            "or specify sensitivity_unit for another unit."
+        )
+    sensitivity, operating_frequency_ghz = _unpack_sensitivity_input(sensitivity)
+    if len(coef_now) != 4:
+        raise ValueError('coef_now must contain (max_f01, biasOffset, kf, fah).')
+    max_f01, bias_offset, kf, fah = map(float, coef_now)
+    if delta_select is None:
+        if operating_frequency_ghz is not None:
+            # AbstractQubit returns f_current in GHz.  Evaluate the fitted
+            # curve at the same point as the supplied sensitivity.
+            selected_frequency = (
+                float(operating_frequency_ghz)
+                * _frequency_scale_to_hz('GHz')
+                / _frequency_scale_to_hz(frequency_unit)
+            )
+        else:
+            # Scalar sensitivities retain the historical 500 MHz detuning.
+            delta_select = 0.5 * _frequency_scale_to_hz(frequency_unit) / 1e9
+            selected_frequency = max_f01 - float(delta_select)
+    else:
+        selected_frequency = max_f01 - float(delta_select)
+    workbias = bias_from_control_frequency(
+        selected_frequency,
+        max_f01,
+        bias_offset,
+        kf,
+        fah,
+    )
+    slope_per_bias = control_frequency_slope(
+        workbias,
+        max_f01,
+        bias_offset,
+        kf,
+        fah,
+    )
+    dVdz = float(dVdz)
+    if not np.isfinite(dVdz) or dVdz == 0:
+        raise ValueError('dVdz must be finite and non-zero.')
+    return estimate_control_line_mutual_inductance(
+        slope_per_bias / dVdz,
+        sensitivity,
+        frequency_unit=frequency_unit,
+        sensitivity_unit=sensitivity_unit,
+        attenuation_db=att_total,
+        line_impedance=line_impedance,
+        endpoint_factor=endpoint_factor,
+    )
