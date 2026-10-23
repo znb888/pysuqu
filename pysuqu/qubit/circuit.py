@@ -14,6 +14,8 @@ from ..funclib.transmission import (
     OutOfBandPolicy,
     TouchstoneInterpolation,
     TouchstoneNetwork,
+    TouchstoneStage,
+    _enforce_real_self_conjugate_bins,
     evaluate_touchstone_response,
     load_touchstone_network,
 )
@@ -513,6 +515,49 @@ def resolve_load_reflection_response(
     return resolved_array
 
 
+def resolve_effective_load_reflection_response(
+    frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    load_reflections: MultiLoadReflectionSpec,
+    round_trip_delays_ns: Union[float, Sequence[float], np.ndarray] = 0.0,
+    num_outputs: int,
+) -> np.ndarray:
+    """
+    Resolve the diagonal entries of ``Gamma_eff(f)`` for multiple terminated loads.
+
+    The effective loop factor for output/load ``j`` is
+
+    ``Gamma_eff_j(f) = Gamma_load_j(f) * exp(-i 2pi f tau_j)``.
+
+    Args:
+        frequencies_ghz: Scalar or array-like frequency grid in GHz.
+        load_reflections: Single reflection spec to broadcast, an already
+            resolved complex array, or one reflection spec per output port.
+        round_trip_delays_ns: Scalar delay to broadcast or one delay per output
+            port, in ns.
+        num_outputs: Number of output ports / loads being solved together.
+
+    Returns:
+        Complex array with shape ``(num_outputs, *frequencies_ghz.shape)`` whose
+        rows are the diagonal entries of ``Gamma_eff`` in output-port order.
+    """
+    freq = np.asarray(frequencies_ghz, dtype=np.float64)
+    gamma_load = resolve_multi_load_reflection_response(
+        freq,
+        load_reflections=load_reflections,
+        num_outputs=num_outputs,
+    )
+    delays_ns = _normalize_per_output_values(
+        round_trip_delays_ns,
+        num_outputs=num_outputs,
+        name="round_trip_delays_ns",
+    )
+    delay_phase = np.exp(
+        -2j * pi * delays_ns.reshape((num_outputs,) + (1,) * freq.ndim) * freq
+    )
+    return gamma_load * delay_phase
+
+
 def calculate_loaded_single_port_response(
     frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
     *,
@@ -775,6 +820,133 @@ def calculate_loaded_multiport_wave_response(
     )
 
 
+def decompose_loaded_single_port_bounces(
+    frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    forward_response: Union[complex, np.ndarray, Sequence[complex]],
+    output_reflection_response: Union[complex, np.ndarray, Sequence[complex]],
+    load_reflection: LoadReflectionSpec,
+    num_bounces: int,
+    round_trip_delay_ns: float = 0.0,
+) -> list[np.ndarray]:
+    """
+    Return the first ``num_bounces`` reflected arrivals of the one-port series.
+
+    Each returned term corresponds to one extra loop through the load/filter
+    reflection cavity:
+
+    ``bounce_n = H_forward * (S_oo * Gamma_load * exp(-i 2pi f tau_rt))**n``
+
+    Args:
+        frequencies_ghz: Frequency grid in GHz.
+        forward_response: Forward response from source port to the load-side
+            port, e.g. ``S21``.
+        output_reflection_response: Return reflection of the upstream network.
+        load_reflection: Load-side reflection specification ``Gamma_load(f)``.
+        num_bounces: Number of reflected arrivals to return.
+        round_trip_delay_ns: Additional round-trip delay in ns per loop.
+
+    Returns:
+        List of complex responses, ordered from the first bounce to the last.
+    """
+    if num_bounces < 0:
+        raise ValueError("num_bounces must be non-negative.")
+    if num_bounces == 0:
+        return []
+
+    freq = np.asarray(frequencies_ghz, dtype=np.float64)
+    forward = np.asarray(forward_response, dtype=np.complex128)
+    output_reflection = np.asarray(output_reflection_response, dtype=np.complex128)
+    if forward.shape != freq.shape or output_reflection.shape != freq.shape:
+        raise ValueError("forward_response and output_reflection_response must match frequencies_ghz shape.")
+
+    gamma_load = resolve_load_reflection_response(freq, load_reflection)
+    loop_delay = np.exp(-2j * pi * freq * float(round_trip_delay_ns))
+    loop_gain = output_reflection * gamma_load * loop_delay
+
+    return [forward * (loop_gain**bounce_idx) for bounce_idx in range(1, num_bounces + 1)]
+
+
+def decompose_loaded_multiport_bounces(
+    frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    forward_responses: np.ndarray,
+    output_reflection_matrix: np.ndarray,
+    load_reflections: MultiLoadReflectionSpec,
+    num_bounces: int,
+    round_trip_delays_ns: Union[float, Sequence[float], np.ndarray] = 0.0,
+) -> list[np.ndarray]:
+    """
+    Return the first ``num_bounces`` terminated multi-output loop contributions.
+
+    Each returned term corresponds to one extra pass through the multi-load
+    cavity:
+
+    ``bounce_n = (S_LL * Gamma_eff)^n S_Ls``
+
+    Args:
+        frequencies_ghz: Scalar or array-like frequency grid in GHz.
+        forward_responses: Complex forward column ``S[L, s]`` with shape
+            ``(n_outputs, *frequencies_ghz.shape)``.
+        output_reflection_matrix: Complex submatrix ``S[L, L]`` with shape
+            ``(n_outputs, n_outputs, *frequencies_ghz.shape)``.
+        load_reflections: Single reflection spec to broadcast, an already
+            resolved complex array, or one reflection spec per output port.
+        num_bounces: Number of bounce terms to return, starting from ``n=1``.
+        round_trip_delays_ns: Scalar delay to broadcast or one delay per output
+            port, in ns.
+
+    Returns:
+        List of complex bounce arrays. Every element has shape
+        ``(n_outputs, *frequencies_ghz.shape)`` and follows the same output-port
+        order as ``forward_responses``.
+    """
+    if num_bounces < 0:
+        raise ValueError("num_bounces must be non-negative.")
+    if num_bounces == 0:
+        return []
+
+    freq = np.asarray(frequencies_ghz, dtype=np.float64)
+    forward = np.asarray(forward_responses, dtype=np.complex128)
+    s_ll = np.asarray(output_reflection_matrix, dtype=np.complex128)
+    if forward.ndim < 1:
+        raise ValueError("forward_responses must include an output-port axis.")
+
+    num_outputs = int(forward.shape[0])
+    expected_forward_shape = (num_outputs,) + freq.shape
+    expected_matrix_shape = (num_outputs, num_outputs) + freq.shape
+    if forward.shape != expected_forward_shape:
+        raise ValueError(
+            "forward_responses must have shape (n_outputs, *frequencies_ghz.shape)."
+        )
+    if s_ll.shape != expected_matrix_shape:
+        raise ValueError(
+            "output_reflection_matrix must have shape "
+            "(n_outputs, n_outputs, *frequencies_ghz.shape)."
+        )
+
+    gamma_eff = resolve_effective_load_reflection_response(
+        freq,
+        load_reflections=load_reflections,
+        round_trip_delays_ns=round_trip_delays_ns,
+        num_outputs=num_outputs,
+    )
+    current = forward.reshape(num_outputs, -1)
+    s_ll_flat = s_ll.reshape(num_outputs, num_outputs, -1)
+    gamma_eff_flat = gamma_eff.reshape(num_outputs, -1)
+
+    bounce_terms: list[np.ndarray] = []
+    for _ in range(num_bounces):
+        current = np.einsum(
+            "ijf,jf->if",
+            s_ll_flat,
+            gamma_eff_flat * current,
+            optimize=True,
+        )
+        bounce_terms.append(current.reshape(expected_forward_shape).copy())
+    return bounce_terms
+
+
 def evaluate_touchstone_multiport_output_block(
     query_frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
     *,
@@ -823,6 +995,123 @@ def evaluate_touchstone_multiport_output_block(
     return forward, s_ll
 
 
+def evaluate_loaded_touchstone_response(
+    query_frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    file_path: Union[str, Path, None] = None,
+    network: TouchstoneNetwork | None = None,
+    input_port: int = 1,
+    output_port: int = 2,
+    reflection_port: int | None = None,
+    load_reflection: LoadReflectionSpec = 1.0 + 0.0j,
+    round_trip_delay_ns: float = 0.0,
+    interpolation: TouchstoneInterpolation = "polar",
+    out_of_band: OutOfBandPolicy = "edge",
+) -> np.ndarray:
+    """
+    Evaluate a loaded forward path using measured Touchstone data plus ``Gamma_load``.
+
+    Args:
+        query_frequencies_ghz: Frequency grid in GHz.
+        file_path: Touchstone file to load when ``network`` is not provided.
+        network: Optional preloaded Touchstone network.
+        input_port: One-based source port index for the forward path.
+        output_port: One-based destination port index for the forward path.
+        reflection_port: One-based output-side port index used for the return
+            reflection. Defaults to ``output_port``.
+        load_reflection: Load-side reflection specification ``Gamma_load(f)``.
+        round_trip_delay_ns: Additional round-trip delay in ns per loop.
+        interpolation: Complex interpolation mode used between measured samples.
+        out_of_band: Policy for frequencies outside the measured span.
+
+    Returns:
+        Complex loaded forward response on the requested grid.
+    """
+    if network is None:
+        if file_path is None:
+            raise ValueError("evaluate_loaded_touchstone_response requires either file_path or network.")
+        network = load_touchstone_network(file_path)
+
+    reflection_port = int(output_port if reflection_port is None else reflection_port)
+    freq = np.asarray(query_frequencies_ghz, dtype=np.float64)
+    forward = evaluate_touchstone_response(
+        freq,
+        network=network,
+        input_port=input_port,
+        output_port=output_port,
+        interpolation=interpolation,
+        out_of_band=out_of_band,
+    )
+    output_reflection = evaluate_touchstone_response(
+        freq,
+        network=network,
+        input_port=reflection_port,
+        output_port=reflection_port,
+        interpolation=interpolation,
+        out_of_band=out_of_band,
+    )
+    return calculate_loaded_single_port_response(
+        freq,
+        forward_response=np.asarray(forward, dtype=np.complex128),
+        output_reflection_response=np.asarray(output_reflection, dtype=np.complex128),
+        load_reflection=load_reflection,
+        round_trip_delay_ns=round_trip_delay_ns,
+    )
+
+
+def evaluate_loaded_touchstone_multiport_response(
+    query_frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    output_ports: Sequence[int],
+    load_reflections: MultiLoadReflectionSpec = 1.0 + 0.0j,
+    round_trip_delays_ns: Union[float, Sequence[float], np.ndarray] = 0.0,
+    file_path: Union[str, Path, None] = None,
+    network: TouchstoneNetwork | None = None,
+    input_port: int = 1,
+    interpolation: TouchstoneInterpolation = "polar",
+    out_of_band: OutOfBandPolicy = "edge",
+) -> np.ndarray:
+    """
+    Evaluate the loaded forward vector for several terminated output ports.
+
+    Args:
+        query_frequencies_ghz: Frequency grid in GHz.
+        output_ports: One-based output-port indices defining the ordered load
+            set ``L``.
+        load_reflections: Single reflection spec to broadcast, an already
+            resolved complex array, or one reflection spec per output port.
+        round_trip_delays_ns: Scalar delay to broadcast or one delay per output
+            port, in ns.
+        file_path: Touchstone file to load when ``network`` is not provided.
+        network: Optional preloaded Touchstone network.
+        input_port: One-based source port index ``s`` used for ``S[L, s]``.
+        interpolation: Complex interpolation mode used between measured samples.
+        out_of_band: Policy for frequencies outside the measured span.
+
+    Returns:
+        Complex loaded forward responses with shape
+        ``(len(output_ports), *query_frequencies_ghz.shape)``. The first axis
+        follows the order of ``output_ports`` so callers can index one output at
+        a time.
+    """
+    forward, s_ll = evaluate_touchstone_multiport_output_block(
+        query_frequencies_ghz,
+        output_ports=output_ports,
+        file_path=file_path,
+        network=network,
+        input_port=input_port,
+        interpolation=interpolation,
+        out_of_band=out_of_band,
+    )
+    return calculate_loaded_multiport_response(
+        query_frequencies_ghz,
+        forward_responses=forward,
+        output_reflection_matrix=s_ll,
+        load_reflections=load_reflections,
+        round_trip_delays_ns=round_trip_delays_ns,
+    )
+
+
 def evaluate_loaded_touchstone_multiport_wave_response(
     query_frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
     *,
@@ -854,3 +1143,193 @@ def evaluate_loaded_touchstone_multiport_wave_response(
         round_trip_delays_ns=round_trip_delays_ns,
         return_coupling=return_coupling,
     )
+
+def evaluate_loaded_touchstone_bounces(
+    query_frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    num_bounces: int,
+    file_path: Union[str, Path, None] = None,
+    network: TouchstoneNetwork | None = None,
+    input_port: int = 1,
+    output_port: int = 2,
+    reflection_port: int | None = None,
+    load_reflection: LoadReflectionSpec = 1.0 + 0.0j,
+    round_trip_delay_ns: float = 0.0,
+    interpolation: TouchstoneInterpolation = "polar",
+    out_of_band: OutOfBandPolicy = "edge",
+) -> list[np.ndarray]:
+    """
+    Evaluate the first few loaded-bounce terms from a measured Touchstone network.
+
+    Args:
+        query_frequencies_ghz: Frequency grid in GHz.
+        num_bounces: Number of reflected arrivals to return.
+        file_path: Touchstone file to load when ``network`` is not provided.
+        network: Optional preloaded Touchstone network.
+        input_port: One-based source port index for the forward path.
+        output_port: One-based destination port index for the forward path.
+        reflection_port: One-based output-side port index used for the return
+            reflection. Defaults to ``output_port``.
+        load_reflection: Load-side reflection specification ``Gamma_load(f)``.
+        round_trip_delay_ns: Additional round-trip delay in ns per loop.
+        interpolation: Complex interpolation mode used between measured samples.
+        out_of_band: Policy for frequencies outside the measured span.
+
+    Returns:
+        List of complex bounce responses.
+    """
+    if network is None:
+        if file_path is None:
+            raise ValueError("evaluate_loaded_touchstone_bounces requires either file_path or network.")
+        network = load_touchstone_network(file_path)
+
+    reflection_port = int(output_port if reflection_port is None else reflection_port)
+    freq = np.asarray(query_frequencies_ghz, dtype=np.float64)
+    forward = evaluate_touchstone_response(
+        freq,
+        network=network,
+        input_port=input_port,
+        output_port=output_port,
+        interpolation=interpolation,
+        out_of_band=out_of_band,
+    )
+    output_reflection = evaluate_touchstone_response(
+        freq,
+        network=network,
+        input_port=reflection_port,
+        output_port=reflection_port,
+        interpolation=interpolation,
+        out_of_band=out_of_band,
+    )
+    return decompose_loaded_single_port_bounces(
+        freq,
+        forward_response=np.asarray(forward, dtype=np.complex128),
+        output_reflection_response=np.asarray(output_reflection, dtype=np.complex128),
+        load_reflection=load_reflection,
+        num_bounces=num_bounces,
+        round_trip_delay_ns=round_trip_delay_ns,
+    )
+
+def evaluate_loaded_touchstone_multiport_bounces(
+    query_frequencies_ghz: Union[float, np.ndarray, Sequence[float]],
+    *,
+    output_ports: Sequence[int],
+    num_bounces: int,
+    load_reflections: MultiLoadReflectionSpec = 1.0 + 0.0j,
+    round_trip_delays_ns: Union[float, Sequence[float], np.ndarray] = 0.0,
+    file_path: Union[str, Path, None] = None,
+    network: TouchstoneNetwork | None = None,
+    input_port: int = 1,
+    interpolation: TouchstoneInterpolation = "polar",
+    out_of_band: OutOfBandPolicy = "edge",
+) -> list[np.ndarray]:
+    """
+    Evaluate the first few terminated multi-output bounce vectors from Touchstone data.
+
+    Args:
+        query_frequencies_ghz: Frequency grid in GHz.
+        output_ports: One-based output-port indices defining the ordered load
+            set ``L``.
+        num_bounces: Number of bounce terms to return, starting from ``n=1``.
+        load_reflections: Single reflection spec to broadcast, an already
+            resolved complex array, or one reflection spec per output port.
+        round_trip_delays_ns: Scalar delay to broadcast or one delay per output
+            port, in ns.
+        file_path: Touchstone file to load when ``network`` is not provided.
+        network: Optional preloaded Touchstone network.
+        input_port: One-based source port index ``s`` used for ``S[L, s]``.
+        interpolation: Complex interpolation mode used between measured samples.
+        out_of_band: Policy for frequencies outside the measured span.
+
+    Returns:
+        List of bounce arrays. Every element has shape
+        ``(len(output_ports), *query_frequencies_ghz.shape)`` and follows the
+        same output-port order as ``output_ports``.
+    """
+    forward, s_ll = evaluate_touchstone_multiport_output_block(
+        query_frequencies_ghz,
+        output_ports=output_ports,
+        file_path=file_path,
+        network=network,
+        input_port=input_port,
+        interpolation=interpolation,
+        out_of_band=out_of_band,
+    )
+    return decompose_loaded_multiport_bounces(
+        query_frequencies_ghz,
+        forward_responses=forward,
+        output_reflection_matrix=s_ll,
+        load_reflections=load_reflections,
+        num_bounces=num_bounces,
+        round_trip_delays_ns=round_trip_delays_ns,
+    )
+
+
+@dataclass
+class LoadedTouchstoneStage(TouchstoneStage):
+    """
+    Touchstone stage that closes the output port with a frequency-dependent load.
+
+    This stage turns one measured forward path plus one load reflection model
+    into an effective loaded transfer function:
+
+    ``S_loaded = S_forward / (1 - S_reflect * Gamma_load * exp(-i 2pi f tau_rt))``
+
+    It is especially useful for qubit-end simulations where the filter response
+    is measured as Touchstone data and the final transmon acts as the load.
+
+    Args:
+        load_reflection: Load-side reflection specification ``Gamma_load(f)``.
+        reflection_port: One-based output-side port used for the return
+            reflection. Defaults to ``output_port``.
+        round_trip_delay_ns: Additional round-trip delay in ns per loop.
+        All other arguments follow ``TouchstoneStage``.
+
+    The response cache of ``TouchstoneStage`` is disabled by default because a
+    callable load can change without the stage fields changing; enable it only
+    when the load specification is immutable.
+    """
+
+    load_reflection: LoadReflectionSpec = 1.0 + 0.0j
+    reflection_port: int | None = None
+    round_trip_delay_ns: float = 0.0
+    response_cache_size: int = 0
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self.reflection_port = int(
+            self.output_port if self.reflection_port is None else self.reflection_port
+        )
+        self.network.get_response(self.reflection_port, self.reflection_port)
+
+    def _evaluate_loaded_response(self, query_freq: np.ndarray) -> np.ndarray:
+        return evaluate_loaded_touchstone_response(
+            query_freq,
+            network=self.network,
+            input_port=self.input_port,
+            output_port=self.output_port,
+            reflection_port=self.reflection_port,
+            load_reflection=self.load_reflection,
+            round_trip_delay_ns=self.round_trip_delay_ns,
+            interpolation=self.interpolation,
+            out_of_band=self.out_of_band,
+        )
+
+    def _evaluate_response(self, trace, freq_axis: np.ndarray) -> np.ndarray:
+        if trace.domain == "iq_complex":
+            base_freq = trace.lo_freq if self.frequency_mode == "absolute" else 0.0
+            return self._evaluate_loaded_response(base_freq + freq_axis)
+
+        positive_response = self._evaluate_loaded_response(np.abs(freq_axis))
+        response = np.asarray(positive_response, dtype=np.complex128)
+        negative_mask = freq_axis < 0
+        response[negative_mask] = np.conj(response[negative_mask])
+        return _enforce_real_self_conjugate_bins(response, freq_axis)
+
+    def describe(self) -> str:
+        """Return a compact summary of the loaded Touchstone path."""
+        file_name = Path(self.file_path).name if self.file_path else "network"
+        return (
+            f"{self.name}[S{self.output_port}{self.input_port}, "
+            f"S{self.reflection_port}{self.reflection_port}, {file_name}]"
+        )

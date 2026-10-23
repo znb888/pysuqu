@@ -10,7 +10,11 @@ install_test_stubs()
 
 import pysuqu.qubit.base as base_module
 from pysuqu.qubit import circuit
-from pysuqu.funclib.transmission import TouchstoneNetwork
+from pysuqu.funclib.transmission import (
+    SignalTrace,
+    TouchstoneNetwork,
+    _next_fft_length,
+)
 from pysuqu.qubit.base import ParameterizedQubit
 
 
@@ -329,6 +333,75 @@ class QubitCircuitModuleTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(actual, expected)
+
+    def test_loaded_touchstone_helpers_and_stage_share_same_closed_loop_response(self):
+        frequencies = np.array([4.8, 5.0, 5.2], dtype=float)
+        s_parameters = np.zeros((3, 2, 2), dtype=np.complex128)
+        s_parameters[:, 1, 0] = np.array([0.8 + 0.0j, 0.7 + 0.1j, 0.75 - 0.05j])
+        s_parameters[:, 1, 1] = np.array([0.25 + 0.0j, 0.20 - 0.03j, 0.22 + 0.01j])
+        network = TouchstoneNetwork(frequencies=frequencies, s_parameters=s_parameters)
+        model = circuit.TransmonReflectionModel(
+            resonance_freq_ghz=5.0,
+            external_t1_ns=3000.0,
+            internal_t1_ns=6000.0,
+        )
+
+        stage = circuit.LoadedTouchstoneStage(
+            network=network,
+            input_port=1,
+            output_port=2,
+            reflection_port=2,
+            load_reflection=model,
+            round_trip_delay_ns=0.25,
+            name="loaded_filter",
+            domain="iq_complex",
+        )
+        impulse = np.zeros(4, dtype=np.complex128)
+        impulse[0] = 1.0
+        trace = SignalTrace(
+            t_axis=np.arange(len(impulse), dtype=float),
+            values=impulse,
+            sample_rate=float(len(impulse)),
+            domain="iq_complex",
+            plane="awg_iq",
+            lo_freq=5.0,
+            label="impulse",
+        )
+
+        fft_length = _next_fft_length(len(impulse))
+        freq_axis = np.fft.fftfreq(fft_length, d=1.0 / trace.sample_rate)
+        stage_response = stage._evaluate_response(trace, freq_axis)
+        expected_response = circuit.evaluate_loaded_touchstone_response(
+            trace.lo_freq + freq_axis,
+            network=network,
+            input_port=1,
+            output_port=2,
+            reflection_port=2,
+            load_reflection=model,
+            round_trip_delay_ns=0.25,
+        )
+
+        np.testing.assert_allclose(stage_response, expected_response, atol=1e-10, rtol=1e-10)
+
+    def test_loaded_touchstone_bounces_match_closed_loop_partial_sum(self):
+        frequencies = np.array([5.0, 5.1], dtype=float)
+        forward = np.array([0.7 + 0.1j, 0.6 - 0.02j])
+        output_reflection = np.array([0.2 + 0.0j, 0.25 - 0.01j])
+        load_reflection = 0.4 - 0.1j
+
+        bounces = circuit.decompose_loaded_single_port_bounces(
+            frequencies,
+            forward_response=forward,
+            output_reflection_response=output_reflection,
+            load_reflection=load_reflection,
+            num_bounces=4,
+            round_trip_delay_ns=0.0,
+        )
+        total_partial = forward + np.sum(np.stack(bounces, axis=0), axis=0)
+        loop = output_reflection * load_reflection
+        expected_partial = forward * (1.0 - loop**5) / (1.0 - loop)
+
+        np.testing.assert_allclose(total_partial, expected_partial)
 
     def test_circuit_module_builds_retain_nodes_and_extracts_reduced_flux(self):
         struct = [1, 2, 1]
