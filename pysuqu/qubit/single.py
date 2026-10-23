@@ -129,7 +129,7 @@ class SingleQubitBase(ParameterizedQubit):
         drive_voltage: the voltage amplitude of drive signal. 
         coupl_capac: the coupling capacitance between qubit and drive line. 
         '''
-        C_strength = coupl_capac*drive_voltage*(8*self.Ej[0,0]*self.Ec[0,0]**3)**(1/4)/e
+        C_strength = coupl_capac*drive_voltage*(8*self.Ej[0,0]*self.Ec[0,0]**3)**(1/4)/e/2/pi
         freq = self.f01*1e9*2*pi
         T1_c = self._capacitive_drive_t1(freq, self._effective_mode_capacitance(), coupl_capac)
         
@@ -150,7 +150,9 @@ class SingleQubitBase(ParameterizedQubit):
         coupl_induc: the coupling inductance between qubit and drive line. 
         '''
         current = drive_voltage/RLINE
-        I_strength = 2*pi*coupl_induc*current*(2*self.Ec[0,0]*self.Ej[0,0]**3)**(1/4)/Phi0
+        # The GHz radian convention is already carried by the frequency axis, so
+        # the phase conversion must not add another 2*pi here.
+        I_strength = coupl_induc*current*(2*self.Ec[0,0]*self.Ej[0,0]**3)**(1/4)/Phi0
         freq = self.f01*1e9*2*pi
         T1_i = self._inductive_drive_t1(freq, self._effective_mode_capacitance(), coupl_induc)
         
@@ -173,26 +175,26 @@ class SingleQubitBase(ParameterizedQubit):
         '''
         if mode == 'ind':
             current = voltage_amp/RLINE
-            I_strength = 2*pi*coupl_term*current*(2*self.Ec[0,0]*self.Ej[0,0]**3)**(1/4)/Phi0*1e3
-            print(f'Capac_coupling drive_strength: {I_strength} MHz')
+            I_strength = coupl_term*current*(2*self.Ec[0,0]*self.Ej[0,0]**3)**(1/4)/Phi0*1e3
+            print(f'Induc_coupling drive_strength: {I_strength} MHz')
             return I_strength
         
         elif mode == 'cap':
-            C_strength = coupl_term*voltage_amp*(8*self.Ej[0,0]*self.Ec[0,0]**3)**(1/4)/e*1e3
-            print(f'Induc_coupling drive_strength: {C_strength} MHz')
+            C_strength = coupl_term*voltage_amp*(8*self.Ej[0,0]*self.Ec[0,0]**3)**(1/4)/e/2/pi*1e3
+            print(f'Capac_coupling drive_strength: {C_strength} MHz')
             return C_strength
         
         elif mode == 'ind+cap':
             current = voltage_amp/RLINE
-            I_strength = 2*pi*coupl_term[0]*current*(2*self.Ec[0,0]*self.Ej[0,0]**3)**(1/4)/Phi0*1e3
-            C_strength = coupl_term[1]*voltage_amp*(8*self.Ej[0,0]*self.Ec[0,0]**3)**(1/4)/e*1e3
+            I_strength = coupl_term[0]*current*(2*self.Ec[0,0]*self.Ej[0,0]**3)**(1/4)/Phi0*1e3
+            C_strength = coupl_term[1]*voltage_amp*(8*self.Ej[0,0]*self.Ec[0,0]**3)**(1/4)/e/2/pi*1e3
             print(f'Induc_coupling drive_strength: {I_strength} MHz\nCapac_coupling drive_strength: {C_strength} MHz')
             return [I_strength, C_strength]
             
         elif mode == 'cap+ind':
             current = voltage_amp/RLINE
-            I_strength = 2*pi*coupl_term[1]*current*(2*self.Ec[0,0]*self.Ej[0,0]**3)**(1/4)/Phi0*1e3
-            C_strength = coupl_term[0]*voltage_amp*(8*self.Ej[0,0]*self.Ec[0,0]**3)**(1/4)/e*1e3
+            I_strength = coupl_term[1]*current*(2*self.Ec[0,0]*self.Ej[0,0]**3)**(1/4)/Phi0*1e3
+            C_strength = coupl_term[0]*voltage_amp*(8*self.Ej[0,0]*self.Ec[0,0]**3)**(1/4)/e/2/pi*1e3
             print(f'Capac_coupling drive_strength: {C_strength} MHz\nInduc_coupling drive_strength: {I_strength} MHz')
             return [C_strength, I_strength]
 

@@ -8,7 +8,14 @@ from tests.support import install_test_stubs
 
 install_test_stubs()
 
-from pysuqu.qubit.single import RLINE, SingleQubitBase, e, hbar, pi
+from pysuqu.qubit.single import (
+    RLINE,
+    Phi0,
+    SingleQubitBase,
+    e,
+    hbar,
+    pi,
+)
 
 
 class SingleQubitDriveLossTests(unittest.TestCase):
@@ -73,6 +80,68 @@ class SingleQubitDriveLossTests(unittest.TestCase):
         self.assertTrue(np.isinf(t1_i))
         self.assertTrue(np.isinf(t1_c))
         self.assertTrue(np.isinf(t1_drive))
+
+
+
+class SingleQubitDriveStrengthTests(unittest.TestCase):
+    """Pin the reported drive strengths to their documented MHz convention."""
+
+    @staticmethod
+    def _bare_single_qubit(f01=5.2, ec=0.28, ej=18.0):
+        qubit = object.__new__(SingleQubitBase)
+        qubit.f01 = f01
+        qubit.Ec = np.array([[ec]], dtype=float)
+        qubit.Ej = np.array([[ej]], dtype=float)
+        qubit._capac = np.array([[1e-6]], dtype=float)
+        return qubit
+
+    def test_capacitive_strength_reports_angular_frequency_in_mhz(self):
+        qubit = self._bare_single_qubit()
+        voltage_amp = 1e-3
+        coupl_capac = 2.0e-16
+
+        with redirect_stdout(StringIO()):
+            strength = qubit.drive_strength(voltage_amp, coupl_capac, mode='cap')
+
+        expected = (
+            coupl_capac * voltage_amp
+            * (8 * qubit.Ej[0, 0] * qubit.Ec[0, 0] ** 3) ** (1 / 4)
+            / e / (2 * pi) * 1e3
+        )
+        np.testing.assert_allclose(strength, expected)
+
+    def test_inductive_strength_does_not_add_an_extra_two_pi(self):
+        qubit = self._bare_single_qubit()
+        voltage_amp = 1e-3
+        coupl_induc = 1.0e-12
+
+        with redirect_stdout(StringIO()):
+            strength = qubit.drive_strength(voltage_amp, coupl_induc, mode='ind')
+
+        expected = (
+            coupl_induc * (voltage_amp / RLINE)
+            * (2 * qubit.Ec[0, 0] * qubit.Ej[0, 0] ** 3) ** (1 / 4)
+            / Phi0 * 1e3
+        )
+        np.testing.assert_allclose(strength, expected)
+
+    def test_combined_modes_keep_the_cap_and_ind_order(self):
+        qubit = self._bare_single_qubit()
+        voltage_amp = 1e-3
+        coupl_induc, coupl_capac = 1.0e-12, 2.0e-16
+
+        with redirect_stdout(StringIO()):
+            cap_strength = qubit.drive_strength(voltage_amp, coupl_capac, mode='cap')
+            ind_strength = qubit.drive_strength(voltage_amp, coupl_induc, mode='ind')
+            ind_plus_cap = qubit.drive_strength(
+                voltage_amp, (coupl_induc, coupl_capac), mode='ind+cap'
+            )
+            cap_plus_ind = qubit.drive_strength(
+                voltage_amp, (coupl_capac, coupl_induc), mode='cap+ind'
+            )
+
+        np.testing.assert_allclose(ind_plus_cap, [ind_strength, cap_strength])
+        np.testing.assert_allclose(cap_plus_ind, [cap_strength, ind_strength])
 
 
 if __name__ == '__main__':
