@@ -219,6 +219,71 @@ class ZTphi2MultiPsdPlotTests(unittest.TestCase):
         finally:
             plt.close(figure)
 
+    def test_many_psd_series_use_distinct_colors_and_external_legend(self):
+        delay_list = np.array([1.0e-6, 2.0e-6, 3.0e-6])
+        series = {
+            f'condition-{index:02d}': {
+                'dephase': np.array([0.95, 0.84, 0.73]) - index * 0.001,
+                'fitted_dephase': np.array([0.94, 0.83, 0.72]) - index * 0.001,
+                'tphi2': (3.0 - index * 0.05) * 1e-6,
+                'tphi2_fiterror': 0.4e-6,
+            }
+            for index in range(13)
+        }
+
+        with patch('pysuqu.decoherence.plotting.plt.show'):
+            plot_z_tphi2_multipsd_fit(
+                delay_list=delay_list,
+                series=series,
+                experiment='Ramsey',
+            )
+
+        figure = plt.gcf()
+        try:
+            axis = figure.axes[0]
+            fit_lines = axis.lines[1::2]
+            self.assertEqual(len(fit_lines), 13)
+            self.assertEqual(len({line.get_color() for line in fit_lines}), 13)
+            self.assertTrue(
+                all(
+                    axis.lines[index * 2].get_color() == fit_lines[index].get_color()
+                    for index in range(13)
+                )
+            )
+            legend_bbox = axis.get_legend().get_bbox_to_anchor().transformed(
+                axis.transAxes.inverted()
+            )
+            self.assertGreater(legend_bbox.x0, 1.0)
+        finally:
+            plt.close(figure)
+
+    def test_large_psd_collection_uses_non_repeating_continuous_colors(self):
+        delay_list = np.array([1.0e-6, 2.0e-6, 3.0e-6])
+        series = {
+            f'condition-{index:02d}': {
+                'dephase': np.array([0.95, 0.84, 0.73]) - index * 0.001,
+                'fitted_dephase': np.array([0.94, 0.83, 0.72]) - index * 0.001,
+                'tphi2': (3.0 - index * 0.01) * 1e-6,
+                'tphi2_fiterror': 0.4e-6,
+            }
+            for index in range(25)
+        }
+
+        with patch('pysuqu.decoherence.plotting.plt.show'):
+            plot_z_tphi2_multipsd_fit(
+                delay_list=delay_list,
+                series=series,
+                experiment='Ramsey',
+            )
+
+        figure = plt.gcf()
+        try:
+            fit_lines = figure.axes[0].lines[1::2]
+            self.assertEqual(len(fit_lines), 25)
+            self.assertEqual(len({line.get_color() for line in fit_lines}), 25)
+        finally:
+            plt.close(figure)
+
 
 if __name__ == '__main__':
     unittest.main()

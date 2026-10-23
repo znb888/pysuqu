@@ -151,6 +151,54 @@ class NoiseModelPlottingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "No requested groups found"):
             plot_psd_groups(self.data, group_ids=["999"])
 
+    def test_plot_psd_groups_uses_unique_colors_and_external_legend_for_many_groups(self):
+        data = {
+            f"{index:03d}/dev/sample": {
+                "group_id": f"{index:03d}",
+                "label": f"group-{index:03d}",
+                "freq": self.data["000/dev/sample"]["freq"],
+                "psd": self.data["000/dev/sample"]["psd"] * (index + 1),
+            }
+            for index in range(13)
+        }
+
+        _, axis = plot_psd_groups(data)
+
+        colors = [line.get_color() for line in axis.lines]
+        self.assertEqual(len(colors), 13)
+        self.assertEqual(len(set(colors)), 13)
+        legend = axis.get_legend()
+        self.assertIsNotNone(legend)
+        legend_bbox = legend.get_bbox_to_anchor().transformed(axis.transAxes.inverted())
+        self.assertGreater(legend_bbox.x0, 1.0)
+
+    def test_plot_psd_groups_uses_a_continuous_palette_after_tab20_capacity(self):
+        data = {
+            f"{index:03d}/dev/sample": {
+                "group_id": f"{index:03d}",
+                "label": f"group-{index:03d}",
+                "freq": self.data["000/dev/sample"]["freq"],
+                "psd": self.data["000/dev/sample"]["psd"] * (index + 1),
+            }
+            for index in range(25)
+        }
+
+        _, axis = plot_psd_groups(data)
+
+        colors = [line.get_color() for line in axis.lines]
+        self.assertEqual(len(colors), 25)
+        self.assertEqual(len(set(colors)), 25)
+
+    def test_plot_psd_groups_accepts_custom_colors_and_can_hide_legend(self):
+        _, axis = plot_psd_groups(
+            self.data,
+            colors=("black", "magenta"),
+            legend=False,
+        )
+
+        self.assertEqual([line.get_color() for line in axis.lines], ["black", "magenta"])
+        self.assertIsNone(axis.get_legend())
+
 
 if __name__ == "__main__":
     unittest.main()

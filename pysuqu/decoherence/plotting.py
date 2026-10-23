@@ -74,13 +74,30 @@ def plot_z_tphi2_multipsd_fit(
     series: Mapping[str, Mapping[str, object]],
     experiment: str,
     plot_title: str = 'Multi-PSD Dephasing',
+    cmap='tab20',
+    legend_outside_threshold: int = 10,
 ) -> None:
     """Render simulated and fitted Tphi2 curves for several PSD inputs."""
-    fig, ax = plt.subplots(figsize=(10, 5.5))
+    n_series = len(series)
+    if legend_outside_threshold < 0:
+        raise ValueError('legend_outside_threshold must be non-negative.')
+    if cmap == 'tab20' and n_series > 20:
+        cmap = 'viridis'
+    color_map = plt.get_cmap(cmap)
+    colors = [
+        color_map(position)
+        for position in np.linspace(0.0, 1.0, max(n_series, 1))
+    ]
+    external_legend = n_series > legend_outside_threshold
+    figure_size = (
+        (12, max(5.5, 5.5 + 0.24 * max(0, n_series - 16)))
+        if external_legend
+        else (10, 5.5)
+    )
+    fig, ax = plt.subplots(figsize=figure_size)
     delay_us = np.asarray(delay_list) * 1e6
 
-    for index, (label, entry) in enumerate(series.items()):
-        color = f'C{index % 10}'
+    for color, (label, entry) in zip(colors, series.items()):
         ax.plot(
             delay_us,
             entry['dephase'],
@@ -105,9 +122,19 @@ def plot_z_tphi2_multipsd_fit(
     ax.set_xlabel('Delay (us)')
     ax.set_ylabel('Dephase factor')
     ax.set_title(f'{plot_title} ({experiment})')
-    ax.legend(loc='upper right', borderaxespad=0.0)
     ax.grid(alpha=0.2)
-    fig.tight_layout()
+    if series:
+        if external_legend:
+            ax.legend(
+                loc='upper left',
+                bbox_to_anchor=(1.02, 1.0),
+                borderaxespad=0.0,
+                fontsize='small',
+            )
+            fig.tight_layout(rect=(0.0, 0.0, 0.72, 1.0))
+        else:
+            ax.legend(loc='best')
+            fig.tight_layout()
     plt.show()
 
 

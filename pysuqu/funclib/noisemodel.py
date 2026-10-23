@@ -851,7 +851,14 @@ def plot_psd_groups(
     ax=None,
     title: Optional[str] = "Group PSD",
     ylabel: str = "PSD (V$^2$/Hz)",
-    group_labels: Optional[List[str]] = None
+    group_labels: Optional[Sequence[str]] = None,
+    colors: Optional[Sequence] = None,
+    cmap="tab20",
+    legend: bool = True,
+    legend_loc: Optional[str] = None,
+    legend_ncol: Optional[int] = None,
+    legend_outside_threshold: int = 10,
+    legend_kwargs: Optional[Mapping] = None,
 ):
     """Plot selected processed H5 groups on one PSD axes.
 
@@ -865,6 +872,19 @@ def plot_psd_groups(
         ax: Existing Matplotlib axes. A new axes is created when omitted.
         title: Plot title. Set to ``None`` to omit it.
         ylabel: PSD axis label.
+        group_labels: Optional labels in selected-group order.
+        colors: Optional explicit color sequence, one color per plotted group.
+        cmap: Colormap name or Matplotlib colormap used when ``colors`` is not
+            provided. The default uses ``tab20`` up to 20 groups and switches
+            to ``viridis`` for larger collections to avoid color repetition.
+        legend: Whether to add a legend.
+        legend_loc: Explicit Matplotlib legend location. When omitted, small
+            collections use ``"best"`` and large collections move outside the
+            axes.
+        legend_ncol: Explicit number of legend columns.
+        legend_outside_threshold: Move the automatic legend outside the axes
+            when the number of plotted groups exceeds this value.
+        legend_kwargs: Additional keyword arguments passed to ``ax.legend``.
 
     Returns:
         ``(figure, ax)`` with one line per selected group. The legend uses each
@@ -890,11 +910,10 @@ def plot_psd_groups(
         if not selected:
             raise ValueError(f"No requested groups found: {sorted(wanted)}")
 
-    if ax is None:
-        figure, ax = plt.subplots(figsize=(9, 5))
-    else:
-        figure = ax.figure
+    if legend_outside_threshold < 0:
+        raise ValueError("legend_outside_threshold must be non-negative.")
 
+    plot_items = []
     for sid, (sample_path, item) in enumerate(selected):
         if psd_key in item:
             psd = item[psd_key]
@@ -918,10 +937,51 @@ def plot_psd_groups(
             group_label = group_labels[sid]
         else:
             group_label = item.get("label") or f"group={item.get('group_id', sample_path)}"
+        plot_items.append(
+            (
+                frequency[mask][order],
+                values[mask][order],
+                group_label,
+            )
+        )
+
+    n_groups = len(plot_items)
+    if colors is not None:
+        line_colors = list(colors)
+        if len(line_colors) < n_groups:
+            raise ValueError(
+                f"colors must provide at least one color per plotted group; "
+                f"got {len(line_colors)} for {n_groups} groups."
+            )
+    else:
+        if cmap == "tab20" and n_groups > 20:
+            cmap = "viridis"
+        color_map = plt.get_cmap(cmap)
+        sample_points = np.linspace(0.0, 1.0, max(n_groups, 1))
+        line_colors = [color_map(point) for point in sample_points]
+
+    legend_options = dict(legend_kwargs or {})
+    has_explicit_legend_layout = any(
+        key in legend_options for key in ("loc", "bbox_to_anchor")
+    ) or legend_loc is not None
+    auto_external_legend = (
+        legend
+        and n_groups > legend_outside_threshold
+        and not has_explicit_legend_layout
+    )
+
+    if ax is None:
+        figsize = (12, 5) if auto_external_legend else (9, 5)
+        figure, ax = plt.subplots(figsize=figsize)
+    else:
+        figure = ax.figure
+
+    for (frequency, values, group_label), line_color in zip(plot_items, line_colors):
         ax.loglog(
-            frequency[mask][order],
-            values[mask][order],
+            frequency,
+            values,
             label=group_label,
+            color=line_color,
         )
 
     ax.set_xlabel("Frequency (Hz)")
@@ -929,9 +989,29 @@ def plot_psd_groups(
     if title:
         ax.set_title(title)
     ax.grid(True, which="both", alpha=0.3)
-    if ax.lines:
-        ax.legend()
-    figure.tight_layout()
+    if legend and ax.lines:
+        if legend_loc is not None:
+            legend_options.setdefault("loc", legend_loc)
+        if legend_ncol is not None:
+            legend_options.setdefault("ncol", legend_ncol)
+        if auto_external_legend:
+            legend_options.setdefault("loc", "upper left")
+            legend_options.setdefault("bbox_to_anchor", (1.02, 1.0))
+            legend_options.setdefault("borderaxespad", 0.0)
+            legend_options.setdefault("fontsize", "small")
+            if legend_ncol is None:
+                legend_options.setdefault(
+                    "ncol",
+                    max(1, min(3, int(np.ceil(len(ax.lines) / 16.0)))),
+                )
+        else:
+            legend_options.setdefault("loc", "best")
+        ax.legend(**legend_options)
+
+    if auto_external_legend:
+        figure.tight_layout(rect=(0.0, 0.0, 0.72, 1.0))
+    else:
+        figure.tight_layout()
     return figure, ax
 
 
